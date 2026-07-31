@@ -43,6 +43,18 @@ pub struct PciDevice {
     pub prog_if: u8,
 }
 
+impl PciDevice {
+    /// Reads BAR0 (config space offset 0x10) - the first Base Address
+    /// Register, where a device's memory-mapped (or I/O-mapped) register
+    /// window is advertised. Returns the raw register value, flag bits
+    /// and all - callers that want the actual base address need to check
+    /// bit 0 (0 = memory space, 1 = I/O space) and mask accordingly, since
+    /// the meaning of the low bits differs between the two.
+    pub fn read_bar0(&self) -> u32 {
+        read_config_dword(self.bus, self.device, self.function, 0x10)
+    }
+}
+
 pub fn class_name(class: u8) -> &'static str {
     match class {
         0x00 => "Unclassified",

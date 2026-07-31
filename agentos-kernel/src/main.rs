@@ -199,6 +199,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("ps");
     shell::dispatch_command("mem");
     shell::dispatch_command("lspci");
+
+    // 7b-2. First real step toward a real e1000 NIC driver: find the real
+    // device lspci above just confirmed is present, reach its
+    // memory-mapped registers (reusing the same PHYS_MEM_OFFSET mechanism
+    // vga_buffer.rs already relies on for the VGA text buffer - see
+    // net/e1000.rs's module doc), and read its real STATUS/MAC registers.
+    // Not a real TX/RX driver yet - that's separate future work.
+    net::e1000::probe();
+
     shell::dispatch_command("disk");
     shell::dispatch_command("ls");
     shell::dispatch_command("cat KERNEL~1");

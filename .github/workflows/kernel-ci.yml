@@ -136,6 +136,18 @@ jobs:
           # confirms PCI config-space reads are actually correct, not just
           # that the lspci command ran without crashing.
           grep -q "device=0x1237" boot.log
+          # Confirms real e1000 NIC MMIO access, not just PCI config-space
+          # enumeration. Unlike the FAT12 byte-count/stack-pointer checks
+          # above, these exact values ARE safe to pin here: bar0/mac are
+          # QEMU's OWN internal device-emulation defaults for its default
+          # machine type and default (no `-device` flags) NIC, not
+          # anything influenced by which machine compiled the kernel -
+          # 0xfebc0000 is QEMU's well-documented default e1000 MMIO base,
+          # and 52:54:00:12:34:56 is its equally well-known default MAC
+          # (the exact value this project's own now-superseded-by-this
+          # virtio_net.rs placeholder had hardcoded, coincidentally).
+          grep -q "bar0=0xfebc0000" boot.log
+          grep -q "mac=52:54:00:12:34:56 valid=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.
