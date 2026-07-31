@@ -18,7 +18,10 @@ fn main() -> ExitCode {
     // machine so far only because the directory already existed from a
     // previous run; CI's clean checkout is what exposed this.
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
-        eprintln!("[kernel-runner] failed to create output dir {}: {e}", out_dir.display());
+        eprintln!(
+            "[kernel-runner] failed to create output dir {}: {e}",
+            out_dir.display()
+        );
         return ExitCode::FAILURE;
     }
 

@@ -10,9 +10,9 @@
 //! it would for any other function call - that's what makes this minimal
 //! save/restore set correct and not just "seems to work".
 
+use crate::{kprintln, serial_println};
 use alloc::boxed::Box;
 use core::arch::naked_asm;
-use crate::{kprintln, serial_println};
 
 const WORKER_STACK_SIZE: usize = 16 * 1024;
 
@@ -119,7 +119,10 @@ pub fn run_demo() {
 
 extern "C" fn worker_entry() -> ! {
     for i in 1..=3 {
-        kprintln!("[WORKER] iteration {}/3 (running on its own heap-allocated stack)", i);
+        kprintln!(
+            "[WORKER] iteration {}/3 (running on its own heap-allocated stack)",
+            i
+        );
         serial_println!("[WORKER] iteration {}/3 (own stack)", i);
     }
 

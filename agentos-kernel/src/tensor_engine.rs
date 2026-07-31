@@ -10,10 +10,7 @@ impl TensorEngine {
         // Loop unrolling for hardware pipeline optimization
         let mut i = 0;
         while i + 4 <= len {
-            sum += w[i] * x[i]
-                + w[i + 1] * x[i + 1]
-                + w[i + 2] * x[i + 2]
-                + w[i + 3] * x[i + 3];
+            sum += w[i] * x[i] + w[i + 1] * x[i + 1] + w[i + 2] * x[i + 2] + w[i + 3] * x[i + 3];
             i += 4;
         }
 
@@ -45,6 +42,10 @@ impl TensorEngine {
 
     #[inline(always)]
     fn relu(val: f32) -> f32 {
-        if val > 0.0 { val } else { 0.0 }
+        if val > 0.0 {
+            val
+        } else {
+            0.0
+        }
     }
 }

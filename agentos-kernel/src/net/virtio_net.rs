@@ -1,6 +1,6 @@
-use spin::Mutex;
-use lazy_static::lazy_static;
 use crate::{kprintln, serial_println};
+use lazy_static::lazy_static;
+use spin::Mutex;
 
 pub struct VirtIONetDriver {
     pub mac_address: [u8; 6],
@@ -28,8 +28,12 @@ impl VirtIONetDriver {
         );
         serial_println!(
             "[VIRTIO-NET] Driver MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            self.mac_address[0], self.mac_address[1], self.mac_address[2],
-            self.mac_address[3], self.mac_address[4], self.mac_address[5]
+            self.mac_address[0],
+            self.mac_address[1],
+            self.mac_address[2],
+            self.mac_address[3],
+            self.mac_address[4],
+            self.mac_address[5]
         );
     }
 
@@ -38,7 +42,10 @@ impl VirtIONetDriver {
             return false;
         }
         self.tx_packets_count += 1;
-        kprintln!("[VIRTIO-NET] Transmitted {} byte packet onto VirtQueue.", packet.len());
+        kprintln!(
+            "[VIRTIO-NET] Transmitted {} byte packet onto VirtQueue.",
+            packet.len()
+        );
         serial_println!("[VIRTIO-NET] TX Packet {} bytes", packet.len());
         true
     }

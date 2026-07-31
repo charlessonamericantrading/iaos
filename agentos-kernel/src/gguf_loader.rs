@@ -44,18 +44,25 @@ impl GgufModelLoader {
 
         let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         let tensor_count = u64::from_le_bytes([
-            bytes[8], bytes[9], bytes[10], bytes[11],
-            bytes[12], bytes[13], bytes[14], bytes[15],
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
         ]) as usize;
 
         let kv_count = u64::from_le_bytes([
-            bytes[16], bytes[17], bytes[18], bytes[19],
-            bytes[20], bytes[21], bytes[22], bytes[23],
+            bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
         ]) as usize;
 
         kprintln!("[GGUF PARSER] Magic: 0x{:X} (Valid GGUF)", magic);
-        kprintln!("[GGUF PARSER] Version: {}, Tensors: {}, KV Metadata: {}", version, tensor_count, kv_count);
-        serial_println!("[GGUF PARSER] Magic OK. Version: {}, Tensors: {}", version, tensor_count);
+        kprintln!(
+            "[GGUF PARSER] Version: {}, Tensors: {}, KV Metadata: {}",
+            version,
+            tensor_count,
+            kv_count
+        );
+        serial_println!(
+            "[GGUF PARSER] Magic OK. Version: {}, Tensors: {}",
+            version,
+            tensor_count
+        );
 
         Ok(GgufModelLoader {
             magic,
@@ -78,7 +85,10 @@ impl GgufModelLoader {
         out_dim: usize,
     ) {
         let dummy_bias = [0.0f32; 16];
-        kprintln!("[GGUF ENGINE] Executing native layer pass for arch '{}'...", self.architecture);
+        kprintln!(
+            "[GGUF ENGINE] Executing native layer pass for arch '{}'...",
+            self.architecture
+        );
         TensorEngine::matmul_layer(weights, inputs, &dummy_bias, outputs, in_dim, out_dim);
     }
 }

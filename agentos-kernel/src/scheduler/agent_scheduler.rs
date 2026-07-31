@@ -1,6 +1,6 @@
-use super::process::{ProcessControlBlock, ProcessState, Priority};
-use spin::Mutex;
+use super::process::{Priority, ProcessControlBlock, ProcessState};
 use lazy_static::lazy_static;
+use spin::Mutex;
 
 const MAX_PROCESSES: usize = 32;
 

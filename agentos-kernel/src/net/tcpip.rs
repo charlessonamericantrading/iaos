@@ -52,6 +52,12 @@ impl NativeNetworkStack {
         buffer[34..payload_end].copy_from_slice(&payload[..payload.len().min(90)]);
 
         driver.transmit_packet(&buffer[..payload_end]);
-        kprintln!("[TCPIP STACK] IPv4 UDP packet sent to {}.{}.{}.{}", dest_ip[0], dest_ip[1], dest_ip[2], dest_ip[3]);
+        kprintln!(
+            "[TCPIP STACK] IPv4 UDP packet sent to {}.{}.{}.{}",
+            dest_ip[0],
+            dest_ip[1],
+            dest_ip[2],
+            dest_ip[3]
+        );
     }
 }

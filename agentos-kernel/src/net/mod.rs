@@ -1,2 +1,2 @@
-pub mod virtio_net;
 pub mod tcpip;
+pub mod virtio_net;

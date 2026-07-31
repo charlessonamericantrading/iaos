@@ -1,6 +1,6 @@
 pub mod frame_allocator;
-pub mod kv_allocator;
 pub mod heap;
+pub mod kv_allocator;
 
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{OffsetPageTable, PageTable};

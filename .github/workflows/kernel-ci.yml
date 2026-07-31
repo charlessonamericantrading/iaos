@@ -12,10 +12,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Toolchain (channel/components/target) comes from
-      # agentos-kernel/rust-toolchain.toml - rustup auto-installs it on
-      # first use, so this stays in sync with local dev by construction
-      # instead of duplicating the pin here.
+      # Toolchain (channel/components/target) comes from each crate's own
+      # rust-toolchain.toml (both now list clippy+rustfmt too) - rustup
+      # auto-installs it on first use, so this stays in sync with local
+      # dev by construction instead of duplicating the pin here.
+      - name: Lint agentos-kernel (fmt + clippy)
+        working-directory: agentos-kernel
+        run: |
+          cargo fmt --check
+          cargo clippy --release -- -D warnings
+
+      - name: Lint kernel-runner (fmt + clippy)
+        working-directory: kernel-runner
+        run: |
+          cargo fmt --check
+          cargo clippy --release -- -D warnings
+
       - name: Build agentos-kernel
         working-directory: agentos-kernel
         run: cargo build --release

@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
-use spin::Mutex;
 use lazy_static::lazy_static;
+use spin::Mutex;
 
 /// Bytes allocated per KV cache block. Kept small (not a realistic
 /// token-cache size) because it comes out of the kernel's current 100 KiB
@@ -96,5 +96,6 @@ impl KVCacheMemoryManager {
 }
 
 lazy_static! {
-    pub static ref KV_MANAGER: Mutex<KVCacheMemoryManager> = Mutex::new(KVCacheMemoryManager::new());
+    pub static ref KV_MANAGER: Mutex<KVCacheMemoryManager> =
+        Mutex::new(KVCacheMemoryManager::new());
 }

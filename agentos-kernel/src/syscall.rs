@@ -1,8 +1,8 @@
 use crate::kprintln;
-use crate::serial_println;
+use crate::memory::kv_allocator::KV_MANAGER;
 use crate::scheduler::agent_scheduler::SCHEDULER;
 use crate::scheduler::process::Priority;
-use crate::memory::kv_allocator::KV_MANAGER;
+use crate::serial_println;
 
 pub const SYS_SERIAL_PRINT: u64 = 1;
 pub const SYS_AGENT_SPAWN: u64 = 2;

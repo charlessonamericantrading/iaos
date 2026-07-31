@@ -7,26 +7,26 @@ extern crate alloc;
 
 use core::panic::PanicInfo;
 
-mod vga_buffer;
-mod serial;
 mod gdt;
-mod interrupts;
-mod memory;
-mod tensor_engine;
-mod scheduler;
-mod syscall;
-mod keyboard;
 mod gguf_loader;
+mod interrupts;
+mod keyboard;
+mod memory;
 mod net;
+mod scheduler;
+mod serial;
 mod shell;
+mod syscall;
+mod tensor_engine;
+mod vga_buffer;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use gguf_loader::GgufModelLoader;
+use memory::kv_allocator::KV_MANAGER;
+use net::tcpip::NativeNetworkStack;
 use scheduler::agent_scheduler::SCHEDULER;
 use scheduler::process::Priority;
-use memory::kv_allocator::KV_MANAGER;
-use gguf_loader::GgufModelLoader;
-use net::tcpip::NativeNetworkStack;
 
 use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::{entry_point, BootInfo};
@@ -92,14 +92,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // over a virtual range that was never mapped to physical memory, so the
     // first real allocation would have page-faulted.
     kprintln!("[KERNEL INIT] Mapping physical memory & initializing heap allocator...");
-    let phys_mem_offset = x86_64::VirtAddr::new(
-        boot_info.physical_memory_offset.into_option().unwrap_or(0),
-    );
+    let phys_mem_offset =
+        x86_64::VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap_or(0));
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
     let mut frame_allocator =
         unsafe { memory::frame_allocator::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
-    memory::heap::init_heap(&mut mapper, &mut frame_allocator)
-        .expect("heap initialization failed");
+    memory::heap::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
     kprintln!(
         "[KERNEL INIT] Heap mapped at {:#x}, {} KiB - alloc (Vec/Box/String) now live.",
         memory::heap::HEAP_START,
@@ -113,7 +111,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         for i in 0..5 {
             v.push(i * i);
         }
-        kprintln!("[HEAP TEST] Box({}) at {:p}; Vec squares = {:?}", boxed, boxed, v);
+        kprintln!(
+            "[HEAP TEST] Box({}) at {:p}; Vec squares = {:?}",
+            boxed,
+            boxed,
+            v
+        );
     }
 
     // 3. Initialize Native Agent Multitask Scheduler
@@ -138,7 +141,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     {
         let mut kv = KV_MANAGER.lock();
         if let Some(block_id) = kv.allocate_kv_block(2, 2048) {
-            kprintln!("[KV MEMORY] Allocated KV Cache Block #{} for PID 2 in VRAM", block_id);
+            kprintln!(
+                "[KV MEMORY] Allocated KV Cache Block #{} for PID 2 in VRAM",
+                block_id
+            );
         }
     }
 
@@ -153,10 +159,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     if let Ok(loader) = GgufModelLoader::parse_header(&sample_gguf_bytes) {
         let weights: [f32; 16] = [
-            0.5, -0.2, 0.8, 0.1,
-            0.3, 0.9, -0.4, 0.6,
-            -0.1, 0.4, 0.7, 0.2,
-            0.6, -0.5, 0.2, 0.8,
+            0.5, -0.2, 0.8, 0.1, 0.3, 0.9, -0.4, 0.6, -0.1, 0.4, 0.7, 0.2, 0.6, -0.5, 0.2, 0.8,
         ];
         let inputs: [f32; 4] = [1.0, 2.0, 0.5, 3.0];
         let mut outputs: [f32; 4] = [0.0; 4];
@@ -165,7 +168,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         kprintln!(
             "[GGUF RESULT] Y = ReLU(W * X + B) -> [{:.2}, {:.2}, {:.2}, {:.2}]",
-            outputs[0], outputs[1], outputs[2], outputs[3]
+            outputs[0],
+            outputs[1],
+            outputs[2],
+            outputs[3]
         );
     }
 

@@ -1,7 +1,7 @@
-use alloc::string::String;
-use spin::Mutex;
-use lazy_static::lazy_static;
 use crate::kprint;
+use alloc::string::String;
+use lazy_static::lazy_static;
+use spin::Mutex;
 
 /// PS/2 set 1 make-code for Backspace.
 const SCANCODE_BACKSPACE: u8 = 0x0E;

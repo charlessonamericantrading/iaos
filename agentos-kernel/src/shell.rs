@@ -61,11 +61,19 @@ pub fn dispatch_command(line: &str) {
             manager.for_each_block(|b| {
                 kprintln!(
                     "  KV block #{} pid={} {:?} {}B @ {:#x}",
-                    b.block_id, b.pid, b.location, b.size_bytes(), b.addr()
+                    b.block_id,
+                    b.pid,
+                    b.location,
+                    b.size_bytes(),
+                    b.addr()
                 );
                 serial_println!(
                     "  KV block #{} pid={} {:?} {}B @ {:#x}",
-                    b.block_id, b.pid, b.location, b.size_bytes(), b.addr()
+                    b.block_id,
+                    b.pid,
+                    b.location,
+                    b.size_bytes(),
+                    b.addr()
                 );
             });
         }
