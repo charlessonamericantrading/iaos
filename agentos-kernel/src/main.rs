@@ -3,6 +3,8 @@
 #![allow(dead_code)]
 #![feature(abi_x86_interrupt)]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
 
 mod vga_buffer;
@@ -17,10 +19,11 @@ mod keyboard;
 mod gguf_loader;
 mod net;
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use scheduler::agent_scheduler::SCHEDULER;
 use scheduler::process::Priority;
 use memory::kv_allocator::KV_MANAGER;
-use keyboard::KEYBOARD;
 use gguf_loader::GgufModelLoader;
 use net::tcpip::NativeNetworkStack;
 
@@ -68,6 +71,49 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!("[KERNEL INIT] Testing breakpoint exception handler (int3)...");
     x86_64::instructions::interrupts::int3();
     kprintln!("[KERNEL INIT] Execution resumed after breakpoint - handler OK.");
+
+    // 2c. Remap the 8259 PIC & Enable Hardware Interrupts
+    // Must happen in this order: the IDT (loaded above) already has real
+    // handlers at vectors 32/33, so it's now safe to let the PIC start
+    // firing IRQs and to flip the CPU's IF flag. Doing this before the IDT
+    // had those handlers, or before the PIC remap, would turn the first
+    // timer tick into an unhandled-vector fault.
+    interrupts::init_pics();
+    x86_64::instructions::interrupts::enable();
+    kprintln!("[KERNEL INIT] Hardware interrupts enabled (STI) - keyboard is now IRQ-driven.");
+
+    // 2d. Map Real Physical Memory & Initialize the Heap Allocator
+    // Everything below this point (KV cache, scheduler, GGUF loader) still
+    // uses fixed-size static arrays, not `alloc` - but a real AI-native
+    // kernel needs to load model files of arbitrary size, which fixed arrays
+    // can't do. This makes `alloc` (Vec/Box/String) actually usable for the
+    // first time; previously `heap::init_heap` initialized the allocator
+    // over a virtual range that was never mapped to physical memory, so the
+    // first real allocation would have page-faulted.
+    kprintln!("[KERNEL INIT] Mapping physical memory & initializing heap allocator...");
+    let phys_mem_offset = x86_64::VirtAddr::new(
+        boot_info.physical_memory_offset.into_option().unwrap_or(0),
+    );
+    let mut mapper = unsafe { memory::init(phys_mem_offset) };
+    let mut frame_allocator =
+        unsafe { memory::frame_allocator::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
+    memory::heap::init_heap(&mut mapper, &mut frame_allocator)
+        .expect("heap initialization failed");
+    kprintln!(
+        "[KERNEL INIT] Heap mapped at {:#x}, {} KiB - alloc (Vec/Box/String) now live.",
+        memory::heap::HEAP_START,
+        memory::heap::HEAP_SIZE / 1024
+    );
+
+    kprintln!("[KERNEL INIT] Testing heap allocator (Box + Vec)...");
+    {
+        let boxed = Box::new(41 + 1);
+        let mut v: Vec<u32> = Vec::new();
+        for i in 0..5 {
+            v.push(i * i);
+        }
+        kprintln!("[HEAP TEST] Box({}) at {:p}; Vec squares = {:?}", boxed, boxed, v);
+    }
 
     // 3. Initialize Native Agent Multitask Scheduler
     kprintln!("[KERNEL INIT] Starting Agent Multitask Scheduler...");
@@ -138,25 +184,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!("==================================================");
     kprint!("AgentOS> ");
 
-    // 8. Main Interactive Kernel Shell Loop (PS/2 Keyboard & Event Dispatch)
-    let mut last_scancode: u8 = 0;
+    // 8. Idle Loop - the shell prompt above is now serviced entirely by the
+    // IRQ1 keyboard handler (see interrupts.rs -> keyboard::handle_scancode).
+    // `hlt` parks the CPU until the next interrupt (keyboard, timer, ...)
+    // instead of burning cycles polling port 0x60 every iteration.
     loop {
-        {
-            let mut kb = KEYBOARD.lock();
-            if let Some(scancode) = kb.read_scancode() {
-                if scancode != last_scancode && (scancode & 0x80) == 0 {
-                    if let Some(ch) = kb.scancode_to_char(scancode) {
-                        if ch == '\n' {
-                            kprintln!("\n[AGENTOS SHELL] Task dispatched to Kernel Scheduler.");
-                            kprint!("AgentOS> ");
-                        } else {
-                            kprint!("{}", ch);
-                        }
-                    }
-                }
-                last_scancode = scancode;
-            }
-        }
         x86_64::instructions::hlt();
     }
 }

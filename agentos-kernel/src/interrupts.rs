@@ -1,7 +1,33 @@
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::registers::control::Cr2;
 use lazy_static::lazy_static;
+use spin::Mutex;
+use pic8259::ChainedPics;
 use crate::{kprintln, serial_println, gdt};
+
+/// The legacy 8259 PIC defaults to delivering IRQ0-7 on vectors 0x08-0x0F,
+/// which collide head-on with CPU exceptions (0x08 is literally our
+/// double-fault vector). Remapping both PICs to start at 0x20 (32) is what
+/// makes it safe to ever call `interrupts::enable()` - without this, the
+/// very first timer tick would look like a double fault to the CPU.
+pub const PIC_1_OFFSET: u8 = 32;
+pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
+
+pub static PICS: Mutex<ChainedPics> =
+    Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InterruptIndex {
+    Timer = PIC_1_OFFSET,
+    Keyboard,
+}
+
+impl InterruptIndex {
+    fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
 
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
@@ -16,6 +42,8 @@ lazy_static! {
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
+        idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
+        idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt
     };
 }
@@ -24,7 +52,34 @@ pub fn init_idt() {
     IDT.load();
     kprintln!("[IDT] Native IDT Loaded into CPU Register (LIDT)");
     serial_println!("[IDT] Native IDT Loaded into CPU Register (LIDT)");
-    kprintln!("[IDT] Handlers armed: breakpoint, double-fault(IST), page-fault, GPF, divide-error, invalid-opcode");
+    kprintln!("[IDT] Handlers armed: breakpoint, double-fault(IST), page-fault, GPF, divide-error, invalid-opcode, timer(IRQ0), keyboard(IRQ1)");
+}
+
+/// Remaps the 8259 PIC to `PIC_1_OFFSET..PIC_2_OFFSET+8` and unmasks IRQs.
+/// Must run after `init_idt()` (so vectors 32/33 already have handlers) and
+/// before `x86_64::instructions::interrupts::enable()`.
+pub fn init_pics() {
+    unsafe { PICS.lock().initialize() };
+    kprintln!("[PIC] 8259 remapped to vectors {}-{} (was 8-15, collided with CPU exceptions)", PIC_1_OFFSET, PIC_2_OFFSET + 7);
+    serial_println!("[PIC] 8259 remapped to vectors {}-{}", PIC_1_OFFSET, PIC_2_OFFSET + 7);
+}
+
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
+    }
+}
+
+extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    use x86_64::instructions::port::Port;
+
+    let mut data_port: Port<u8> = Port::new(0x60);
+    let scancode: u8 = unsafe { data_port.read() };
+    crate::keyboard::handle_scancode(scancode);
+
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
 }
 
 /// Non-fatal: a debugger/test breakpoint (int3). Execution continues after this.

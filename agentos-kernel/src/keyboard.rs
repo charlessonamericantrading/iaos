@@ -1,26 +1,14 @@
 use spin::Mutex;
 use lazy_static::lazy_static;
-use x86_64::instructions::port::Port;
+use crate::{kprint, kprintln};
 
 pub struct KeyboardDriver {
-    data_port: Port<u8>,
+    last_scancode: u8,
 }
 
 impl KeyboardDriver {
     pub const fn new() -> Self {
-        KeyboardDriver {
-            data_port: Port::new(0x60),
-        }
-    }
-
-    /// Read raw scancode from PS/2 Keyboard Port 0x60
-    pub fn read_scancode(&mut self) -> Option<u8> {
-        let scancode = unsafe { self.data_port.read() };
-        if scancode > 0 {
-            Some(scancode)
-        } else {
-            None
-        }
+        KeyboardDriver { last_scancode: 0 }
     }
 
     /// Convert PS/2 set 1 scancode to ASCII char
@@ -71,4 +59,26 @@ impl KeyboardDriver {
 
 lazy_static! {
     pub static ref KEYBOARD: Mutex<KeyboardDriver> = Mutex::new(KeyboardDriver::new());
+}
+
+/// Called from the IRQ1 handler in `interrupts.rs` with the scancode
+/// already read off PS/2 port 0x60. PS/2 set 1 sends one code on key-down
+/// and the same code with the top bit set on key-up, and can repeat the
+/// down-code while a key is held - we only act on a genuinely new key-down.
+pub fn handle_scancode(scancode: u8) {
+    let mut kb = KEYBOARD.lock();
+    let is_new_press = scancode != kb.last_scancode && (scancode & 0x80) == 0;
+    kb.last_scancode = scancode;
+    if !is_new_press {
+        return;
+    }
+
+    if let Some(ch) = kb.scancode_to_char(scancode) {
+        if ch == '\n' {
+            kprintln!("\n[AGENTOS SHELL] Task dispatched to Kernel Scheduler.");
+            kprint!("AgentOS> ");
+        } else {
+            kprint!("{}", ch);
+        }
+    }
 }
