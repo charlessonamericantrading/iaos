@@ -187,6 +187,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("ps");
     shell::dispatch_command("mem");
 
+    // 7c. Test a Real Cooperative Context Switch (stack + register swap)
+    // Cooperative only - the worker yields back voluntarily. Not wired to
+    // the timer interrupt yet (that's real preemption, separate work).
+    scheduler::context_switch::run_demo();
+
     kprintln!("==================================================");
     kprintln!("  [SUCCESS] AgentOS Native Kernel Boot Sequence Complete ");
     kprintln!("  [SHELL] AgentOS Native Console Ready. Type commands: ");
