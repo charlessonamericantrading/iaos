@@ -1,8 +1,8 @@
-//! Minimal ATA PIO (Programmable I/O) disk read - the classic, simple,
-//! universally-supported way to talk to an IDE/ATA disk, predating AHCI.
-//! Read-only for now (only READ SECTORS, command `0x20`) - groundwork for
-//! eventually loading a real file (a GGUF model, say) off disk instead of
-//! a hardcoded sample, not a full disk driver yet.
+//! Minimal ATA PIO (Programmable I/O) disk read/write - the classic,
+//! simple, universally-supported way to talk to an IDE/ATA disk,
+//! predating AHCI. `read_sector`/`write_sector` (commands `0x20`/`0x30`) -
+//! groundwork for real file I/O (a GGUF model, say, or real FAT write
+//! support) instead of a hardcoded sample, not a full disk driver yet.
 //!
 //! Targets the primary ATA bus's master drive (legacy/compatibility-mode
 //! ports 0x1F0-0x1F7) - the same ports the PIIX3 IDE controller `pci.rs`
@@ -21,6 +21,8 @@ const DRIVE_HEAD: u16 = 0x1F6;
 const COMMAND_STATUS: u16 = 0x1F7;
 
 const CMD_READ_SECTORS: u8 = 0x20;
+const CMD_WRITE_SECTORS: u8 = 0x30;
+const CMD_CACHE_FLUSH: u8 = 0xE7;
 
 const STATUS_ERR: u8 = 0x01;
 const STATUS_DRQ: u8 = 0x08;
@@ -94,6 +96,75 @@ fn read_sector_inner(lba: u32, buf: &mut [u8; 512]) -> Result<(), &'static str> 
             chunk[0] = (word & 0xFF) as u8;
             chunk[1] = (word >> 8) as u8;
         }
+    }
+    Ok(())
+}
+
+/// Writes one 512-byte sector at 28-bit LBA `lba` on the primary ATA
+/// bus's master drive from `buf`.
+///
+/// # Errors
+/// Returns `Err` if the drive reports an error (`ERR` status bit) or
+/// never becomes ready within a bounded number of polls - same
+/// conventions as `read_sector`.
+///
+/// Issues CACHE FLUSH (`0xE7`) after the data transfer and waits for it
+/// to complete before returning `Ok` - so a caller that gets `Ok` back
+/// knows the write is genuinely committed, not just accepted into a
+/// volatile write cache. QEMU's emulated IDE controller likely commits
+/// synchronously already, but the flush costs one more bounded poll and
+/// is what a real drive needs this guarantee from.
+pub fn write_sector(lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
+    x86_64::instructions::interrupts::without_interrupts(|| write_sector_inner(lba, buf))
+}
+
+fn write_sector_inner(lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
+    unsafe {
+        let mut drive_head: Port<u8> = Port::new(DRIVE_HEAD);
+        let mut warmup: Port<u8> = Port::new(ERROR_FEATURES);
+        let mut sector_count: Port<u8> = Port::new(SECTOR_COUNT);
+        let mut lba_low: Port<u8> = Port::new(LBA_LOW);
+        let mut lba_mid: Port<u8> = Port::new(LBA_MID);
+        let mut lba_high: Port<u8> = Port::new(LBA_HIGH);
+        let mut command_status: Port<u8> = Port::new(COMMAND_STATUS);
+        let mut data: Port<u16> = Port::new(DATA);
+
+        drive_head.write(0xE0 | ((lba >> 24) & 0x0F) as u8);
+
+        for _ in 0..4 {
+            let _ = warmup.read();
+        }
+
+        sector_count.write(1);
+        lba_low.write((lba & 0xFF) as u8);
+        lba_mid.write(((lba >> 8) & 0xFF) as u8);
+        lba_high.write(((lba >> 16) & 0xFF) as u8);
+        command_status.write(CMD_WRITE_SECTORS);
+
+        let mut status = poll_until(&mut command_status, |s| s & STATUS_BSY == 0)?;
+        if status & STATUS_ERR != 0 {
+            return Err("ATA write: drive reported an error (ERR bit set)");
+        }
+
+        // DRQ here means "ready for you to hand over the data" - the
+        // write-side mirror of read_sector's DRQ check meaning "data is
+        // ready for you to take".
+        status = poll_until(&mut command_status, |s| s & STATUS_DRQ != 0)?;
+        if status & STATUS_ERR != 0 {
+            return Err("ATA write: drive reported an error (ERR bit set)");
+        }
+
+        for chunk in buf.as_chunks::<2>().0 {
+            data.write((chunk[0] as u16) | ((chunk[1] as u16) << 8));
+        }
+
+        status = poll_until(&mut command_status, |s| s & STATUS_BSY == 0)?;
+        if status & STATUS_ERR != 0 {
+            return Err("ATA write: drive reported an error after transfer (ERR bit set)");
+        }
+
+        command_status.write(CMD_CACHE_FLUSH);
+        poll_until(&mut command_status, |s| s & STATUS_BSY == 0)?;
     }
     Ok(())
 }

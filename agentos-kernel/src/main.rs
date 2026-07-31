@@ -283,6 +283,56 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("ls");
     shell::dispatch_command("cat KERNEL~1");
 
+    // 7b-4. Real ATA PIO sector write - prerequisite for any future FAT
+    // write support, same relationship Fase 21's frame allocator had to
+    // e1000 TX. Writes a recognizable test pattern to a sector safely
+    // within the FAT12 partition's likely-unused tail (well past where
+    // real file data/metadata reaches - the files read above total well
+    // under 1000 sectors out of this partition's 4096), reads it back,
+    // and confirms it matches byte-for-byte - proof the write genuinely
+    // reached disk, not just that the function returned without
+    // erroring. Safe to run every boot: kernel-runner regenerates the
+    // disk image fresh each time, so nothing persists across runs anyway.
+    kprintln!("[KERNEL INIT] Testing real ATA sector write (write + read-back)...");
+    match shell::find_fat_partition() {
+        Ok(partition) => {
+            let test_lba = partition.start_lba + 3000;
+            let test_pattern = [0xA5u8; 512];
+            match ata::write_sector(test_lba, &test_pattern) {
+                Ok(()) => {
+                    let mut read_back = [0u8; 512];
+                    match ata::read_sector(test_lba, &mut read_back) {
+                        Ok(()) => {
+                            let matches = read_back == test_pattern;
+                            kprintln!(
+                                "[ATA] write+read-back test at LBA {}: {}",
+                                test_lba,
+                                if matches {
+                                    "OK (bytes match)"
+                                } else {
+                                    "MISMATCH"
+                                }
+                            );
+                            serial_println!("[ATA] write_test lba={} match={}", test_lba, matches);
+                        }
+                        Err(e) => {
+                            kprintln!("[ATA] write test: read-back failed: {}", e);
+                            serial_println!("[ATA] write_test lba={} read_failed: {}", test_lba, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    kprintln!("[ATA] write test: write failed: {}", e);
+                    serial_println!("[ATA] write_test lba={} write_failed: {}", test_lba, e);
+                }
+            }
+        }
+        Err(e) => {
+            kprintln!("[ATA] write test: couldn't find FAT partition: {}", e);
+            serial_println!("[ATA] write_test -> no partition: {}", e);
+        }
+    }
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real

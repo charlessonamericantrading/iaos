@@ -207,6 +207,15 @@ jobs:
           # timeout-based exit code the healthy end-of-boot idle loop
           # already produces).
           grep -q "E1000\] tx_sent -> not yet confirmed" boot.log
+          # Confirms the new ATA write path (Fase 23) genuinely wrote and
+          # read back matching bytes - not just that write_sector()
+          # returned without erroring. Deliberately NOT asserting the
+          # exact LBA tested: it's partition.start_lba + 3000, and
+          # partition1 sits immediately after partition0 in the MBR, so
+          # its start could in principle shift if partition0's size ever
+          # varies by build machine (the same class of risk Fase 15 hit
+          # with file sizes) - only the match=true outcome is asserted.
+          grep -qE "ATA\] write_test lba=[0-9]+ match=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.

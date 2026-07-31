@@ -262,8 +262,10 @@ fn state_label(s: ProcessState) -> &'static str {
 
 /// Finds the first FAT-typed partition in the MBR. Returns it by value
 /// (not a reference into the local `mbr` buffer) so callers aren't tied
-/// to that buffer's short lifetime.
-fn find_fat_partition() -> Result<crate::partition::PartitionEntry, &'static str> {
+/// to that buffer's short lifetime. `pub(crate)` so main.rs's self-tests
+/// (e.g. the ATA write test) can find a safe LBA to test against without
+/// duplicating this lookup.
+pub(crate) fn find_fat_partition() -> Result<crate::partition::PartitionEntry, &'static str> {
     let mut mbr = [0u8; 512];
     crate::ata::read_sector(0, &mut mbr)?;
     crate::partition::parse_mbr(&mbr)
