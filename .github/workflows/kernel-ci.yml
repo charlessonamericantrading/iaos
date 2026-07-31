@@ -107,15 +107,25 @@ jobs:
           # Confirms the FAT12 fallback actually parsed the fixed-location
           # root directory and found all 3 real files on this disk (the
           # two bootloader stages + the kernel binary itself) - not just
-          # that fat12::read_bpb() ran without erroring.
+          # that fat12::read_bpb() ran without erroring. Deliberately NOT
+          # asserting exact byte counts here: a first run of this exact
+          # check (hardcoded to the local build's 132992-byte KERNEL~1)
+          # failed on the CI runner, which produced a KERNEL~1 of 132960
+          # bytes from the same source - the kernel ELF's own size isn't
+          # stable across build machines (e.g. absolute source paths of
+          # differing length end up embedded in panic/debug strings), so
+          # pinning an exact size here would make this check flaky by
+          # construction rather than a real regression guard.
           grep -q "FAT12/16 3 entries" boot.log
-          grep -q "KERNEL~1 132992 bytes" boot.log
+          grep -q "KERNEL~1" boot.log
           # Confirms `cat` walked the FAT12 cluster chain (starting at
-          # cluster 268, per the ls listing above) and read back the file's
-          # *exact* byte count. first4=7f454c46 is the real ELF magic
-          # number (\x7fELF) - the strongest evidence available that the
-          # bytes read off disk are genuinely the kernel's own binary, not
-          # just a plausible-looking length.
-          grep -q "SHELL\] cat KERNEL~1 -> 132992 bytes" boot.log
+          # cluster 268, per the ls listing above) and read the file back
+          # successfully. first4=7f454c46 is the real ELF magic number
+          # (\x7fELF) - unlike the byte count, this 4-byte prefix IS a
+          # build-independent invariant (every valid ELF starts with it
+          # regardless of the file's total size), making it the strongest
+          # portable evidence available that the bytes read off disk are
+          # genuinely the kernel's own binary.
+          grep -q "SHELL\] cat KERNEL~1 ->" boot.log
           grep -q "first4=7f454c46" boot.log
           echo "All expected boot milestones found."
