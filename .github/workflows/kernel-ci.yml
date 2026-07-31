@@ -71,6 +71,30 @@ jobs:
           grep -q "\[IDT\] Native IDT Loaded" boot.log
           grep -q "\[EXCEPTION\] Breakpoint" boot.log
           grep -q "\[PIC\] 8259 remapped to vectors 32-47" boot.log
+          # Confirms the global frame allocator hands out real, distinct,
+          # genuinely writable/readable physical frames (verified=true is
+          # only printed if all 3 write/read-back checks passed - a
+          # mismatch would have panicked the boot instead). Not asserting
+          # the exact addresses: they depend both on the bootloader's own
+          # memory-map detection (could vary by QEMU/firmware version,
+          # like Fase 19's BAR0 finding) and on how many earlier frames
+          # the kernel image + heap already consumed (could vary by build
+          # machine, like Fase 15's ELF-size finding) - so instead this
+          # checks the one thing that's actually invariant: consecutive
+          # allocate_frame() calls must return frames exactly 4 KiB apart,
+          # which is a property of the allocator's own walk order, not of
+          # where in physical memory it happens to start from.
+          grep -q "FRAME ALLOC\].*verified=true" boot.log
+          frame_line=$(grep "FRAME ALLOC\]" boot.log)
+          mapfile -t frame_addrs < <(echo "$frame_line" | grep -oE "0x[0-9a-f]+")
+          if [ "${#frame_addrs[@]}" -ne 3 ]; then
+            echo "FRAME ALLOC REGRESSION: expected 3 addresses in '$frame_line', found ${#frame_addrs[@]}."
+            exit 1
+          fi
+          if [ $(( ${frame_addrs[1]} - ${frame_addrs[0]} )) -ne 4096 ] || [ $(( ${frame_addrs[2]} - ${frame_addrs[1]} )) -ne 4096 ]; then
+            echo "FRAME ALLOC REGRESSION: frames aren't consecutive 4 KiB apart: ${frame_addrs[*]}."
+            exit 1
+          fi
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -

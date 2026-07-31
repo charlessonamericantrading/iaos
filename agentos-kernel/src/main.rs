@@ -111,6 +111,57 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         memory::heap::HEAP_SIZE / 1024
     );
 
+    // Hands the SAME allocator instance (cursor already advanced past
+    // whatever heap init just claimed) to a global slot so later code -
+    // e.g. a future real NIC driver's TX/RX descriptor rings - can keep
+    // allocating fresh physical frames after boot, without re-handing-out
+    // frames the heap already owns.
+    memory::frame_allocator::install_global(frame_allocator);
+
+    // Proves the global allocator just installed hands out genuinely
+    // usable, distinct physical frames - not just plausible-looking
+    // numbers. Writes then reads back a small pattern through each
+    // frame's PHYS_MEM_OFFSET-mapped virtual address (the same
+    // identity-mapping mechanism vga_buffer.rs and net/e1000.rs already
+    // rely on) - if that mapping or the frame itself were somehow wrong,
+    // this panics here with a clear message instead of corrupting
+    // something later, silently, whenever real DMA buffers eventually
+    // use this same allocator.
+    kprintln!("[KERNEL INIT] Testing global frame allocator...");
+    {
+        let frames = [
+            memory::frame_allocator::allocate_frame(),
+            memory::frame_allocator::allocate_frame(),
+            memory::frame_allocator::allocate_frame(),
+        ];
+        for (i, frame) in frames.iter().enumerate() {
+            let phys = frame.start_address().as_u64();
+            let virt = (phys_mem_offset.as_u64() + phys) as *mut u8;
+            let pattern = 0xA0 + i as u8;
+            unsafe {
+                core::ptr::write_volatile(virt, pattern);
+                let read_back = core::ptr::read_volatile(virt);
+                assert_eq!(
+                    read_back, pattern,
+                    "frame {} at phys {:#x} not genuinely writable/readable",
+                    i, phys
+                );
+            }
+        }
+        kprintln!(
+            "[FRAME ALLOC] 3 fresh frames: {:#x}, {:#x}, {:#x} (write/read-back verified)",
+            frames[0].start_address().as_u64(),
+            frames[1].start_address().as_u64(),
+            frames[2].start_address().as_u64()
+        );
+        serial_println!(
+            "[FRAME ALLOC] frames={:#x},{:#x},{:#x} verified=true",
+            frames[0].start_address().as_u64(),
+            frames[1].start_address().as_u64(),
+            frames[2].start_address().as_u64()
+        );
+    }
+
     kprintln!("[KERNEL INIT] Testing heap allocator (Box + Vec)...");
     {
         let boxed = Box::new(41 + 1);
