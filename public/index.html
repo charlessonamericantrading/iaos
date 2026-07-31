@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AgentOS - Sistema Operativo Nativo para Inteligencia Artificial</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-icon">
+          <i class="fa-solid fa-microchip"></i>
+        </div>
+        <div class="brand-text">
+          <h2>AgentOS</h2>
+          <span class="version-tag">v1.0 Kernel</span>
+        </div>
+      </div>
+
+      <nav class="nav-menu">
+        <button class="nav-item active" data-tab="dispatcher">
+          <i class="fa-solid fa-terminal"></i>
+          <span>Task Dispatcher</span>
+        </button>
+        <button class="nav-item" data-tab="agents">
+          <i class="fa-solid fa-network-wired"></i>
+          <span>Process Manager</span>
+        </button>
+        <button class="nav-item" data-tab="mal">
+          <i class="fa-solid fa-sliders"></i>
+          <span>Model Layer (MAL)</span>
+        </button>
+        <button class="nav-item" data-tab="memory">
+          <i class="fa-solid fa-memory"></i>
+          <span>Context Memory (UCM)</span>
+        </button>
+        <button class="nav-item" data-tab="sandbox">
+          <i class="fa-solid fa-shield-halved"></i>
+          <span>Tool Sandbox</span>
+        </button>
+        <button class="nav-item" data-tab="studio">
+          <i class="fa-solid fa-code"></i>
+          <span>Software Studio</span>
+        </button>
+      </nav>
+
+      <div class="kernel-status-card">
+        <div class="status-indicator online"></div>
+        <div class="status-info">
+          <span class="status-title">Kernel State</span>
+          <span class="status-sub">ACTIVE (PID 1)</span>
+        </div>
+        <div class="uptime-badge" id="uptimeBadge">00:00:00</div>
+      </div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="main-content">
+      <!-- Top Header Metrics Bar -->
+      <header class="top-header">
+        <div class="header-title">
+          <h1 id="pageTitle">Control Center</h1>
+          <p class="subtitle">Next-Generation AI-Native Operating System Runtime</p>
+        </div>
+
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <div class="metric-icon purple"><i class="fa-solid fa-robot"></i></div>
+            <div class="metric-data">
+              <span class="metric-label">Active Agents</span>
+              <span class="metric-value" id="activeAgentsVal">4</span>
+            </div>
+          </div>
+
+          <div class="metric-card">
+            <div class="metric-icon emerald"><i class="fa-solid fa-bolt"></i></div>
+            <div class="metric-data">
+              <span class="metric-label">KV Efficiency</span>
+              <span class="metric-value" id="kvEfficiencyVal">98.4%</span>
+            </div>
+          </div>
+
+          <div class="metric-card">
+            <div class="metric-icon blue"><i class="fa-solid fa-microchip"></i></div>
+            <div class="metric-data">
+              <span class="metric-label">VRAM Paging</span>
+              <span class="metric-value" id="vramVal">4.9 / 16 GB</span>
+            </div>
+          </div>
+
+          <div class="metric-card">
+            <div class="metric-icon amber"><i class="fa-solid fa-gauge-high"></i></div>
+            <div class="metric-data">
+              <span class="metric-label">Throughput</span>
+              <span class="metric-value" id="throughputVal">142.5 t/s</span>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <!-- TAB 1: Task Dispatcher & Live Agent Execution -->
+      <section class="tab-panel active" id="tab-dispatcher">
+        <div class="dispatcher-grid">
+          <!-- Prompt Console -->
+          <div class="card console-card">
+            <div class="card-header">
+              <h3><i class="fa-solid fa-paper-plane"></i> Dispatch Agent Task</h3>
+              <div class="policy-toggle">
+                <label><input type="checkbox" id="preferLocalToggle" checked> Prefer Local NPU/GPU</label>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="chat-log" id="chatLog">
+                <div class="chat-message system">
+                  <i class="fa-solid fa-info-circle"></i> AgentOS Kernel listo. Envía un comando o tarea para iniciar el enrutamiento de subagentes y memoria.
+                </div>
+              </div>
+
+              <div class="input-bar">
+                <input type="text" id="taskInput" placeholder="Ejemplo: 'Genera un script de análisis y consulta el estado del sistema'..." />
+                <button id="btnSendTask" class="btn btn-primary">
+                  <span>Ejecutar</span>
+                  <i class="fa-solid fa-play"></i>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Real-Time Kernel Logs -->
+          <div class="card log-card">
+            <div class="card-header">
+              <h3><i class="fa-solid fa-list-check"></i> System & IPC Event Stream</h3>
+              <span class="badge live-badge"><i class="fa-solid fa-circle"></i> Live WebSocket</span>
+            </div>
+            <div class="card-body">
+              <div class="log-stream" id="eventStreamLog">
+                <div class="log-entry sys">[SYSTEM] WebSocket connected to AgentOS Kernel (port 3000)</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: Process Manager -->
+      <section class="tab-panel" id="tab-agents">
+        <div class="card">
+          <div class="card-header">
+            <h3><i class="fa-solid fa-diagram-project"></i> Active Agent Process Tree</h3>
+            <button class="btn btn-secondary" id="btnRefreshAgents"><i class="fa-solid fa-arrows-rotate"></i> Actualizar</button>
+          </div>
+          <div class="card-body">
+            <table class="data-table" id="agentsTable">
+              <thead>
+                <tr>
+                  <th>PID</th>
+                  <th>Proceso / Agente</th>
+                  <th>Rol</th>
+                  <th>Estado</th>
+                  <th>Prioridad</th>
+                  <th>Tokens Usados</th>
+                  <th>Herramientas / Permisos</th>
+                  <th>Acción</th>
+                </tr>
+              </thead>
+              <tbody>
+                <!-- Populated via JS -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: Model Abstraction Layer (MAL) -->
+      <section class="tab-panel" id="tab-mal">
+        <div class="mal-grid">
+          <div class="card">
+            <div class="card-header">
+              <h3><i class="fa-solid fa-server"></i> Endpoints Híbridos Registrados</h3>
+            </div>
+            <div class="card-body">
+              <div class="endpoints-list" id="endpointsList">
+                <!-- Populated via JS -->
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3><i class="fa-solid fa-route"></i> Simular Enrutador Inteligente (MAL)</h3>
+            </div>
+            <div class="card-body">
+              <div class="form-group">
+                <label>Tipo de Tarea:</label>
+                <select id="routerTaskType">
+                  <option value="text">Texto General / Razonamiento</option>
+                  <option value="code">Generación de Código</option>
+                  <option value="vision">Análisis Multimodal (Visión)</option>
+                  <option value="tool_use">Ejecución de Herramientas</option>
+                </select>
+              </div>
+              <button id="btnTestRoute" class="btn btn-primary">Probar Enrutado MAL</button>
+
+              <div class="route-result-box" id="routeResultBox" style="display:none; margin-top:20px;">
+                <!-- Result displayed here -->
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: Context Memory (UCM) -->
+      <section class="tab-panel" id="tab-memory">
+        <div class="memory-grid">
+          <div class="card">
+            <div class="card-header">
+              <h3><i class="fa-solid fa-hard-drive"></i> Marcos KV Cache Paginados (GPU VRAM vs RAM)</h3>
+            </div>
+            <div class="card-body">
+              <div class="kv-frames-grid" id="kvFramesGrid">
+                <!-- Populated via JS -->
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3><i class="fa-solid fa-magnifying-glass"></i> Búsqueda Semántica en Memoria Vectorial</h3>
+            </div>
+            <div class="card-body">
+              <div class="search-box">
+                <input type="text" id="vectorSearchInput" placeholder="Buscar concepto en la memoria semántica..." value="kernel memory" />
+                <button id="btnVectorSearch" class="btn btn-secondary"><i class="fa-solid fa-search"></i> Buscar</button>
+              </div>
+
+              <div class="vector-results" id="vectorResultsList" style="margin-top:20px;">
+                <!-- Results -->
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 5: Tool Sandbox -->
+      <section class="tab-panel" id="tab-sandbox">
+        <div class="card">
+          <div class="card-header">
+            <h3><i class="fa-solid fa-shield-virus"></i> Registro de Auditoría de Permisos e I/O</h3>
+          </div>
+          <div class="card-body">
+            <table class="data-table" id="auditTable">
+              <thead>
+                <tr>
+                  <th>Hora</th>
+                  <th>PID</th>
+                  <th>Herramienta Solicitada</th>
+                  <th>Capacidad / Ámbito</th>
+                  <th>Resultado Permiso</th>
+                </tr>
+              </thead>
+              <tbody>
+                <!-- Populated via JS -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 6: Software Studio & App IDE -->
+      <section class="tab-panel" id="tab-studio">
+        <div class="dispatcher-grid">
+          <!-- IDE Code Editor -->
+          <div class="card">
+            <div class="card-header">
+              <h3><i class="fa-solid fa-code"></i> AgentOS Software Studio & IDE</h3>
+              <button class="btn btn-primary" id="btnDeployApp"><i class="fa-solid fa-cloud-arrow-up"></i> Compilar y Desplegar App</button>
+            </div>
+            <div class="card-body">
+              <div class="form-group" style="margin-bottom:12px;">
+                <label>Nombre del Software / Agente:</label>
+                <input type="text" id="appNameInput" style="width:100%; padding:8px 12px; background:rgba(0,0,0,0.4); border:1px solid rgba(255,255,255,0.1); border-radius:6px; color:white; margin-top:4px;" value="Autonomic Code Refactorer Agent" />
+              </div>
+
+              <div class="form-group" style="margin-bottom:12px;">
+                <label>Código Fuente (AgentOS SDK TypeScript/JS):</label>
+                <textarea id="appCodeInput" style="width:100%; height:220px; font-family:var(--font-mono); font-size:13px; padding:12px; background:rgba(0,0,0,0.6); border:1px solid rgba(255,255,255,0.1); border-radius:6px; color:#6ee7b7; margin-top:4px; resize:vertical;">
+// Software App impulsada por AgentOS SDK
+const app = new AgentOS.SDK({ name: 'Refactor Agent v1.0' });
+
+app.log("Iniciando análisis de código y optimizaciones...");
+const memoryDocs = await app.searchMemory("kernel optimization");
+app.log("Documentos relevantes de contexto encontrados: " + memoryDocs.length);
+
+const aiResponse = await app.predict("Genera una optimización de memoria para el Kernel nativo.");
+app.log("Respuesta obtenida: " + aiResponse.text);
+</textarea>
+              </div>
+
+              <div class="app-output-box" id="appRunConsole" style="display:none; background:rgba(0,0,0,0.7); border:1px solid var(--border-card); border-radius:8px; padding:12px; font-family:var(--font-mono); font-size:12px; margin-top:12px; color:#a5b4fc; white-space:pre-wrap;">
+              </div>
+            </div>
+          </div>
+
+          <!-- Installed Apps List -->
+          <div class="card">
+            <div class="card-header">
+              <h3><i class="fa-solid fa-cubes"></i> Aplicaciones Instaladas en AgentOS</h3>
+            </div>
+            <div class="card-body">
+              <div class="installed-apps-list" id="installedAppsList">
+                <!-- Populated via JS -->
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

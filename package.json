@@ -1,0 +1,28 @@
+{
+  "name": "agent-os",
+  "version": "1.0.0",
+  "description": "AgentOS - AI-Native Operating System Kernel and Runtime Dashboard",
+  "main": "dist/server/kernel.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server/kernel.js",
+    "dev": "tsc-watch --onSuccess \"node dist/server/kernel.js\""
+  },
+  "keywords": ["ai", "operating-system", "agents", "llm", "kernel"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.13.0",
+    "@types/ws": "^8.5.14",
+    "tsc-watch": "^6.2.1",
+    "typescript": "^5.7.3"
+  }
+}

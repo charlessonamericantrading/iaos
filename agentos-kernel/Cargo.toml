@@ -1,0 +1,21 @@
+[package]
+name = "agentos-kernel"
+version = "0.1.0"
+edition = "2021"
+authors = ["AgentOS Deepmind AI Team"]
+description = "Bare-metal Native AI-Native Operating System Kernel in Rust (#![no_std])"
+
+[dependencies]
+spin = "0.9.8"
+volatile = "0.2.6"
+lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
+x86_64 = { version = "0.14.13", default-features = false, features = ["instructions"] }
+uart_16550 = "0.3.0"
+linked_list_allocator = "0.10.5"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
