@@ -13,6 +13,15 @@ fn main() -> ExitCode {
     let builder = DiskImageBuilder::new(PathBuf::from(kernel_path));
     let out_dir = PathBuf::from(out_dir);
 
+    // On a fresh checkout `target/disk-image/` doesn't exist yet - cargo
+    // never creates it, only this tool writes into it. Worked on every dev
+    // machine so far only because the directory already existed from a
+    // previous run; CI's clean checkout is what exposed this.
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!("[kernel-runner] failed to create output dir {}: {e}", out_dir.display());
+        return ExitCode::FAILURE;
+    }
+
     let bios_path = out_dir.join("agentos-bios.img");
     if let Err(e) = builder.create_bios_image(&bios_path) {
         eprintln!("[kernel-runner] failed to create BIOS image: {e:?}");
