@@ -33,7 +33,7 @@ static mut MAIN_RSP: u64 = 0;
 /// slot, or the return value of `prepare_initial_stack` - any other value
 /// is an arbitrary jump and stack-corrupting undefined behavior.
 #[unsafe(naked)]
-unsafe extern "C" fn switch_to(old_rsp: *mut u64, new_rsp: u64) {
+pub(crate) unsafe extern "C" fn switch_to(old_rsp: *mut u64, new_rsp: u64) {
     naked_asm!(
         "push rbp",
         "push rbx",
@@ -68,7 +68,7 @@ unsafe extern "C" fn switch_to(old_rsp: *mut u64, new_rsp: u64) {
 /// `entry`'s compiler-generated prologue assumes that invariant; getting
 /// this off by 8 produces a stack that *looks* fine until something does
 /// an aligned SSE access and takes a #GP fault.
-unsafe fn prepare_initial_stack(stack_top: *mut u8, entry: extern "C" fn() -> !) -> u64 {
+pub(crate) unsafe fn prepare_initial_stack(stack_top: *mut u8, entry: extern "C" fn() -> !) -> u64 {
     let top = ((stack_top as u64) & !0xf) - 8;
     let mut sp = top;
 
@@ -296,6 +296,18 @@ pub fn run_cooperative_demo() {
     // and the last one fell back to the kernel context.
     kprintln!("[COOP] All cooperative tasks finished - back in kernel context.");
     serial_println!("[COOP] all tasks finished, back in kernel");
+
+    // Every finished task's stack (3 x 16 KiB) would otherwise stay
+    // allocated forever - harmless in isolation, but stacking up against
+    // the preemptive demo's own task stacks gets uncomfortably close to
+    // the 100 KiB heap. Safe to free now: nothing will ever switch to a
+    // `done` task's saved_rsp again.
+    unsafe {
+        let tasks: *mut [Option<CoopTask>; MAX_COOP_TASKS] = core::ptr::addr_of_mut!(COOP_TASKS);
+        for slot in (*tasks).iter_mut() {
+            *slot = None;
+        }
+    }
 }
 
 extern "C" fn task_alpha_entry() -> ! {

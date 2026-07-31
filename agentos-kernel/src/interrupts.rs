@@ -1,9 +1,20 @@
 use crate::{gdt, kprintln, serial_println};
+use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+
+/// Monotonic count of real timer ticks since boot. A simple counter, so a
+/// plain `AtomicU64` (unlike the context-switch code's `saved_rsp` fields)
+/// is fine here - there's no "restore a stale value" hazard, just an
+/// increment nothing else contends with in a way that matters.
+static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+
+pub fn timer_ticks() -> u64 {
+    TIMER_TICKS.load(Ordering::Relaxed)
+}
 
 /// The legacy 8259 PIC defaults to delivering IRQ0-7 on vectors 0x08-0x0F,
 /// which collide head-on with CPU exceptions (0x08 is literally our
@@ -74,10 +85,18 @@ pub fn init_pics() {
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+
+    // EOI must happen before `preemptive::tick()`, which may switch to a
+    // different context and never return from *this* call - if we hadn't
+    // acknowledged the interrupt yet, the PIC would think it's still in
+    // service and could withhold further same/lower-priority IRQs.
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
+
+    crate::scheduler::preemptive::tick();
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {

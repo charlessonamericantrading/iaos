@@ -19,8 +19,8 @@ pub fn dispatch_command(line: &str) {
     let cmd = parts.next().unwrap_or("");
     match cmd {
         "help" => {
-            kprintln!("Commands: help, ps, mem, clear");
-            serial_println!("[SHELL] help -> Commands: help, ps, mem, clear");
+            kprintln!("Commands: help, ps, mem, uptime, clear");
+            serial_println!("[SHELL] help -> Commands: help, ps, mem, uptime, clear");
         }
         "ps" => {
             kprintln!("PID  PRIO   STATE    NAME");
@@ -76,6 +76,15 @@ pub fn dispatch_command(line: &str) {
                     b.addr()
                 );
             });
+        }
+        "uptime" => {
+            let ticks = crate::interrupts::timer_ticks();
+            kprintln!(
+                "Timer ticks since boot: {} (~{:.1}s at ~18.2Hz)",
+                ticks,
+                ticks as f64 / 18.2
+            );
+            serial_println!("[SHELL] uptime -> {} ticks", ticks);
         }
         "clear" => {
             crate::vga_buffer::clear_screen();

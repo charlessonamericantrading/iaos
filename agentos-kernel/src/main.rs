@@ -219,6 +219,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // priority - still cooperative, not timer-driven.
     scheduler::context_switch::run_cooperative_demo();
 
+    // 7f. Test Real Timer-Driven Preemption
+    // Unlike 7d/7e, these two tasks never call yield_now at all - the only
+    // reason either one ever stops running is the timer IRQ forcing it.
+    scheduler::preemptive::run_preemptive_demo();
+
     kprintln!("==================================================");
     kprintln!("  [SUCCESS] AgentOS Native Kernel Boot Sequence Complete ");
     kprintln!("  [SHELL] AgentOS Native Console Ready. Type commands: ");
