@@ -13,6 +13,7 @@ mod interrupts;
 mod keyboard;
 mod memory;
 mod net;
+mod pci;
 mod scheduler;
 mod serial;
 mod shell;
@@ -192,6 +193,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("help");
     shell::dispatch_command("ps");
     shell::dispatch_command("mem");
+    shell::dispatch_command("lspci");
 
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then

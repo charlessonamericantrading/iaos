@@ -83,4 +83,9 @@ jobs:
             echo "PREEMPT REGRESSION: both counters are zero - neither task ever ran."
             exit 1
           fi
+          # device=0x1237 is the real i440FX host bridge's device ID -
+          # always present at 00:00.0 on QEMU's default machine, so this
+          # confirms PCI config-space reads are actually correct, not just
+          # that the lspci command ran without crashing.
+          grep -q "device=0x1237" boot.log
           echo "All expected boot milestones found."

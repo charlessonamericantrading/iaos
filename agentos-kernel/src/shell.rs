@@ -19,8 +19,8 @@ pub fn dispatch_command(line: &str) {
     let cmd = parts.next().unwrap_or("");
     match cmd {
         "help" => {
-            kprintln!("Commands: help, ps, mem, uptime, clear");
-            serial_println!("[SHELL] help -> Commands: help, ps, mem, uptime, clear");
+            kprintln!("Commands: help, ps, mem, uptime, lspci, clear");
+            serial_println!("[SHELL] help -> Commands: help, ps, mem, uptime, lspci, clear");
         }
         "ps" => {
             kprintln!("PID  PRIO   STATE    NAME");
@@ -85,6 +85,36 @@ pub fn dispatch_command(line: &str) {
                 ticks as f64 / 18.2
             );
             serial_println!("[SHELL] uptime -> {} ticks", ticks);
+        }
+        "lspci" => {
+            let devices = crate::pci::scan_bus0();
+            kprintln!("Bus Dev Fn  Vendor Device Class");
+            serial_println!("[SHELL] lspci -> {} device(s) on bus 0", devices.len());
+            for d in &devices {
+                kprintln!(
+                    "{:3} {:3} {:2}  {:#06x} {:#06x} {:#04x}:{:#04x} ({})",
+                    d.bus,
+                    d.device,
+                    d.function,
+                    d.vendor_id,
+                    d.device_id,
+                    d.class,
+                    d.subclass,
+                    crate::pci::class_name(d.class)
+                );
+                serial_println!(
+                    "  {:02x}:{:02x}.{} vendor={:#06x} device={:#06x} class={:#04x}:{:#04x} prog_if={:#04x} ({})",
+                    d.bus,
+                    d.device,
+                    d.function,
+                    d.vendor_id,
+                    d.device_id,
+                    d.class,
+                    d.subclass,
+                    d.prog_if,
+                    crate::pci::class_name(d.class)
+                );
+            }
         }
         "clear" => {
             crate::vga_buffer::clear_screen();
