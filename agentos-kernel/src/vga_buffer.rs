@@ -137,6 +137,30 @@ impl Writer {
             });
         }
     }
+
+    /// Moves the write cursor one column left *without* erasing what's
+    /// there - unlike `backspace`, the character stays on screen. Used for
+    /// pure cursor movement (Left arrow) and internally by callers that
+    /// need to reposition after reprinting a line, where nothing about the
+    /// line's on-screen content should change, only where the next
+    /// write/erase lands.
+    pub fn cursor_left(&mut self) {
+        if self.column_position > 0 {
+            self.column_position -= 1;
+        }
+    }
+
+    /// Moves the write cursor one column right without writing anything.
+    /// The `BUFFER_WIDTH` clamp is only a hard physical backstop - callers
+    /// are expected to already know (from their own line-length
+    /// bookkeeping) exactly how far it's valid to move, same as
+    /// `cursor_left` relies on callers not calling it more times than
+    /// there are characters to move back over.
+    pub fn cursor_right(&mut self) {
+        if self.column_position < BUFFER_WIDTH {
+            self.column_position += 1;
+        }
+    }
 }
 
 impl fmt::Write for Writer {
@@ -179,4 +203,12 @@ pub fn clear_screen() {
 
 pub fn backspace() {
     WRITER.lock().backspace();
+}
+
+pub fn cursor_left() {
+    WRITER.lock().cursor_left();
+}
+
+pub fn cursor_right() {
+    WRITER.lock().cursor_right();
 }

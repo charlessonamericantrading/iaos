@@ -72,6 +72,18 @@ jobs:
           grep -q "\[EXCEPTION\] Breakpoint" boot.log
           grep -q "\[PIC\] 8259 remapped to vectors 32-47" boot.log
           grep -q "SHELL\] ps ->" boot.log
+          # Confirms cursor movement really works, not just that it
+          # compiles: typing "hep", pressing Left once, then typing "l"
+          # should insert at the cursor (between 'e' and 'p') and dispatch
+          # the real `help` command - so "help ->" must appear a SECOND
+          # time (the first is the earlier, separate help self-test).
+          # Landing on "hepl" (append-only bug) or "lhep" (wrong insert
+          # index) would both fail this - only the cursor genuinely being
+          # between 'e' and 'p' produces exactly "help".
+          if [ "$(grep -c 'SHELL\] help ->' boot.log)" -ne 2 ]; then
+            echo "CURSOR REGRESSION: expected exactly 2 'help ->' dispatches (self-test + cursor-movement test), got $(grep -c 'SHELL\] help ->' boot.log)."
+            exit 1
+          fi
           grep -q "\[CTXSWITCH\] worker -> main: demo OK" boot.log
           grep -q "\[COOP\] all tasks finished" boot.log
           # Confirms the ps-visible PCB table is really unified with the

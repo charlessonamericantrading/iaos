@@ -11,6 +11,8 @@ const SCANCODE_BACKSPACE: u8 = 0x0E;
 const SCANCODE_EXTENDED_PREFIX: u8 = 0xE0;
 const SCANCODE_UP: u8 = 0x48;
 const SCANCODE_DOWN: u8 = 0x50;
+const SCANCODE_LEFT: u8 = 0x4B;
+const SCANCODE_RIGHT: u8 = 0x4D;
 
 pub struct KeyboardDriver {
     last_scancode: u8,
@@ -18,6 +20,13 @@ pub struct KeyboardDriver {
     /// next scancode - that's the one that actually identifies the key.
     pending_extended: bool,
     line_buffer: String,
+    /// Byte index into `line_buffer` where the next insert/backspace
+    /// applies - always `<= line_buffer.len()`. Byte index and char index
+    /// coincide here because `scancode_to_char` only ever produces
+    /// single-byte ASCII, so every position is a valid char boundary;
+    /// `String::insert`/`remove` would panic on a split multi-byte
+    /// character otherwise.
+    cursor_pos: usize,
     history: Vec<String>,
     /// `None` = a fresh line (not browsing history). `Some(i)` = currently
     /// showing `history[i]`, reachable by Up/Down.
@@ -30,6 +39,7 @@ impl KeyboardDriver {
             last_scancode: 0,
             pending_extended: false,
             line_buffer: String::new(),
+            cursor_pos: 0,
             history: Vec::new(),
             history_index: None,
         }
@@ -82,7 +92,8 @@ impl KeyboardDriver {
 
     /// Moves to the previous (older) history entry, if any. Returns
     /// `true` if `line_buffer` changed (caller is responsible for
-    /// updating the screen to match).
+    /// updating the screen to match). Leaves the cursor at the end of the
+    /// recalled line, same convention as a real shell.
     fn recall_older(&mut self) -> bool {
         if self.history.is_empty() {
             return false;
@@ -95,6 +106,7 @@ impl KeyboardDriver {
         self.history_index = Some(new_index);
         self.line_buffer.clear();
         self.line_buffer.push_str(&self.history[new_index]);
+        self.cursor_pos = self.line_buffer.len();
         true
     }
 
@@ -107,13 +119,63 @@ impl KeyboardDriver {
                 self.history_index = Some(i + 1);
                 self.line_buffer.clear();
                 self.line_buffer.push_str(&self.history[i + 1]);
+                self.cursor_pos = self.line_buffer.len();
                 true
             }
             Some(_) => {
                 self.history_index = None;
                 self.line_buffer.clear();
+                self.cursor_pos = 0;
                 true
             }
+        }
+    }
+
+    /// Inserts `ch` at the cursor (not necessarily at the end) and
+    /// redraws the line to match.
+    fn insert_char(&mut self, ch: char) {
+        let old_len = self.line_buffer.len();
+        let old_cursor = self.cursor_pos;
+        self.line_buffer.insert(self.cursor_pos, ch);
+        self.cursor_pos += 1;
+        self.redraw_line(old_len, old_cursor);
+    }
+
+    /// Deletes the character just before the cursor (if any) and redraws.
+    /// A no-op at the start of the line, same as a real shell.
+    fn backspace_char(&mut self) {
+        if self.cursor_pos == 0 {
+            return;
+        }
+        let old_len = self.line_buffer.len();
+        let old_cursor = self.cursor_pos;
+        self.line_buffer.remove(self.cursor_pos - 1);
+        self.cursor_pos -= 1;
+        self.redraw_line(old_len, old_cursor);
+    }
+
+    /// The one fully general way to keep the screen in sync with
+    /// `line_buffer`/`cursor_pos` after *any* edit - including one in the
+    /// middle of the line, which shifts every character after it. Plain
+    /// `backspace()` only ever erases from wherever the writer's cursor
+    /// currently sits, moving further left - so to erase the *whole*
+    /// previous line correctly regardless of where `old_cursor` was, this
+    /// first moves right to the true old end (`cursor_right` for each
+    /// character between `old_cursor` and `old_len`), then backspaces the
+    /// full `old_len`, reprints the new `line_buffer` from scratch, and
+    /// finally moves left back to the new `cursor_pos` (a no-op if the
+    /// edit was at the end, which keeps the common case exactly as cheap
+    /// as before this method existed).
+    fn redraw_line(&self, old_len: usize, old_cursor: usize) {
+        for _ in old_cursor..old_len {
+            crate::vga_buffer::cursor_right();
+        }
+        for _ in 0..old_len {
+            crate::vga_buffer::backspace();
+        }
+        kprint!("{}", self.line_buffer);
+        for _ in self.cursor_pos..self.line_buffer.len() {
+            crate::vga_buffer::cursor_left();
         }
     }
 }
@@ -130,10 +192,10 @@ lazy_static! {
 ///
 /// Accumulates printable characters into a per-driver line buffer and
 /// hands the completed line to `shell::dispatch_command` on Enter.
-/// Backspace pops the last buffered character and erases it on screen.
-/// Up/Down browse real command history, erasing and reprinting the line
-/// to match whichever entry is recalled. No cursor movement within a
-/// line beyond that.
+/// Backspace/typing act at the cursor, not always at the end of the line;
+/// Left/Right move the cursor without changing the buffer. Up/Down browse
+/// real command history, replacing the whole line and leaving the cursor
+/// at its end.
 pub fn handle_scancode(scancode: u8) {
     let mut kb = KEYBOARD.lock();
 
@@ -150,33 +212,42 @@ pub fn handle_scancode(scancode: u8) {
     }
 
     if is_extended {
-        let old_len = kb.line_buffer.len();
-        let changed = match scancode {
-            SCANCODE_UP => kb.recall_older(),
-            SCANCODE_DOWN => kb.recall_newer(),
-            _ => false,
-        };
-        if changed {
-            for _ in 0..old_len {
-                crate::vga_buffer::backspace();
+        match scancode {
+            SCANCODE_UP | SCANCODE_DOWN => {
+                let old_len = kb.line_buffer.len();
+                let old_cursor = kb.cursor_pos;
+                let changed = if scancode == SCANCODE_UP {
+                    kb.recall_older()
+                } else {
+                    kb.recall_newer()
+                };
+                if changed {
+                    kb.redraw_line(old_len, old_cursor);
+                }
             }
-            kprint!("{}", kb.line_buffer);
+            SCANCODE_LEFT if kb.cursor_pos > 0 => {
+                kb.cursor_pos -= 1;
+                crate::vga_buffer::cursor_left();
+            }
+            SCANCODE_RIGHT if kb.cursor_pos < kb.line_buffer.len() => {
+                kb.cursor_pos += 1;
+                crate::vga_buffer::cursor_right();
+            }
+            _ => {}
         }
         return;
     }
 
     if scancode == SCANCODE_BACKSPACE {
-        if kb.line_buffer.pop().is_some() {
-            kb.history_index = None; // editing means we're on a fresh line again
-            drop(kb);
-            crate::vga_buffer::backspace();
-        }
+        kb.history_index = None; // editing means we're on a fresh line again
+        kb.backspace_char();
         return;
     }
 
     if let Some(ch) = kb.scancode_to_char(scancode) {
         if ch == '\n' {
             let line = core::mem::take(&mut kb.line_buffer);
+            kb.cursor_pos = 0;
             kb.history_index = None;
             if !line.trim().is_empty() {
                 kb.history.push(line.clone());
@@ -186,9 +257,8 @@ pub fn handle_scancode(scancode: u8) {
             crate::shell::dispatch_command(&line);
             kprint!("AgentOS> ");
         } else {
-            kb.line_buffer.push(ch);
             kb.history_index = None;
-            kprint!("{}", ch);
+            kb.insert_char(ch);
         }
     }
 }

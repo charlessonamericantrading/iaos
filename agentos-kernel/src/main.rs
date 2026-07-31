@@ -238,6 +238,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         keyboard::handle_scancode(code);
     }
 
+    // 7c-3. Test Left/Right Cursor Movement within a line via the real
+    // handle_scancode sequence: type "hep" (a typo missing the 'l'), press
+    // Left once (cursor moves from after 'p' to between 'e' and 'p'), type
+    // 'l', Enter. If the cursor genuinely moved and the insert landed at
+    // that position rather than at the end, the buffer is "help" - a real
+    // shell command, so success shows up as the actual help text below,
+    // not "Unknown command: 'hep'" or "...'hepl'".
+    kprintln!("[KERNEL INIT] Testing cursor movement (type 'hep', Left, 'l' -> 'help')...");
+    const CURSOR_TEST_SEQUENCE: &[u8] = &[
+        0x23, 0xA3, // h down, up
+        0x12, 0x92, // e down, up
+        0x19, 0x99, // p down, up
+        0xE0, 0x4B, 0xE0, 0xCB, // Left (press+release)
+        0x26, 0xA6, // l down, up -> inserted between 'e' and 'p'
+        0x1C, 0x9C, // enter -> dispatch "help"
+    ];
+    for &code in CURSOR_TEST_SEQUENCE {
+        keyboard::handle_scancode(code);
+    }
+
     // 7d. Test a Real Cooperative Context Switch (stack + register swap)
     // Cooperative only - the worker yields back voluntarily. Not wired to
     // the timer interrupt yet (that's real preemption, separate work).
