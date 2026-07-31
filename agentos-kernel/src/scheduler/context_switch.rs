@@ -132,3 +132,189 @@ extern "C" fn worker_entry() -> ! {
     }
     unreachable!("switch_to just moved execution to main's stack for good");
 }
+
+// ---- N-way priority-scheduled cooperative tasks ----
+//
+// Builds on the exact same `switch_to`/`prepare_initial_stack` primitives
+// as the single-worker demo above (that demo is left as-is - a minimal,
+// independent regression test for the raw switch mechanism). This layer
+// adds the part that's actually scheduler-shaped: registering more than
+// one task and picking *which* one runs next by priority. Still
+// cooperative - a task only ever changes on a voluntary `yield_now()` -
+// nothing here is wired to the timer interrupt yet.
+
+use crate::scheduler::process::Priority;
+
+const MAX_COOP_TASKS: usize = 4;
+const TASK_STACK_SIZE: usize = 16 * 1024;
+
+struct CoopTask {
+    name: &'static str,
+    priority: Priority,
+    done: bool,
+    saved_rsp: u64,
+    _stack: Box<[u8]>,
+}
+
+/// # Safety invariant
+/// Touched only from cooperative task/kernel code, one context running at
+/// a time on a single core - the same invariant `MAIN_RSP` above relies
+/// on. Every access goes through a raw pointer from `addr_of_mut!`/
+/// `addr_of!` rather than `&mut COOP_TASKS` etc. directly, so a long-lived
+/// reference into the static is never created (keeps this clean under the
+/// `static_mut_refs` lint, which `-D warnings` in CI would otherwise
+/// reject).
+static mut COOP_TASKS: [Option<CoopTask>; MAX_COOP_TASKS] = {
+    const EMPTY: Option<CoopTask> = None;
+    [EMPTY; MAX_COOP_TASKS]
+};
+static mut COOP_CURRENT: Option<usize> = None;
+static mut COOP_KERNEL_RSP: u64 = 0;
+
+/// Registers a new cooperative task on its own heap-backed stack. Call
+/// from the kernel context before the first `yield_now()` - spawning from
+/// inside an already-running task isn't supported yet. Returns `false` if
+/// all `MAX_COOP_TASKS` slots are taken.
+pub fn spawn_cooperative(
+    name: &'static str,
+    priority: Priority,
+    entry: extern "C" fn() -> !,
+) -> bool {
+    unsafe {
+        let tasks: *mut [Option<CoopTask>; MAX_COOP_TASKS] = core::ptr::addr_of_mut!(COOP_TASKS);
+        for slot in (*tasks).iter_mut() {
+            if slot.is_none() {
+                let mut stack = Box::new([0u8; TASK_STACK_SIZE]);
+                let stack_top = stack.as_mut_ptr().add(TASK_STACK_SIZE);
+                let saved_rsp = prepare_initial_stack(stack_top, entry);
+                *slot = Some(CoopTask {
+                    name,
+                    priority,
+                    done: false,
+                    saved_rsp,
+                    _stack: stack,
+                });
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Switches away from the current context (kernel, if this is the first
+/// call, or whichever task last ran) to the highest-priority not-yet-
+/// finished task - ties broken by lowest slot index, the same convention
+/// `NativeAgentScheduler::schedule_next` uses. Falls back to the original
+/// kernel context once every task has finished.
+///
+/// A no-op if the highest-priority runnable task is already the caller: a
+/// real switch in that case would restore `saved_rsp` as of the *last*
+/// time this exact task was switched away from, not "now" - the value
+/// about to be overwritten one line into `switch_to` - corrupting its
+/// stack. Skipping the switch entirely is both correct and cheaper.
+pub fn yield_now() {
+    unsafe {
+        let tasks: *mut [Option<CoopTask>; MAX_COOP_TASKS] = core::ptr::addr_of_mut!(COOP_TASKS);
+
+        let mut best: Option<usize> = None;
+        for idx in 0..MAX_COOP_TASKS {
+            if let Some(task) = &(*tasks)[idx] {
+                if !task.done {
+                    let is_better = match best {
+                        None => true,
+                        Some(b) => {
+                            let current_best = (*tasks)[b].as_ref().unwrap();
+                            (task.priority as u8) < (current_best.priority as u8)
+                        }
+                    };
+                    if is_better {
+                        best = Some(idx);
+                    }
+                }
+            }
+        }
+
+        let current_ptr = core::ptr::addr_of_mut!(COOP_CURRENT);
+        let from = *current_ptr;
+
+        if best == from {
+            return;
+        }
+
+        let old_rsp_ptr: *mut u64 = match from {
+            Some(i) => {
+                let task = (*tasks)[i].as_mut().unwrap();
+                &mut task.saved_rsp
+            }
+            None => core::ptr::addr_of_mut!(COOP_KERNEL_RSP),
+        };
+
+        let new_rsp: u64 = match best {
+            Some(i) => (*tasks)[i].as_ref().unwrap().saved_rsp,
+            None => *core::ptr::addr_of!(COOP_KERNEL_RSP),
+        };
+
+        *current_ptr = best;
+        switch_to(old_rsp_ptr, new_rsp);
+    }
+}
+
+/// Marks the calling task finished (so it's never selected again) and
+/// yields away - never returns, since nothing will ever resume this
+/// task's stack again.
+pub fn finish_current_task() -> ! {
+    unsafe {
+        let tasks: *mut [Option<CoopTask>; MAX_COOP_TASKS] = core::ptr::addr_of_mut!(COOP_TASKS);
+        if let Some(i) = *core::ptr::addr_of!(COOP_CURRENT) {
+            (*tasks)[i].as_mut().unwrap().done = true;
+        }
+    }
+    yield_now();
+    unreachable!("yield_now switched away from a finished task for good");
+}
+
+/// Proof that this is a real priority scheduler, not just round-robin:
+/// three tasks (High/Normal/Background) each print twice, yielding
+/// between prints. Because the highest-priority not-done task always wins
+/// the scan in `yield_now` (including against itself, via the no-op
+/// self-switch case above), each task runs to completion before the next
+/// lower-priority one gets a single instruction - the expected serial
+/// order is fully deterministic: alpha x2, then bravo x2, then charlie x2.
+pub fn run_cooperative_demo() {
+    kprintln!(
+        "[COOP] Spawning 3 cooperative tasks: alpha(High), bravo(Normal), charlie(Background)..."
+    );
+    serial_println!("[COOP] spawn alpha(High) bravo(Normal) charlie(Background)");
+
+    spawn_cooperative("task-alpha", Priority::High, task_alpha_entry);
+    spawn_cooperative("task-bravo", Priority::Normal, task_bravo_entry);
+    spawn_cooperative("task-charlie", Priority::Background, task_charlie_entry);
+
+    yield_now();
+
+    // Resumes here only once every task has called finish_current_task()
+    // and the last one fell back to the kernel context.
+    kprintln!("[COOP] All cooperative tasks finished - back in kernel context.");
+    serial_println!("[COOP] all tasks finished, back in kernel");
+}
+
+extern "C" fn task_alpha_entry() -> ! {
+    coop_task_body("alpha")
+}
+
+extern "C" fn task_bravo_entry() -> ! {
+    coop_task_body("bravo")
+}
+
+extern "C" fn task_charlie_entry() -> ! {
+    coop_task_body("charlie")
+}
+
+fn coop_task_body(name: &str) -> ! {
+    for i in 1..=2 {
+        kprintln!("[TASK {}] iteration {}/2", name, i);
+        serial_println!("[TASK {}] iteration {}/2", name, i);
+        yield_now();
+    }
+    finish_current_task();
+}

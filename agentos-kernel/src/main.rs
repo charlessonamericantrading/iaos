@@ -214,6 +214,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // the timer interrupt yet (that's real preemption, separate work).
     scheduler::context_switch::run_demo();
 
+    // 7e. Test a Real N-Way Priority Cooperative Scheduler
+    // Generalizes 7d from one hardcoded worker to multiple tasks picked by
+    // priority - still cooperative, not timer-driven.
+    scheduler::context_switch::run_cooperative_demo();
+
     kprintln!("==================================================");
     kprintln!("  [SUCCESS] AgentOS Native Kernel Boot Sequence Complete ");
     kprintln!("  [SHELL] AgentOS Native Console Ready. Type commands: ");
