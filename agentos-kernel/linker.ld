@@ -28,4 +28,15 @@ SECTIONS {
     {
         *(.bss .bss.*)
     }
+
+    /DISCARD/ :
+    {
+        *(.eh_frame)
+        *(.eh_frame_hdr)
+        *(.comment)
+        *(.note*)
+        *(.rela.*)
+        *(.got)
+        *(.got.plt)
+    }
 }

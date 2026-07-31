@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 #![allow(dead_code)]
+#![feature(abi_x86_interrupt)]
 
 use core::panic::PanicInfo;
 
@@ -51,6 +52,12 @@ pub extern "C" fn _start() -> ! {
 
     kprintln!("[KERNEL INIT] Loading IDT Interrupt Handlers...");
     interrupts::init_idt();
+
+    // 2b. Smoke-test the breakpoint handler: if this line is followed by
+    // "[EXCEPTION] Breakpoint..." instead of a reset/hang, exception handling works.
+    kprintln!("[KERNEL INIT] Testing breakpoint exception handler (int3)...");
+    x86_64::instructions::interrupts::int3();
+    kprintln!("[KERNEL INIT] Execution resumed after breakpoint - handler OK.");
 
     // 3. Initialize Native Agent Multitask Scheduler
     kprintln!("[KERNEL INIT] Starting Agent Multitask Scheduler...");
