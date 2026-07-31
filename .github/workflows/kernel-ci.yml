@@ -50,14 +50,17 @@ jobs:
 
       # Boots headlessly and greps the serial log for milestones from
       # across every phase of the kernel (exceptions, PIC/interrupts, the
-      # shell dispatcher, the cooperative context switch) - a real
-      # smoke test, not just "did it compile". `|| true` on the qemu
+      # shell dispatcher, the cooperative and preemptive schedulers) - a
+      # real smoke test, not just "did it compile". `|| true` on the qemu
       # invocation because `timeout` exits non-zero when it has to kill
       # the still-running kernel, which is the expected/healthy outcome
-      # (the kernel's idle loop never exits on its own).
+      # (the kernel's idle loop never exits on its own). 25s (not 15s) to
+      # leave margin for the preemptive demo's ~2.7s real timer wait on
+      # top of everything before it, especially on a possibly slower/
+      # nested-virtualized CI runner than local dev hardware.
       - name: Boot-test in QEMU and verify the serial trace
         run: |
-          timeout 15 qemu-system-x86_64 \
+          timeout 25 qemu-system-x86_64 \
             -drive format=raw,file=agentos-kernel/target/disk-image/agentos-bios.img \
             -serial stdio -display none -no-reboot -no-shutdown \
             | tee boot.log || true
@@ -70,4 +73,14 @@ jobs:
           grep -q "\[PIC\] 8259 remapped to vectors 32-47" boot.log
           grep -q "SHELL\] ps ->" boot.log
           grep -q "\[CTXSWITCH\] worker -> main: demo OK" boot.log
+          grep -q "\[COOP\] all tasks finished" boot.log
+          grep -q "\[PREEMPT\] task0=" boot.log
+          # Regression guard for the exact bug this demo caught locally:
+          # both counters at exactly 0 means the timer-forced switches
+          # never really happened (e.g. a non-atomic flag/counter got
+          # optimized away again), not that preemption is merely slow.
+          if grep -q "\[PREEMPT\] task0=0 task1=0" boot.log; then
+            echo "PREEMPT REGRESSION: both counters are zero - neither task ever ran."
+            exit 1
+          fi
           echo "All expected boot milestones found."
