@@ -3,6 +3,9 @@ use spin::Mutex;
 use lazy_static::lazy_static;
 use crate::kprint;
 
+/// PS/2 set 1 make-code for Backspace.
+const SCANCODE_BACKSPACE: u8 = 0x0E;
+
 pub struct KeyboardDriver {
     last_scancode: u8,
     line_buffer: String,
@@ -72,14 +75,22 @@ lazy_static! {
 /// down-code while a key is held - we only act on a genuinely new key-down.
 ///
 /// Accumulates printable characters into a per-driver line buffer and hands
-/// the completed line to `shell::dispatch_command` on Enter - no
-/// backspace/line-editing yet, just enough to make the prompt real instead
-/// of an echo-only demo.
+/// the completed line to `shell::dispatch_command` on Enter. Backspace pops
+/// the last buffered character and erases it on screen; there's no
+/// line-history or cursor movement beyond that.
 pub fn handle_scancode(scancode: u8) {
     let mut kb = KEYBOARD.lock();
     let is_new_press = scancode != kb.last_scancode && (scancode & 0x80) == 0;
     kb.last_scancode = scancode;
     if !is_new_press {
+        return;
+    }
+
+    if scancode == SCANCODE_BACKSPACE {
+        if kb.line_buffer.pop().is_some() {
+            drop(kb);
+            crate::vga_buffer::backspace();
+        }
         return;
     }
 

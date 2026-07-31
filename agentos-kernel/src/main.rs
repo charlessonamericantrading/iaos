@@ -187,7 +187,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("ps");
     shell::dispatch_command("mem");
 
-    // 7c. Test a Real Cooperative Context Switch (stack + register swap)
+    // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
+    // byte sequence through the real handle_scancode() - typing "pss" then
+    // one backspace should leave "ps" (verified: this dispatches the real
+    // `ps` process listing below, not an "Unknown command: 'pss'").
+    kprintln!("[KERNEL INIT] Testing keyboard backspace (typing 'pss' + backspace -> 'ps')...");
+    const BACKSPACE_TEST_SEQUENCE: &[u8] = &[
+        0x19, 0x99, // p down, up
+        0x1F, 0x9F, // s down, up
+        0x1F, 0x9F, // s down, up (repeated key - needs the break code above first)
+        0x0E, 0x8E, // backspace down, up
+        0x1C, 0x9C, // enter down, up
+    ];
+    for &code in BACKSPACE_TEST_SEQUENCE {
+        keyboard::handle_scancode(code);
+    }
+
+    // 7d. Test a Real Cooperative Context Switch (stack + register swap)
     // Cooperative only - the worker yields back voluntarily. Not wired to
     // the timer interrupt yet (that's real preemption, separate work).
     scheduler::context_switch::run_demo();

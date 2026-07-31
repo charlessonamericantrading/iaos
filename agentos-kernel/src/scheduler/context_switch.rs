@@ -91,8 +91,14 @@ unsafe fn prepare_initial_stack(stack_top: *mut u8, entry: extern "C" fn() -> !)
 pub fn run_demo() {
     kprintln!("[KERNEL INIT] Testing cooperative context switch (real stack/register swap)...");
 
-    let stack = Box::new([0u8; WORKER_STACK_SIZE]);
-    let stack_top = unsafe { stack.as_ptr().add(WORKER_STACK_SIZE) as *mut u8 };
+    let mut stack = Box::new([0u8; WORKER_STACK_SIZE]);
+    // as_mut_ptr(), not as_ptr(): the stack gets written through this
+    // pointer (via prepare_initial_stack and then the worker itself), and
+    // a pointer derived from a shared (`&`) reference doesn't have valid
+    // provenance for that under Rust's aliasing rules, even after an `as
+    // *mut` cast - only cosmetically different from as_ptr() today, but
+    // as_mut_ptr() is the version that's actually sound to write through.
+    let stack_top = unsafe { stack.as_mut_ptr().add(WORKER_STACK_SIZE) };
     let worker_rsp = unsafe { prepare_initial_stack(stack_top, worker_entry) };
 
     kprintln!("[CTXSWITCH] main -> worker");

@@ -121,6 +121,22 @@ impl Writer {
         }
         self.column_position = 0;
     }
+
+    /// Erases the last character on the current line. Only handles the
+    /// single-line case (does nothing at column 0) - the shell prompt is
+    /// always a fresh line after Enter, so backspacing across a wrapped
+    /// line boundary isn't a real scenario here yet.
+    pub fn backspace(&mut self) {
+        if self.column_position > 0 {
+            self.column_position -= 1;
+            let row = BUFFER_HEIGHT - 1;
+            let col = self.column_position;
+            self.buffer.chars[row][col].write(ScreenChar {
+                ascii_character: b' ',
+                color_code: self.color_code,
+            });
+        }
+    }
 }
 
 impl fmt::Write for Writer {
@@ -157,4 +173,8 @@ pub fn _print(args: fmt::Arguments) {
 
 pub fn clear_screen() {
     WRITER.lock().clear_screen();
+}
+
+pub fn backspace() {
+    WRITER.lock().backspace();
 }
