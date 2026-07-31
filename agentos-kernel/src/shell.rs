@@ -19,9 +19,9 @@ pub fn dispatch_command(line: &str) {
     let cmd = parts.next().unwrap_or("");
     match cmd {
         "help" => {
-            kprintln!("Commands: help, ps, mem, uptime, lspci, disk, ls, cat, clear");
+            kprintln!("Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, clear");
             serial_println!(
-                "[SHELL] help -> Commands: help, ps, mem, uptime, lspci, disk, ls, cat, clear"
+                "[SHELL] help -> Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, clear"
             );
         }
         "ps" => {
@@ -89,6 +89,27 @@ pub fn dispatch_command(line: &str) {
                 ticks as f64 / 18.2
             );
             serial_println!("[SHELL] uptime -> {} ticks", ticks);
+        }
+        "date" => {
+            let t = crate::rtc::read_time();
+            kprintln!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                t.year,
+                t.month,
+                t.day,
+                t.hours,
+                t.minutes,
+                t.seconds
+            );
+            serial_println!(
+                "[SHELL] date -> {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                t.year,
+                t.month,
+                t.day,
+                t.hours,
+                t.minutes,
+                t.seconds
+            );
         }
         "lspci" => {
             let devices = crate::pci::scan_bus0();

@@ -19,6 +19,7 @@ mod memory;
 mod net;
 mod partition;
 mod pci;
+mod rtc;
 mod scheduler;
 mod serial;
 mod shell;
@@ -198,6 +199,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("help");
     shell::dispatch_command("ps");
     shell::dispatch_command("mem");
+    shell::dispatch_command("uptime");
+    shell::dispatch_command("date");
     shell::dispatch_command("lspci");
 
     // 7b-2. First real step toward a real e1000 NIC driver: find the real
