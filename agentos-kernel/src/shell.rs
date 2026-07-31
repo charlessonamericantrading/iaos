@@ -43,21 +43,31 @@ pub fn dispatch_command(line: &str) {
             });
         }
         "mem" => {
-            let kv_blocks = KV_MANAGER.lock().get_allocated_count();
+            let manager = KV_MANAGER.lock();
             kprintln!(
                 "Heap: {:#x}..{:#x} ({} KiB) | KV cache blocks allocated: {}",
                 heap::HEAP_START,
                 heap::HEAP_START + heap::HEAP_SIZE,
                 heap::HEAP_SIZE / 1024,
-                kv_blocks
+                manager.get_allocated_count()
             );
             serial_println!(
                 "[SHELL] mem -> heap {:#x}..{:#x} ({} KiB), kv_blocks={}",
                 heap::HEAP_START,
                 heap::HEAP_START + heap::HEAP_SIZE,
                 heap::HEAP_SIZE / 1024,
-                kv_blocks
+                manager.get_allocated_count()
             );
+            manager.for_each_block(|b| {
+                kprintln!(
+                    "  KV block #{} pid={} {:?} {}B @ {:#x}",
+                    b.block_id, b.pid, b.location, b.size_bytes(), b.addr()
+                );
+                serial_println!(
+                    "  KV block #{} pid={} {:?} {}B @ {:#x}",
+                    b.block_id, b.pid, b.location, b.size_bytes(), b.addr()
+                );
+            });
         }
         "clear" => {
             crate::vga_buffer::clear_screen();
