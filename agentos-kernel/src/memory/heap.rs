@@ -7,7 +7,11 @@ use x86_64::VirtAddr;
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 pub const HEAP_START: usize = 0x4444_4444_0000;
-pub const HEAP_SIZE: usize = 100 * 1024; // 100 KiB
+// 1 MiB. Was 100 KiB until `cat`-ing a real file off the FAT12 partition
+// (see fat12.rs) proved that too small: `read_file` needs one contiguous
+// allocation big enough for the whole file, and every real file on this
+// disk (116-148 KiB) already exceeded the old heap's total size.
+pub const HEAP_SIZE: usize = 1024 * 1024;
 
 /// Maps every page in the heap's virtual range to a freshly allocated
 /// physical frame, then hands that now-backed range to the allocator.

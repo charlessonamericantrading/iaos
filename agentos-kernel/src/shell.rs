@@ -19,9 +19,9 @@ pub fn dispatch_command(line: &str) {
     let cmd = parts.next().unwrap_or("");
     match cmd {
         "help" => {
-            kprintln!("Commands: help, ps, mem, uptime, lspci, disk, ls, clear");
+            kprintln!("Commands: help, ps, mem, uptime, lspci, disk, ls, cat, clear");
             serial_println!(
-                "[SHELL] help -> Commands: help, ps, mem, uptime, lspci, disk, ls, clear"
+                "[SHELL] help -> Commands: help, ps, mem, uptime, lspci, disk, ls, cat, clear"
             );
         }
         "ps" => {
@@ -167,13 +167,47 @@ pub fn dispatch_command(line: &str) {
                 }
             }
         }
-        "ls" => match list_fat32_root() {
+        "ls" => match list_root_directory() {
             Ok(()) => {}
             Err(e) => {
                 kprintln!("ls: {}", e);
                 serial_println!("[SHELL] ls -> FAILED: {}", e);
             }
         },
+        "cat" => {
+            let filename = parts.next().unwrap_or("");
+            if filename.is_empty() {
+                kprintln!("cat: usage: cat FILENAME.EXT");
+                serial_println!("[SHELL] cat -> no filename given");
+            } else {
+                match read_fat_file(filename) {
+                    Ok(data) => {
+                        kprintln!("Read {} bytes from '{}'.", data.len(), filename);
+                        serial_println!("[SHELL] cat {} -> {} bytes", filename, data.len());
+                        if data.len() >= 4 {
+                            kprintln!(
+                                "  first 4 bytes: {:02x} {:02x} {:02x} {:02x}",
+                                data[0],
+                                data[1],
+                                data[2],
+                                data[3]
+                            );
+                            serial_println!(
+                                "  first4={:02x}{:02x}{:02x}{:02x}",
+                                data[0],
+                                data[1],
+                                data[2],
+                                data[3]
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        kprintln!("cat: {}", e);
+                        serial_println!("[SHELL] cat {} -> FAILED: {}", filename, e);
+                    }
+                }
+            }
+        }
         "clear" => {
             crate::vga_buffer::clear_screen();
             serial_println!("[SHELL] clear -> VGA screen cleared");
@@ -203,26 +237,22 @@ fn state_label(s: ProcessState) -> &'static str {
     }
 }
 
-/// Finds the first FAT32 partition in the MBR and lists its root
-/// directory - the `ls` command's implementation, pulled out of the
-/// dispatch match arm so it can use `?` for the multi-step read/parse
-/// chain (MBR -> partition table -> BPB -> cluster-chain walk).
-fn list_fat32_root() -> Result<(), &'static str> {
+/// Finds the first FAT-typed partition in the MBR. Returns it by value
+/// (not a reference into the local `mbr` buffer) so callers aren't tied
+/// to that buffer's short lifetime.
+fn find_fat_partition() -> Result<crate::partition::PartitionEntry, &'static str> {
     let mut mbr = [0u8; 512];
     crate::ata::read_sector(0, &mut mbr)?;
+    crate::partition::parse_mbr(&mbr)
+        .into_iter()
+        .find(|p| matches!(p.partition_type, 0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E))
+        .ok_or("no FAT-typed partition found in the MBR")
+}
 
-    let partitions = crate::partition::parse_mbr(&mbr);
-    let fat32 = partitions
-        .iter()
-        .find(|p| p.partition_type == 0x0B || p.partition_type == 0x0C)
-        .ok_or("no FAT32 partition found in the MBR")?;
-
-    let fs = crate::fat32::read_bpb(fat32)?;
-    let entries = fs.list_directory(fs.root_cluster)?;
-
-    kprintln!("FAT32 root directory ({} entries):", entries.len());
-    serial_println!("[SHELL] ls -> {} entries", entries.len());
-    for e in &entries {
+fn print_dir_entries(fs_name: &str, entries: &[crate::fat_common::DirEntry]) {
+    kprintln!("{} root directory ({} entries):", fs_name, entries.len());
+    serial_println!("[SHELL] ls -> {} {} entries", fs_name, entries.len());
+    for e in entries {
         kprintln!(
             "  {}{:<12} {} bytes",
             if e.is_dir { "[DIR] " } else { "      " },
@@ -237,5 +267,37 @@ fn list_fat32_root() -> Result<(), &'static str> {
             e.is_dir
         );
     }
-    Ok(())
+}
+
+/// The `ls` command's implementation: tries FAT32 first, and falls back
+/// to FAT12/16 if the partition doesn't parse as FAT32 - our own disk's
+/// `0x0C`-typed partition is actually FAT12 (see `fat32::read_bpb`'s doc
+/// comment), so this fallback is what makes `ls` actually work on it
+/// instead of just reporting "not FAT32" and stopping.
+fn list_root_directory() -> Result<(), &'static str> {
+    let partition = find_fat_partition()?;
+    match crate::fat32::read_bpb(&partition) {
+        Ok(fs) => {
+            let entries = fs.list_directory(fs.root_cluster)?;
+            print_dir_entries("FAT32", &entries);
+            Ok(())
+        }
+        Err(fat32_err) => {
+            serial_println!("[SHELL] ls -> not FAT32 ({}), trying FAT12/16", fat32_err);
+            let fs = crate::fat12::read_bpb(&partition)?;
+            let entries = fs.list_root_directory()?;
+            print_dir_entries("FAT12/16", &entries);
+            Ok(())
+        }
+    }
+}
+
+/// The `cat` command's implementation - same FAT32-then-FAT12/16 fallback
+/// as `list_root_directory`.
+fn read_fat_file(name: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
+    let partition = find_fat_partition()?;
+    match crate::fat32::read_bpb(&partition) {
+        Ok(fs) => fs.read_file(name),
+        Err(_) => crate::fat12::read_bpb(&partition)?.read_file(name),
+    }
 }

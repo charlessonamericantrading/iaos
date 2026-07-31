@@ -1,14 +1,15 @@
 //! Minimal read-only FAT32 support: parse the BIOS Parameter Block (BPB),
-//! walk the FAT cluster chain, and list a directory's entries.
+//! walk the FAT cluster chain, list a directory, and read a file's
+//! contents by name. Short (8.3) names only; VFAT long-filename entries
+//! are recognized and skipped, not reconstructed.
 //!
-//! Deliberately stops at *listing* what's there - reading a file's actual
-//! contents by name is the next real step once this is proven, not
-//! attempted here. Short (8.3) names only; VFAT long-filename entries are
-//! recognized and skipped, not reconstructed.
+//! Directory-entry parsing is shared with `fat12.rs` via `fat_common` -
+//! that part of the on-disk format is identical across FAT12/16/32, only
+//! the FAT table encoding and root-directory location differ.
 
 use crate::ata;
+use crate::fat_common::{self, DirEntry};
 use crate::partition::PartitionEntry;
-use alloc::string::String;
 use alloc::vec::Vec;
 
 pub struct Fat32Info {
@@ -18,13 +19,6 @@ pub struct Fat32Info {
     pub fat_size_32: u32,
     pub root_cluster: u32,
     pub partition_start_lba: u32,
-}
-
-pub struct DirEntry {
-    pub name: String,
-    pub is_dir: bool,
-    pub size: u32,
-    pub start_cluster: u32,
 }
 
 /// Reads and parses the FAT32 BPB from the first sector of `partition`.
@@ -52,7 +46,7 @@ pub fn read_bpb(partition: &PartitionEntry) -> Result<Fat32Info, &'static str> {
     // garbage large enough to compute an LBA in the billions.
     let root_entry_count = u16::from_le_bytes([sector[17], sector[18]]);
     if root_entry_count != 0 {
-        return Err("not FAT32 (root_entry_count != 0 means this is FAT12/16, not supported yet)");
+        return Err("not FAT32 (root_entry_count != 0 means this is FAT12/16)");
     }
 
     let sectors_per_cluster = sector[13];
@@ -129,26 +123,8 @@ impl Fat32Info {
             let cluster_lba = self.cluster_to_lba(cluster);
             for s in 0..self.sectors_per_cluster as u32 {
                 ata::read_sector(cluster_lba + s, &mut sector_buf)?;
-                for raw in sector_buf.as_chunks::<32>().0 {
-                    if raw[0] == 0x00 {
-                        break 'outer; // no more entries anywhere in this directory
-                    }
-                    if raw[0] == 0xE5 || raw[11] == 0x0F || raw[11] & 0x08 != 0 {
-                        continue; // deleted / long-filename (VFAT) / volume label
-                    }
-
-                    let name = format_short_name(&raw[0..8], &raw[8..11]);
-                    let is_dir = raw[11] & 0x10 != 0;
-                    let hi = u16::from_le_bytes([raw[20], raw[21]]) as u32;
-                    let lo = u16::from_le_bytes([raw[26], raw[27]]) as u32;
-                    let size = u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]);
-
-                    entries.push(DirEntry {
-                        name,
-                        is_dir,
-                        size,
-                        start_cluster: (hi << 16) | lo,
-                    });
+                if fat_common::parse_dir_sector(&sector_buf, &mut entries) {
+                    break 'outer;
                 }
             }
 
@@ -160,24 +136,41 @@ impl Fat32Info {
 
         Ok(entries)
     }
-}
 
-/// Reconstructs a "NAME.EXT" string from the raw 8-byte name + 3-byte
-/// extension fields of a short directory entry (space-padded on disk).
-fn format_short_name(name: &[u8], ext: &[u8]) -> String {
-    let mut s = String::new();
-    for &b in name {
-        if b == b' ' {
-            break;
+    /// Finds `name` (case-insensitive, short 8.3 form) in the root
+    /// directory and reads its full contents by walking its cluster
+    /// chain.
+    pub fn read_file(&self, name: &str) -> Result<Vec<u8>, &'static str> {
+        let entries = self.list_directory(self.root_cluster)?;
+        let entry = entries
+            .iter()
+            .find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(name))
+            .ok_or("FAT32: file not found in root directory")?;
+
+        if entry.size == 0 {
+            return Ok(Vec::new());
         }
-        s.push(b as char);
-    }
-    let ext_len = ext.iter().take_while(|&&b| b != b' ').count();
-    if ext_len > 0 {
-        s.push('.');
-        for &b in &ext[..ext_len] {
-            s.push(b as char);
+
+        let mut data = Vec::with_capacity(entry.size as usize);
+        let mut cluster = entry.start_cluster;
+        let mut sector_buf = [0u8; 512];
+
+        loop {
+            let cluster_lba = self.cluster_to_lba(cluster);
+            for s in 0..self.sectors_per_cluster as u32 {
+                ata::read_sector(cluster_lba + s, &mut sector_buf)?;
+                let remaining = entry.size as usize - data.len();
+                let take = remaining.min(512);
+                data.extend_from_slice(&sector_buf[..take]);
+                if data.len() >= entry.size as usize {
+                    return Ok(data);
+                }
+            }
+
+            match self.next_cluster(cluster)? {
+                Some(next) => cluster = next,
+                None => return Ok(data),
+            }
         }
     }
-    s
 }

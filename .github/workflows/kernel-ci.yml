@@ -104,4 +104,18 @@ jobs:
           # happened locally before this check existed: a garbage LBA in
           # the billions and a confusing raw ATA error instead).
           grep -q "not FAT32 (root_entry_count" boot.log
+          # Confirms the FAT12 fallback actually parsed the fixed-location
+          # root directory and found all 3 real files on this disk (the
+          # two bootloader stages + the kernel binary itself) - not just
+          # that fat12::read_bpb() ran without erroring.
+          grep -q "FAT12/16 3 entries" boot.log
+          grep -q "KERNEL~1 132992 bytes" boot.log
+          # Confirms `cat` walked the FAT12 cluster chain (starting at
+          # cluster 268, per the ls listing above) and read back the file's
+          # *exact* byte count. first4=7f454c46 is the real ELF magic
+          # number (\x7fELF) - the strongest evidence available that the
+          # bytes read off disk are genuinely the kernel's own binary, not
+          # just a plausible-looking length.
+          grep -q "SHELL\] cat KERNEL~1 -> 132992 bytes" boot.log
+          grep -q "first4=7f454c46" boot.log
           echo "All expected boot milestones found."
