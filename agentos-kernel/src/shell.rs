@@ -19,8 +19,8 @@ pub fn dispatch_command(line: &str) {
     let cmd = parts.next().unwrap_or("");
     match cmd {
         "help" => {
-            kprintln!("Commands: help, ps, mem, uptime, lspci, clear");
-            serial_println!("[SHELL] help -> Commands: help, ps, mem, uptime, lspci, clear");
+            kprintln!("Commands: help, ps, mem, uptime, lspci, disk, clear");
+            serial_println!("[SHELL] help -> Commands: help, ps, mem, uptime, lspci, disk, clear");
         }
         "ps" => {
             kprintln!("PID  PRIO   STATE    NAME");
@@ -114,6 +114,30 @@ pub fn dispatch_command(line: &str) {
                     d.prog_if,
                     crate::pci::class_name(d.class)
                 );
+            }
+        }
+        "disk" => {
+            let mut buf = [0u8; 512];
+            match crate::ata::read_sector(0, &mut buf) {
+                Ok(()) => {
+                    let sig_ok = buf[510] == 0x55 && buf[511] == 0xAA;
+                    kprintln!(
+                        "ATA read OK: LBA 0, 512 bytes. Boot signature (bytes 510-511): {:#04x}{:02x} ({})",
+                        buf[510],
+                        buf[511],
+                        if sig_ok { "valid MBR" } else { "unexpected" }
+                    );
+                    serial_println!(
+                        "[SHELL] disk -> LBA0 read OK, signature={:#04x}{:02x} ({})",
+                        buf[510],
+                        buf[511],
+                        if sig_ok { "valid" } else { "UNEXPECTED" }
+                    );
+                }
+                Err(e) => {
+                    kprintln!("ATA read failed: {}", e);
+                    serial_println!("[SHELL] disk -> FAILED: {}", e);
+                }
             }
         }
         "clear" => {

@@ -40,6 +40,15 @@ impl InterruptIndex {
     }
 }
 
+/// IRQ14, the primary ATA channel's completion interrupt - PIC_2_OFFSET+6
+/// (IRQ8 is the slave PIC's first line, so IRQ14 is its 6th). `ata.rs`
+/// only ever does polling PIO reads and disables interrupts while doing
+/// so, but the drive raises this anyway the moment a command finishes,
+/// and it stays *pending* at the PIC until interrupts are re-enabled -
+/// leaving it with no handler at all faulted (straight to double-fault,
+/// not even a catchable #GP) the first time this code ran a real read.
+pub const ATA_PRIMARY_IRQ_VECTOR: u8 = PIC_2_OFFSET + 6;
+
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
@@ -56,6 +65,7 @@ lazy_static! {
         }
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+        idt[ATA_PRIMARY_IRQ_VECTOR].set_handler_fn(ata_primary_interrupt_handler);
         idt
     };
 }
@@ -64,7 +74,7 @@ pub fn init_idt() {
     IDT.load();
     kprintln!("[IDT] Native IDT Loaded into CPU Register (LIDT)");
     serial_println!("[IDT] Native IDT Loaded into CPU Register (LIDT)");
-    kprintln!("[IDT] Handlers armed: breakpoint, double-fault(IST), page-fault, GPF, divide-error, invalid-opcode, timer(IRQ0), keyboard(IRQ1)");
+    kprintln!("[IDT] Handlers armed: breakpoint, double-fault(IST), page-fault, GPF, divide-error, invalid-opcode, timer(IRQ0), keyboard(IRQ1), ata-primary(IRQ14)");
 }
 
 /// Remaps the 8259 PIC to `PIC_1_OFFSET..PIC_2_OFFSET+8` and unmasks IRQs.
@@ -109,6 +119,19 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
+}
+
+/// `ata.rs` only ever polls status registers - it never waits on this
+/// interrupt - but the drive raises it anyway, so it needs *a* handler to
+/// exist even though this one has nothing useful to do beyond
+/// acknowledging it. IRQ8-15 are chained through the slave PIC, so
+/// `notify_end_of_interrupt` must (and does, via `pic8259`) EOI both the
+/// slave and the master - skipping the master would leave it thinking
+/// the slave's cascade line is still busy, blocking IRQ8-13/15 too.
+extern "x86-interrupt" fn ata_primary_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(ATA_PRIMARY_IRQ_VECTOR);
     }
 }
 

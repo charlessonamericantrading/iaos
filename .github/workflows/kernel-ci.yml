@@ -88,4 +88,8 @@ jobs:
           # confirms PCI config-space reads are actually correct, not just
           # that the lspci command ran without crashing.
           grep -q "device=0x1237" boot.log
+          # Confirms the ATA PIO sector read got real bytes back, not just
+          # that it returned without crashing - 0x55AA is only present at
+          # 510-511 if the MBR was actually read correctly.
+          grep -q "signature=0x55aa (valid)" boot.log
           echo "All expected boot milestones found."
