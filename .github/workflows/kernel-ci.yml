@@ -1,0 +1,61 @@
+name: kernel-ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Toolchain (channel/components/target) comes from
+      # agentos-kernel/rust-toolchain.toml - rustup auto-installs it on
+      # first use, so this stays in sync with local dev by construction
+      # instead of duplicating the pin here.
+      - name: Build agentos-kernel
+        working-directory: agentos-kernel
+        run: cargo build --release
+
+      # Separate host-target crate (its own rust-toolchain.toml) that
+      # packages the kernel ELF into a bootable disk image via the
+      # `bootloader` crate's DiskImageBuilder.
+      - name: Build kernel-runner and package a bootable disk image
+        working-directory: kernel-runner
+        run: |
+          cargo build --release
+          ./target/release/kernel-runner \
+            "../agentos-kernel/target/x86_64-unknown-none/release/agentos-kernel" \
+            "../agentos-kernel/target/disk-image"
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+
+      # Boots headlessly and greps the serial log for milestones from
+      # across every phase of the kernel (exceptions, PIC/interrupts, the
+      # shell dispatcher, the cooperative context switch) - a real
+      # smoke test, not just "did it compile". `|| true` on the qemu
+      # invocation because `timeout` exits non-zero when it has to kill
+      # the still-running kernel, which is the expected/healthy outcome
+      # (the kernel's idle loop never exits on its own).
+      - name: Boot-test in QEMU and verify the serial trace
+        run: |
+          timeout 15 qemu-system-x86_64 \
+            -drive format=raw,file=agentos-kernel/target/disk-image/agentos-bios.img \
+            -serial stdio -display none -no-reboot -no-shutdown \
+            | tee boot.log || true
+          echo "----- full boot.log -----"
+          cat boot.log
+          echo "--------------------------"
+          grep -q "AgentOS Native Bare-Metal Kernel Initialized" boot.log
+          grep -q "\[IDT\] Native IDT Loaded" boot.log
+          grep -q "\[EXCEPTION\] Breakpoint" boot.log
+          grep -q "\[PIC\] 8259 remapped to vectors 32-47" boot.log
+          grep -q "SHELL\] ps ->" boot.log
+          grep -q "\[CTXSWITCH\] worker -> main: demo OK" boot.log
+          echo "All expected boot milestones found."

@@ -1,5 +1,7 @@
 # AgentOS
 
+[![kernel-ci](https://github.com/charlessonamericantrading/iaos/actions/workflows/kernel-ci.yml/badge.svg)](https://github.com/charlessonamericantrading/iaos/actions/workflows/kernel-ci.yml)
+
 An "AI-native" operating system project, explored in two independent, **not yet integrated** directions:
 
 1. **[`agentos-kernel/`](agentos-kernel/)** — a real bare-metal kernel written in Rust (`#![no_std]`), booting on actual x86_64 hardware/QEMU. This is the actively developed half of the project.
