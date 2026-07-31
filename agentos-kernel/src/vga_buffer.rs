@@ -114,6 +114,13 @@ impl Writer {
             self.buffer.chars[row][col].write(blank);
         }
     }
+
+    pub fn clear_screen(&mut self) {
+        for row in 0..BUFFER_HEIGHT {
+            self.clear_row(row);
+        }
+        self.column_position = 0;
+    }
 }
 
 impl fmt::Write for Writer {
@@ -146,4 +153,8 @@ macro_rules! kprintln {
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
     WRITER.lock().write_fmt(args).unwrap();
+}
+
+pub fn clear_screen() {
+    WRITER.lock().clear_screen();
 }

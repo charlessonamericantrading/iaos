@@ -18,6 +18,7 @@ mod syscall;
 mod keyboard;
 mod gguf_loader;
 mod net;
+mod shell;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -177,6 +178,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     syscall::dispatch_syscall(syscall::SYS_SERIAL_PRINT, 0, 0, 0);
     let spawned_pid = syscall::dispatch_syscall(syscall::SYS_AGENT_SPAWN, 10000, 0, 0);
     syscall::dispatch_syscall(syscall::SYS_KV_ALLOC, spawned_pid, 1024, 0);
+
+    // 7b. Test the Shell Command Dispatcher (same parser the IRQ1 keyboard
+    // handler calls once a real key press ends a line - this exercises it
+    // without needing one, so it's provable from a headless serial capture.
+    kprintln!("[KERNEL INIT] Testing shell command dispatcher (help, ps, mem)...");
+    shell::dispatch_command("help");
+    shell::dispatch_command("ps");
+    shell::dispatch_command("mem");
 
     kprintln!("==================================================");
     kprintln!("  [SUCCESS] AgentOS Native Kernel Boot Sequence Complete ");

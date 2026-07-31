@@ -61,6 +61,15 @@ impl NativeAgentScheduler {
     pub fn get_active_count(&self) -> usize {
         self.processes.iter().filter(|p| p.is_some()).count()
     }
+
+    /// Read-only iteration over live processes, for the `ps` shell command -
+    /// keeps the fixed-size `processes` array a private implementation
+    /// detail instead of exposing it directly.
+    pub fn for_each_process<F: FnMut(&ProcessControlBlock)>(&self, mut f: F) {
+        for slot in self.processes.iter().flatten() {
+            f(slot);
+        }
+    }
 }
 
 lazy_static! {

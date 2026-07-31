@@ -18,6 +18,7 @@ The kernel **boots for real** in QEMU via the [`bootloader`](https://github.com/
 | 8259 PIC + hardware interrupts | **Real.** PIC remapped to vectors 32-47 (avoids colliding with CPU exception vectors 8-15), interrupts enabled, timer (IRQ0) and keyboard (IRQ1) are interrupt-driven, not polled. |
 | Physical memory / paging / heap | **Real.** Frame allocator walks the actual `BootInfo` memory map (skips regions already used by the kernel/bootloader); the heap is properly mapped page-by-page before use. `alloc` (`Vec`, `Box`, `String`) works. |
 | Agent scheduler | Partial. Real priority-based process table, but no timer-driven preemption or context switching yet — picks a "next" PID without actually switching registers/stacks. |
+| Interactive shell | Real (small). The `AgentOS>` prompt is IRQ1-driven (not polled), buffers a real line (heap-backed `String`), and dispatches `help` / `ps` / `mem` / `clear` against the live scheduler, KV-cache, and heap state - not canned output. No history or line-editing (backspace) yet. |
 | KV-cache memory manager | Simulated. Fixed-size static array with fabricated physical addresses; not backed by real allocated/mapped memory. |
 | GGUF model loader / tensor engine | Simulated. Parses a hardcoded 24-byte sample header and runs a toy 4x4 matmul+ReLU; does not load or run a real model file. |
 | VirtIO-net / TCP/IP stack | Simulated. Prints a fixed MAC address and increments packet counters; does not touch real VirtIO MMIO/virtqueues. |

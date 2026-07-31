@@ -1,14 +1,19 @@
+use alloc::string::String;
 use spin::Mutex;
 use lazy_static::lazy_static;
-use crate::{kprint, kprintln};
+use crate::kprint;
 
 pub struct KeyboardDriver {
     last_scancode: u8,
+    line_buffer: String,
 }
 
 impl KeyboardDriver {
     pub const fn new() -> Self {
-        KeyboardDriver { last_scancode: 0 }
+        KeyboardDriver {
+            last_scancode: 0,
+            line_buffer: String::new(),
+        }
     }
 
     /// Convert PS/2 set 1 scancode to ASCII char
@@ -65,6 +70,11 @@ lazy_static! {
 /// already read off PS/2 port 0x60. PS/2 set 1 sends one code on key-down
 /// and the same code with the top bit set on key-up, and can repeat the
 /// down-code while a key is held - we only act on a genuinely new key-down.
+///
+/// Accumulates printable characters into a per-driver line buffer and hands
+/// the completed line to `shell::dispatch_command` on Enter - no
+/// backspace/line-editing yet, just enough to make the prompt real instead
+/// of an echo-only demo.
 pub fn handle_scancode(scancode: u8) {
     let mut kb = KEYBOARD.lock();
     let is_new_press = scancode != kb.last_scancode && (scancode & 0x80) == 0;
@@ -75,9 +85,13 @@ pub fn handle_scancode(scancode: u8) {
 
     if let Some(ch) = kb.scancode_to_char(scancode) {
         if ch == '\n' {
-            kprintln!("\n[AGENTOS SHELL] Task dispatched to Kernel Scheduler.");
+            let line = core::mem::take(&mut kb.line_buffer);
+            drop(kb);
+            kprint!("\n");
+            crate::shell::dispatch_command(&line);
             kprint!("AgentOS> ");
         } else {
+            kb.line_buffer.push(ch);
             kprint!("{}", ch);
         }
     }
