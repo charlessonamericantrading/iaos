@@ -8,6 +8,7 @@ extern crate alloc;
 use core::panic::PanicInfo;
 
 mod ata;
+mod fat32;
 mod gdt;
 mod gguf_loader;
 mod interrupts;
@@ -197,6 +198,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("mem");
     shell::dispatch_command("lspci");
     shell::dispatch_command("disk");
+    shell::dispatch_command("ls");
 
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then

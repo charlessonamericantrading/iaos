@@ -19,8 +19,10 @@ pub fn dispatch_command(line: &str) {
     let cmd = parts.next().unwrap_or("");
     match cmd {
         "help" => {
-            kprintln!("Commands: help, ps, mem, uptime, lspci, disk, clear");
-            serial_println!("[SHELL] help -> Commands: help, ps, mem, uptime, lspci, disk, clear");
+            kprintln!("Commands: help, ps, mem, uptime, lspci, disk, ls, clear");
+            serial_println!(
+                "[SHELL] help -> Commands: help, ps, mem, uptime, lspci, disk, ls, clear"
+            );
         }
         "ps" => {
             kprintln!("PID  PRIO   STATE    NAME");
@@ -165,6 +167,13 @@ pub fn dispatch_command(line: &str) {
                 }
             }
         }
+        "ls" => match list_fat32_root() {
+            Ok(()) => {}
+            Err(e) => {
+                kprintln!("ls: {}", e);
+                serial_println!("[SHELL] ls -> FAILED: {}", e);
+            }
+        },
         "clear" => {
             crate::vga_buffer::clear_screen();
             serial_println!("[SHELL] clear -> VGA screen cleared");
@@ -192,4 +201,41 @@ fn state_label(s: ProcessState) -> &'static str {
         ProcessState::Blocked => "BLOCKED",
         ProcessState::Terminated => "DEAD",
     }
+}
+
+/// Finds the first FAT32 partition in the MBR and lists its root
+/// directory - the `ls` command's implementation, pulled out of the
+/// dispatch match arm so it can use `?` for the multi-step read/parse
+/// chain (MBR -> partition table -> BPB -> cluster-chain walk).
+fn list_fat32_root() -> Result<(), &'static str> {
+    let mut mbr = [0u8; 512];
+    crate::ata::read_sector(0, &mut mbr)?;
+
+    let partitions = crate::partition::parse_mbr(&mbr);
+    let fat32 = partitions
+        .iter()
+        .find(|p| p.partition_type == 0x0B || p.partition_type == 0x0C)
+        .ok_or("no FAT32 partition found in the MBR")?;
+
+    let fs = crate::fat32::read_bpb(fat32)?;
+    let entries = fs.list_directory(fs.root_cluster)?;
+
+    kprintln!("FAT32 root directory ({} entries):", entries.len());
+    serial_println!("[SHELL] ls -> {} entries", entries.len());
+    for e in &entries {
+        kprintln!(
+            "  {}{:<12} {} bytes",
+            if e.is_dir { "[DIR] " } else { "      " },
+            e.name,
+            e.size
+        );
+        serial_println!(
+            "  {} {} bytes cluster={} dir={}",
+            e.name,
+            e.size,
+            e.start_cluster,
+            e.is_dir
+        );
+    }
+    Ok(())
 }

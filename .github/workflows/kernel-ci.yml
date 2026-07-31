@@ -92,8 +92,16 @@ jobs:
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.
           grep -q "signature=0x55aa (valid)" boot.log
-          # Confirms MBR partition parsing found the real FAT32 partition
+          # Confirms MBR partition parsing found the real partition entry
           # the bootloader crate lays the kernel binary down in - not just
           # that parse_mbr() ran, but that it read genuine partition data.
-          grep -q "FAT32" boot.log
+          grep -q "type=0x0c (FAT32)" boot.log
+          # Our own disk's 0x0C-typed partition is actually formatted
+          # FAT12, not FAT32 - confirms the parser's root_entry_count
+          # check still correctly detects and rejects that with a clean
+          # message, rather than silently misreading FAT12's
+          # differently-shaped BPB as FAT32 fields (which is exactly what
+          # happened locally before this check existed: a garbage LBA in
+          # the billions and a confusing raw ATA error instead).
+          grep -q "not FAT32 (root_entry_count" boot.log
           echo "All expected boot milestones found."
