@@ -1,7 +1,14 @@
 use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use volatile::Volatile;
 use lazy_static::lazy_static;
+
+/// Offset added to physical addresses to reach the bootloader's identity
+/// mapping of physical memory (see `BootInfo::physical_memory_offset`).
+/// Must be set from `kernel_main` before the first `kprint!`/`kprintln!`
+/// call, since `WRITER` computes its buffer pointer on first use.
+pub static PHYS_MEM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +127,7 @@ lazy_static! {
     pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer {
         column_position: 0,
         color_code: ColorCode::new(Color::LightCyan, Color::Black),
-        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+        buffer: unsafe { &mut *((PHYS_MEM_OFFSET.load(Ordering::Relaxed) + 0xb8000) as *mut Buffer) },
     });
 }
 

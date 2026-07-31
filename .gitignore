@@ -1,3 +1,5 @@
 node_modules/
 dist/
 agentos-kernel/target/
+kernel-runner/target/
+.claude/

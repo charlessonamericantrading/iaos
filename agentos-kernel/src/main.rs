@@ -24,19 +24,29 @@ use keyboard::KEYBOARD;
 use gguf_loader::GgufModelLoader;
 use net::tcpip::NativeNetworkStack;
 
-/// Multiboot2 Header for QEMU / GRUB Bare-Metal Bootloaders
-#[link_section = ".multiboot_header"]
-#[no_mangle]
-pub static MULTIBOOT_HEADER: [u32; 4] = [
-    0xe85250d6, // Magic number (Multiboot 2)
-    0,          // Architecture 0 (i386 / x86_64 protected mode)
-    16,         // Header length
-    0x17adcf1a, // Checksum: -(0xe85250d6 + 0 + 16)
-];
+use bootloader_api::config::{BootloaderConfig, Mapping};
+use bootloader_api::{entry_point, BootInfo};
 
-/// Kernel Bare-Metal Entry Point (_start)
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+/// Physical memory must be mapped so vga_buffer can reach the 0xb8000 text
+/// buffer through `physical_memory_offset` (see BootInfo docs) instead of a
+/// raw, unmapped physical address.
+pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config
+};
+
+entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
+
+/// Kernel Entry Point, invoked by the `bootloader` crate after it has already
+/// switched the CPU to 64-bit long mode and set up paging - the multiboot2
+/// hand-rolled entry (`_start` + a 32-bit trampoline we never wrote) is gone.
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    vga_buffer::PHYS_MEM_OFFSET.store(
+        boot_info.physical_memory_offset.into_option().unwrap_or(0),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+
     // 1. Initialize Hardware Displays & Debug Serial Output
     kprintln!("==================================================");
     kprintln!("   AgentOS Native Bare-Metal Kernel v1.0 (Rust)   ");

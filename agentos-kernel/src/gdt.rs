@@ -12,8 +12,8 @@ lazy_static! {
             const STACK_SIZE: usize = 4096 * 5;
             static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
 
-            let stack_start = VirtAddr::from_ptr(unsafe { &raw const STACK });
-            let stack_end = stack_start + STACK_SIZE;
+            let stack_start = VirtAddr::from_ptr(&raw const STACK);
+            let stack_end = stack_start + STACK_SIZE as u64;
             stack_end
         };
         tss
@@ -23,8 +23,8 @@ lazy_static! {
 lazy_static! {
     static ref GDT: (GlobalDescriptorTable, Selectors) = {
         let mut gdt = GlobalDescriptorTable::new();
-        let kernel_code_selector = gdt.add_entry(Descriptor::kernel_code_segment());
-        let tss_selector = gdt.add_entry(Descriptor::tss_segment(&TSS));
+        let kernel_code_selector = gdt.append(Descriptor::kernel_code_segment());
+        let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
         (gdt, Selectors { kernel_code_selector, tss_selector })
     };
 }
@@ -37,11 +37,17 @@ struct Selectors {
 
 pub fn init() {
     use x86_64::instructions::tables::load_tss;
-    use x86_64::instructions::segmentation::{CS, Segment};
+    use x86_64::instructions::segmentation::{Segment, CS, SS};
 
     GDT.0.load();
     unsafe {
         CS::set_reg(GDT.1.kernel_code_selector);
+        // SS still holds whatever selector the bootloader's (now-replaced) GDT
+        // used. Left alone, it stays a stale index that may alias an entry in
+        // our new GDT (e.g. the TSS descriptor) and faults the next time the
+        // CPU re-validates it, such as on the `iretq` from an interrupt. Data
+        // segments are unused for addressing in long mode, so null is valid.
+        SS::set_reg(SegmentSelector::NULL);
         load_tss(GDT.1.tss_selector);
     }
 }
