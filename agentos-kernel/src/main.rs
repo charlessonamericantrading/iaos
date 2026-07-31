@@ -14,6 +14,7 @@ mod interrupts;
 mod keyboard;
 mod memory;
 mod net;
+mod partition;
 mod pci;
 mod scheduler;
 mod serial;

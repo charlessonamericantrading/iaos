@@ -133,6 +133,31 @@ pub fn dispatch_command(line: &str) {
                         buf[511],
                         if sig_ok { "valid" } else { "UNEXPECTED" }
                     );
+                    if sig_ok {
+                        for (i, p) in crate::partition::parse_mbr(&buf).iter().enumerate() {
+                            if p.partition_type == 0 {
+                                continue;
+                            }
+                            kprintln!(
+                                "  Partition {}: {}type={:#04x} ({}) start_lba={} sectors={}",
+                                i,
+                                if p.bootable { "* " } else { "  " },
+                                p.partition_type,
+                                crate::partition::partition_type_name(p.partition_type),
+                                p.start_lba,
+                                p.sector_count
+                            );
+                            serial_println!(
+                                "  partition{} type={:#04x} ({}) start_lba={} sectors={} bootable={}",
+                                i,
+                                p.partition_type,
+                                crate::partition::partition_type_name(p.partition_type),
+                                p.start_lba,
+                                p.sector_count,
+                                p.bootable
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     kprintln!("ATA read failed: {}", e);
