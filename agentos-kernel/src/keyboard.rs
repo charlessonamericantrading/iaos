@@ -1,21 +1,37 @@
 use crate::kprint;
 use alloc::string::String;
+use alloc::vec::Vec;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
 /// PS/2 set 1 make-code for Backspace.
 const SCANCODE_BACKSPACE: u8 = 0x0E;
+/// PS/2 set 1: several keys (arrows among them) send this prefix byte
+/// before their actual make/break code, e.g. Up-press is `0xE0, 0x48`.
+const SCANCODE_EXTENDED_PREFIX: u8 = 0xE0;
+const SCANCODE_UP: u8 = 0x48;
+const SCANCODE_DOWN: u8 = 0x50;
 
 pub struct KeyboardDriver {
     last_scancode: u8,
+    /// Set after seeing `SCANCODE_EXTENDED_PREFIX`, consumed by the very
+    /// next scancode - that's the one that actually identifies the key.
+    pending_extended: bool,
     line_buffer: String,
+    history: Vec<String>,
+    /// `None` = a fresh line (not browsing history). `Some(i)` = currently
+    /// showing `history[i]`, reachable by Up/Down.
+    history_index: Option<usize>,
 }
 
 impl KeyboardDriver {
     pub const fn new() -> Self {
         KeyboardDriver {
             last_scancode: 0,
+            pending_extended: false,
             line_buffer: String::new(),
+            history: Vec::new(),
+            history_index: None,
         }
     }
 
@@ -63,6 +79,43 @@ impl KeyboardDriver {
             _ => None,
         }
     }
+
+    /// Moves to the previous (older) history entry, if any. Returns
+    /// `true` if `line_buffer` changed (caller is responsible for
+    /// updating the screen to match).
+    fn recall_older(&mut self) -> bool {
+        if self.history.is_empty() {
+            return false;
+        }
+        let new_index = match self.history_index {
+            None => self.history.len() - 1,
+            Some(0) => return false, // already at the oldest entry
+            Some(i) => i - 1,
+        };
+        self.history_index = Some(new_index);
+        self.line_buffer.clear();
+        self.line_buffer.push_str(&self.history[new_index]);
+        true
+    }
+
+    /// Moves to the next (newer) history entry, or back to a fresh empty
+    /// line once past the newest. Returns `true` if `line_buffer` changed.
+    fn recall_newer(&mut self) -> bool {
+        match self.history_index {
+            None => false, // already a fresh line
+            Some(i) if i + 1 < self.history.len() => {
+                self.history_index = Some(i + 1);
+                self.line_buffer.clear();
+                self.line_buffer.push_str(&self.history[i + 1]);
+                true
+            }
+            Some(_) => {
+                self.history_index = None;
+                self.line_buffer.clear();
+                true
+            }
+        }
+    }
 }
 
 lazy_static! {
@@ -72,22 +125,49 @@ lazy_static! {
 /// Called from the IRQ1 handler in `interrupts.rs` with the scancode
 /// already read off PS/2 port 0x60. PS/2 set 1 sends one code on key-down
 /// and the same code with the top bit set on key-up, and can repeat the
-/// down-code while a key is held - we only act on a genuinely new key-down.
+/// down-code while a key is held - we only act on a genuinely new key-down
+/// (this applies equally to the byte following an extended `0xE0` prefix).
 ///
-/// Accumulates printable characters into a per-driver line buffer and hands
-/// the completed line to `shell::dispatch_command` on Enter. Backspace pops
-/// the last buffered character and erases it on screen; there's no
-/// line-history or cursor movement beyond that.
+/// Accumulates printable characters into a per-driver line buffer and
+/// hands the completed line to `shell::dispatch_command` on Enter.
+/// Backspace pops the last buffered character and erases it on screen.
+/// Up/Down browse real command history, erasing and reprinting the line
+/// to match whichever entry is recalled. No cursor movement within a
+/// line beyond that.
 pub fn handle_scancode(scancode: u8) {
     let mut kb = KEYBOARD.lock();
+
+    if scancode == SCANCODE_EXTENDED_PREFIX {
+        kb.pending_extended = true;
+        return;
+    }
+    let is_extended = core::mem::take(&mut kb.pending_extended);
+
     let is_new_press = scancode != kb.last_scancode && (scancode & 0x80) == 0;
     kb.last_scancode = scancode;
     if !is_new_press {
         return;
     }
 
+    if is_extended {
+        let old_len = kb.line_buffer.len();
+        let changed = match scancode {
+            SCANCODE_UP => kb.recall_older(),
+            SCANCODE_DOWN => kb.recall_newer(),
+            _ => false,
+        };
+        if changed {
+            for _ in 0..old_len {
+                crate::vga_buffer::backspace();
+            }
+            kprint!("{}", kb.line_buffer);
+        }
+        return;
+    }
+
     if scancode == SCANCODE_BACKSPACE {
         if kb.line_buffer.pop().is_some() {
+            kb.history_index = None; // editing means we're on a fresh line again
             drop(kb);
             crate::vga_buffer::backspace();
         }
@@ -97,12 +177,17 @@ pub fn handle_scancode(scancode: u8) {
     if let Some(ch) = kb.scancode_to_char(scancode) {
         if ch == '\n' {
             let line = core::mem::take(&mut kb.line_buffer);
+            kb.history_index = None;
+            if !line.trim().is_empty() {
+                kb.history.push(line.clone());
+            }
             drop(kb);
             kprint!("\n");
             crate::shell::dispatch_command(&line);
             kprint!("AgentOS> ");
         } else {
             kb.line_buffer.push(ch);
+            kb.history_index = None;
             kprint!("{}", ch);
         }
     }

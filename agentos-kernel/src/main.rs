@@ -209,6 +209,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         keyboard::handle_scancode(code);
     }
 
+    // 7c-2. Test Shell Command History (Up/Down) via the real handle_scancode
+    // sequence: "xx"+Enter, "yy"+Enter, Up, Up, Enter. Two Up presses from a
+    // fresh line should land on the OLDER of the two ("xx"), not "yy" - so
+    // the final Enter should dispatch "xx" again, meaning "Unknown command:
+    // 'xx'" appears twice in the log total and "...'yy'" only once.
+    kprintln!("[KERNEL INIT] Testing shell history (xx, yy, Up, Up -> recall 'xx')...");
+    const HISTORY_TEST_SEQUENCE: &[u8] = &[
+        0x2D, 0xAD, 0x2D, 0xAD, // "xx"
+        0x1C, 0x9C, // enter -> dispatch "xx"
+        0x15, 0x95, 0x15, 0x95, // "yy"
+        0x1C, 0x9C, // enter -> dispatch "yy"
+        0xE0, 0x48, 0xE0, 0xC8, // Up (press+release) -> recall "yy"
+        0xE0, 0x48, 0xE0, 0xC8, // Up (press+release) -> recall "xx"
+        0x1C, 0x9C, // enter -> dispatch recalled "xx"
+    ];
+    for &code in HISTORY_TEST_SEQUENCE {
+        keyboard::handle_scancode(code);
+    }
+
     // 7d. Test a Real Cooperative Context Switch (stack + register swap)
     // Cooperative only - the worker yields back voluntarily. Not wired to
     // the timer interrupt yet (that's real preemption, separate work).
