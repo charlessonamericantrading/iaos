@@ -143,16 +143,20 @@ extern "C" fn worker_entry() -> ! {
 // cooperative - a task only ever changes on a voluntary `yield_now()` -
 // nothing here is wired to the timer interrupt yet.
 
-use crate::scheduler::process::Priority;
+use crate::scheduler::agent_scheduler::SCHEDULER;
+use crate::scheduler::process::{Priority, ProcessState};
 
 const MAX_COOP_TASKS: usize = 4;
 const TASK_STACK_SIZE: usize = 16 * 1024;
 
 struct CoopTask {
-    name: &'static str,
     priority: Priority,
     done: bool,
     saved_rsp: u64,
+    /// Real PCB pid, registered with `SCHEDULER` at spawn time - this is
+    /// what makes this task show up in the `ps` shell command instead of
+    /// only existing inside this module's own private task table.
+    pid: u32,
     _stack: Box<[u8]>,
 }
 
@@ -171,10 +175,14 @@ static mut COOP_TASKS: [Option<CoopTask>; MAX_COOP_TASKS] = {
 static mut COOP_CURRENT: Option<usize> = None;
 static mut COOP_KERNEL_RSP: u64 = 0;
 
-/// Registers a new cooperative task on its own heap-backed stack. Call
-/// from the kernel context before the first `yield_now()` - spawning from
-/// inside an already-running task isn't supported yet. Returns `false` if
-/// all `MAX_COOP_TASKS` slots are taken.
+/// Registers a new cooperative task on its own heap-backed stack, and as a
+/// real entry in the `ps`-visible `SCHEDULER` PCB table (`Ready`, so it
+/// shows up correctly even before its first `yield_now`-driven switch).
+/// Call from the kernel context before the first `yield_now()` - spawning
+/// from inside an already-running task isn't supported yet. Returns
+/// `false` if all `MAX_COOP_TASKS` slots are taken, or if the PCB table
+/// itself is full (shares `MAX_PROCESSES` with every other PCB spawn
+/// source, so a lot of unrelated spawning elsewhere could exhaust it).
 pub fn spawn_cooperative(
     name: &'static str,
     priority: Priority,
@@ -184,14 +192,20 @@ pub fn spawn_cooperative(
         let tasks: *mut [Option<CoopTask>; MAX_COOP_TASKS] = core::ptr::addr_of_mut!(COOP_TASKS);
         for slot in (*tasks).iter_mut() {
             if slot.is_none() {
+                // Token quota 0: these are cooperative-scheduler plumbing
+                // tasks, not LLM-agent work, so the token-budget field
+                // NativeAgentScheduler otherwise tracks doesn't apply.
+                let Some(pid) = SCHEDULER.lock().spawn(name, priority, 0) else {
+                    return false;
+                };
                 let mut stack = Box::new([0u8; TASK_STACK_SIZE]);
                 let stack_top = stack.as_mut_ptr().add(TASK_STACK_SIZE);
                 let saved_rsp = prepare_initial_stack(stack_top, entry);
                 *slot = Some(CoopTask {
-                    name,
                     priority,
                     done: false,
                     saved_rsp,
+                    pid,
                     _stack: stack,
                 });
                 return true;
@@ -241,6 +255,36 @@ pub fn yield_now() {
             return;
         }
 
+        // Keep the ps-visible PCB table honest. The incoming task's PCB
+        // stack_pointer is refreshed from saved_rsp here - guaranteed
+        // current, since the *last* switch_to that moved this same task
+        // off-CPU is exactly what wrote it. The outgoing task (if any, and
+        // if it isn't finishing for good - finish_current_task already
+        // marked that case Terminated, `!done` skips re-marking it Ready)
+        // goes back to Ready; its own stack_pointer is left as-is here
+        // (one yield-cycle stale until it next becomes "best" above,
+        // which is harmless - `ps` is diagnostic-only, nothing schedules
+        // off this value).
+        if let Some(i) = from {
+            if let Some(task) = (*tasks)[i].as_ref() {
+                if !task.done {
+                    SCHEDULER.lock().update_process(
+                        task.pid,
+                        ProcessState::Ready,
+                        task.saved_rsp as usize,
+                    );
+                }
+            }
+        }
+        if let Some(i) = best {
+            let task = (*tasks)[i].as_ref().unwrap();
+            SCHEDULER.lock().update_process(
+                task.pid,
+                ProcessState::Running,
+                task.saved_rsp as usize,
+            );
+        }
+
         let old_rsp_ptr: *mut u64 = match from {
             Some(i) => {
                 let task = (*tasks)[i].as_mut().unwrap();
@@ -266,7 +310,13 @@ pub fn finish_current_task() -> ! {
     unsafe {
         let tasks: *mut [Option<CoopTask>; MAX_COOP_TASKS] = core::ptr::addr_of_mut!(COOP_TASKS);
         if let Some(i) = *core::ptr::addr_of!(COOP_CURRENT) {
-            (*tasks)[i].as_mut().unwrap().done = true;
+            let task = (*tasks)[i].as_mut().unwrap();
+            task.done = true;
+            SCHEDULER.lock().update_process(
+                task.pid,
+                ProcessState::Terminated,
+                task.saved_rsp as usize,
+            );
         }
     }
     yield_now();
@@ -298,9 +348,8 @@ pub fn run_cooperative_demo() {
     serial_println!("[COOP] all tasks finished, back in kernel");
 
     // Every finished task's stack (3 x 16 KiB) would otherwise stay
-    // allocated forever - harmless in isolation, but stacking up against
-    // the preemptive demo's own task stacks gets uncomfortably close to
-    // the 100 KiB heap. Safe to free now: nothing will ever switch to a
+    // allocated forever - harmless in isolation, but no reason to hold
+    // onto it either. Safe to free now: nothing will ever switch to a
     // `done` task's saved_rsp again.
     unsafe {
         let tasks: *mut [Option<CoopTask>; MAX_COOP_TASKS] = core::ptr::addr_of_mut!(COOP_TASKS);
@@ -326,6 +375,16 @@ fn coop_task_body(name: &str) -> ! {
     for i in 1..=2 {
         kprintln!("[TASK {}] iteration {}/2", name, i);
         serial_println!("[TASK {}] iteration {}/2", name, i);
+        if name == "alpha" && i == 1 {
+            // Proof this isn't just a same-boot-time coincidence: `ps`
+            // dispatched from *inside* a running cooperative task, reading
+            // the exact same SCHEDULER `spawn_cooperative` just registered
+            // into. At this precise point alpha must show RUNNING (it's
+            // the one calling this) and bravo/charlie READY (spawned, not
+            // yet switched to) - real, live scheduler state, not a fixed
+            // boot-time table `ps` used to only ever show.
+            crate::shell::dispatch_command("ps");
+        }
         yield_now();
     }
     finish_current_task();

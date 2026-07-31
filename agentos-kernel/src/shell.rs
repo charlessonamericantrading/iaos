@@ -25,22 +25,24 @@ pub fn dispatch_command(line: &str) {
             );
         }
         "ps" => {
-            kprintln!("PID  PRIO   STATE    NAME");
+            kprintln!("PID  PRIO   STATE    NAME              RSP");
             serial_println!("[SHELL] ps ->");
             SCHEDULER.lock().for_each_process(|p| {
                 kprintln!(
-                    "{:<4} {:<6} {:<8} {}",
+                    "{:<4} {:<6} {:<8} {:<17} {:#x}",
                     p.pid,
                     priority_label(p.priority),
                     state_label(p.state),
-                    p.name
+                    p.name,
+                    p.stack_pointer
                 );
                 serial_println!(
-                    "  PID {} [{}] {} {}",
+                    "  PID {} [{}] {} {} rsp={:#x}",
                     p.pid,
                     priority_label(p.priority),
                     state_label(p.state),
-                    p.name
+                    p.name,
+                    p.stack_pointer
                 );
             });
         }

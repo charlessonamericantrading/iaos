@@ -245,8 +245,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // 7e. Test a Real N-Way Priority Cooperative Scheduler
     // Generalizes 7d from one hardcoded worker to multiple tasks picked by
-    // priority - still cooperative, not timer-driven.
+    // priority - still cooperative, not timer-driven. Also proves the
+    // ps-visible PCB table is now really unified with this scheduler: the
+    // demo itself calls `ps` from inside the "alpha" task to show live
+    // RUNNING/READY state, and this second call afterward should show
+    // task-alpha/bravo/charlie as real PCB entries in TERMINATED state
+    // with distinct, real (nonzero) stack pointers - not the fixed
+    // boot-time-only table `ps` used to be limited to.
     scheduler::context_switch::run_cooperative_demo();
+    shell::dispatch_command("ps");
 
     // 7f. Test Real Timer-Driven Preemption
     // Unlike 7d/7e, these two tasks never call yield_now at all - the only

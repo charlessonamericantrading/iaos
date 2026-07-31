@@ -70,6 +70,21 @@ impl NativeAgentScheduler {
             f(slot);
         }
     }
+
+    /// Updates an existing process's scheduling state and last-known stack
+    /// pointer by pid - lets a real task scheduler (currently the
+    /// cooperative one in `context_switch.rs`) keep this `ps`-visible table
+    /// honest as tasks actually run/yield/finish, instead of every entry
+    /// only ever reflecting whatever `spawn` set once at boot.
+    pub fn update_process(&mut self, pid: u32, state: ProcessState, stack_pointer: usize) {
+        for slot in self.processes.iter_mut().flatten() {
+            if slot.pid == pid {
+                slot.state = state;
+                slot.stack_pointer = stack_pointer;
+                return;
+            }
+        }
+    }
 }
 
 lazy_static! {

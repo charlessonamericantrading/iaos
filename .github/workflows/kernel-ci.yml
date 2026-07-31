@@ -74,6 +74,29 @@ jobs:
           grep -q "SHELL\] ps ->" boot.log
           grep -q "\[CTXSWITCH\] worker -> main: demo OK" boot.log
           grep -q "\[COOP\] all tasks finished" boot.log
+          # Confirms the ps-visible PCB table is really unified with the
+          # cooperative scheduler now, not just two disjoint task tables
+          # that happen to both exist. Mid-demo: task-alpha (spawned first,
+          # highest priority) must already be RUNNING with a real stack
+          # pointer at the exact point it dispatches `ps` on itself, while
+          # its not-yet-scheduled siblings still show the PCB default of
+          # rsp=0x0 - proving ps reflects live state, not a fixed table.
+          # Deliberately NOT asserting the exact rsp value here (same
+          # lesson as the FAT12 byte-count fix above): only that it starts
+          # with the heap's address prefix, since the precise byte offset
+          # can shift a little depending on what got allocated earlier in
+          # boot on a given machine. 0x444444 is guaranteed to prefix any
+          # real address in this kernel's whole 1 MiB heap range
+          # (0x444444440000..0x444444540000, see memory/heap.rs).
+          grep -q "PID 5 \[HIGH\] RUNNING task-alpha rsp=0x444444" boot.log
+          grep -q "task-bravo rsp=0x0" boot.log
+          grep -q "task-charlie rsp=0x0" boot.log
+          # After the demo: all three really terminated (not just stopped
+          # existing), each with a distinct real stack pointer recorded -
+          # proof the PCB updates kept firing through to the very end.
+          grep -q "PID 5 \[HIGH\] DEAD task-alpha rsp=0x444444" boot.log
+          grep -q "PID 6 \[NORM\] DEAD task-bravo rsp=0x444444" boot.log
+          grep -q "PID 7 \[BG\] DEAD task-charlie rsp=0x444444" boot.log
           grep -q "\[PREEMPT\] task0=" boot.log
           # Regression guard for the exact bug this demo caught locally:
           # both counters at exactly 0 means the timer-forced switches
