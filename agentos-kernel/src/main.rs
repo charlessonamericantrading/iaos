@@ -259,8 +259,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // memory-mapped registers (reusing the same PHYS_MEM_OFFSET mechanism
     // vga_buffer.rs already relies on for the VGA text buffer - see
     // net/e1000.rs's module doc), and read its real STATUS/MAC registers.
-    // Not a real TX/RX driver yet - that's separate future work.
     net::e1000::probe();
+
+    // 7b-3. Real e1000 TX attempt: build a real transmit descriptor ring
+    // (using fresh physical frames from the global allocator - Fase 21)
+    // and hand a real ARP request to the hardware. Genuinely proven: the
+    // ring's physical address and descriptor content are correct, and the
+    // hardware really dequeues the descriptor (TDH advances). NOT yet
+    // resolved: the descriptor's Descriptor-Done status bit never gets
+    // written back in local testing, despite several independently ruled-
+    // out hypotheses - see net/e1000.rs's module doc for the full
+    // investigation. This currently always returns Err; kept and reported
+    // honestly as real partial progress, not reverted.
+    match net::e1000::send_test_frame() {
+        Ok(()) => {}
+        Err(e) => {
+            kprintln!("[E1000] send_test_frame: {}", e);
+            serial_println!("[E1000] tx_sent -> not yet confirmed: {}", e);
+        }
+    }
 
     shell::dispatch_command("disk");
     shell::dispatch_command("ls");

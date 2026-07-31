@@ -1,13 +1,24 @@
-//! Minimal real e1000 NIC access - the first step toward replacing
-//! `net::virtio_net`'s fully simulated driver with something that talks to
-//! actual hardware. QEMU's default machine (no extra `-device` flags)
-//! exposes a real Intel 8254x-family NIC at PCI vendor:device 8086:100e -
-//! confirmed present via `pci.rs`'s real enumeration (see README/Fase 11).
+//! Real e1000 NIC access. `net::virtio_net` remains fully simulated - this
+//! module talks to actual hardware. QEMU's default machine (no extra
+//! `-device` flags) exposes a real Intel 8254x-family NIC at PCI
+//! vendor:device 8086:100e - confirmed present via `pci.rs`'s real
+//! enumeration (see README/Fase 11).
 //!
-//! This step deliberately stops at "find it, reach its registers, read a
-//! couple back" - a real TX/RX driver (descriptor rings, actually
-//! sending/receiving frames) is substantially more work and is left for
-//! separate future iterations.
+//! Two stages so far:
+//! - `probe()` (Fase 19): find the device, reach its registers, read a
+//!   couple back (STATUS, MAC via RAL0/RAH0) - proof this kernel can
+//!   genuinely talk to real device MMIO at all.
+//! - `send_test_frame()` (Fase 22): build a real transmit descriptor
+//!   ring and hand a frame to the hardware. Register offsets and the
+//!   legacy TX descriptor layout were cross-checked against a real
+//!   shipped driver (MINIX's `e1000_reg.h`) and QEMU's own `e1000.c`/
+//!   `e1000_regs.h` rather than relied on from memory alone, given the
+//!   cost of getting hardware-register-level code wrong. **This stage is
+//!   a real, verified partial result, not a full success - see the
+//!   "known limitation" section below.**
+//!
+//! Real RX (receiving a frame back) is deliberately not attempted yet -
+//! separate future work.
 //!
 //! ## Why no new page-table mapping code was needed
 //! The e1000's BAR0 is a *memory-mapped* register window (not I/O-port
@@ -20,7 +31,41 @@
 //! "usable RAM" region and that already works, this reuses the identical,
 //! already-proven technique instead of writing new mapping code -
 //! confirmed to actually work for *this* physical address by booting and
-//! reading real register values below, not just assumed by analogy.
+//! reading real register values below, not just assumed by analogy. The
+//! TX descriptor ring and packet buffer below reuse it too, for the exact
+//! same reason: `memory::frame_allocator::allocate_frame()` (Fase 21)
+//! hands back a physical frame, and `PHYS_MEM_OFFSET + that address` is
+//! already a valid, mapped virtual address to write through - no dedicated
+//! DMA-region mapping code needed.
+//!
+//! ## Known limitation, found and documented honestly (Fase 22)
+//! `send_test_frame` genuinely engages the hardware: the descriptor ring's
+//! physical address, the descriptor's own content (verified correct via a
+//! direct memory read-back before the kick), and the TDT-triggered dequeue
+//! all work - **TDH provably advances from 0 to 1 the instant TDT is
+//! written**, proof the device really read the descriptor off the ring.
+//! What does *not* happen, in every variant tried locally: the
+//! descriptor's `status` byte (the DD/Descriptor-Done bit `TXD_STATUS_DD`)
+//! never gets written back - not even a partial write; a full 16-byte raw
+//! dump after timeout shows every byte exactly as this code left it,
+//! `status` included. Ruled out so far, each with its own real test, not
+//! just reasoning: wrong register offsets or descriptor layout (both
+//! cross-checked against multiple independent sources and confirmed
+//! correct via memory read-back); `TCTL`/`TIPG` misconfiguration (QEMU's
+//! own source shows `TCTL.EN` doesn't gate the writeback step, and `TIPG`
+//! writes read back as `0` regardless - QEMU's e1000 model likely doesn't
+//! model wire-timing at all, so this register is probably a no-op there);
+//! a tight-spin-loop starving QEMU's own event loop (tested by halting -
+//! interrupts enabled - between polls for ~11 real seconds; no change);
+//! `CTRL.SLU` not set (it already reads as set by default); packet content
+//! being unrecognized by the SLIRP backend (tested both an experimental-
+//! EtherType frame and a fully valid ARP request - identical result
+//! either way). The exact remaining cause is unresolved as of this note -
+//! likely something in QEMU's own `process_tx_desc`/`start_xmit` logic
+//! this investigation didn't reach (full verbatim source wasn't available
+//! to fetch). Left as a known, real, documented gap rather than papered
+//! over - see `agentos_direction` memory for the full investigation if
+//! picking this up again.
 
 use crate::pci::{self, PciDevice};
 use crate::vga_buffer::PHYS_MEM_OFFSET;
@@ -30,9 +75,54 @@ use core::sync::atomic::Ordering;
 const E1000_VENDOR_ID: u16 = 0x8086;
 const E1000_DEVICE_ID: u16 = 0x100e;
 
+const REG_CTRL: u64 = 0x0000;
 const REG_STATUS: u64 = 0x0008;
 const REG_RAL0: u64 = 0x5400;
 const REG_RAH0: u64 = 0x5404;
+const REG_TCTL: u64 = 0x0400;
+const REG_TDBAL: u64 = 0x3800;
+const REG_TDBAH: u64 = 0x3804;
+const REG_TDLEN: u64 = 0x3808;
+const REG_TDH: u64 = 0x3810;
+const REG_TDT: u64 = 0x3818;
+const REG_TIPG: u64 = 0x0410;
+
+const CTRL_SLU: u32 = 1 << 6; // Set Link Up - standard bring-up bit, already set by default in local testing
+
+const TCTL_EN: u32 = 1 << 1;
+const TCTL_PSP: u32 = 1 << 3;
+const TCTL_CT_DEFAULT: u32 = 0x0F << 4; // recommended collision threshold
+const TCTL_COLD_FULL_DUPLEX: u32 = 0x40 << 12; // recommended collision distance, full duplex
+
+// IEEE 802.3's standard Inter Packet Gap timing (IPGT=10, IPGR1=8, IPGR2=6,
+// packed into TIPG's low three 10-bit fields). Written for correctness/
+// completeness even though it reads back as 0 regardless in local testing
+// - see the module doc's "known limitation" section.
+const TIPG_DEFAULT: u32 = 0x0060_200A;
+
+const TXD_CMD_EOP: u8 = 0x01; // End Of Packet - this is the last (only) descriptor of the frame
+const TXD_CMD_IFCS: u8 = 0x02; // Insert FCS/CRC - let the hardware compute it
+const TXD_CMD_RS: u8 = 0x08; // Report Status - hardware sets DD in `status` once processed
+const TXD_STATUS_DD: u8 = 0x01; // Descriptor Done
+
+const NUM_TX_DESCRIPTORS: usize = 8; // 8 * 16 bytes = 128, satisfies TDLEN's 128-byte-multiple rule
+const MAX_POLL_ITERATIONS: u32 = 1_000_000;
+
+/// Legacy transmit descriptor - 16 bytes, exact field order matters (this
+/// is read by the NIC's own DMA engine, not just other Rust code).
+/// `packed` since the hardware format has no padding this struct should
+/// introduce either.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct TxDescriptor {
+    addr: u64,
+    length: u16,
+    cso: u8,
+    cmd: u8,
+    status: u8,
+    css: u8,
+    special: u16,
+}
 
 /// Finds the real e1000 NIC on bus 0, if present.
 pub fn find_e1000() -> Option<PciDevice> {
@@ -54,33 +144,66 @@ unsafe fn read_reg(mmio_base: u64, offset: u64) -> u32 {
     core::ptr::read_volatile((mmio_base + offset) as *const u32)
 }
 
-/// Finds the e1000, reads its BAR0 to locate its register window, and
-/// reads a couple of real registers back through it - proof this kernel
-/// can genuinely talk to real device MMIO, not just enumerate config
-/// space. Does not touch TX/RX yet.
-pub fn probe() {
-    let Some(dev) = find_e1000() else {
-        kprintln!("[E1000] no e1000 NIC found on bus 0");
-        serial_println!("[E1000] not found");
-        return;
-    };
+/// Writes a 32-bit register - same volatility reasoning as `read_reg`,
+/// mirrored for writes: the compiler must never treat this as dead-store
+/// eliminable or reorderable relative to other register accesses.
+///
+/// # Safety
+/// Same as `read_reg`.
+unsafe fn write_reg(mmio_base: u64, offset: u64, value: u32) {
+    core::ptr::write_volatile((mmio_base + offset) as *mut u32, value);
+}
 
+/// Finds the e1000 and computes its MMIO register window's virtual base
+/// address (BAR0, masked to its physical address, plus `PHYS_MEM_OFFSET`).
+/// Shared by `probe` and `send_test_frame` so the BAR0-interpretation
+/// logic exists in exactly one place.
+fn find_mmio_base() -> Result<(PciDevice, u64), &'static str> {
+    let dev = find_e1000().ok_or("no e1000 NIC found on bus 0")?;
     let bar0 = dev.read_bar0();
-    let is_io_space = bar0 & 0x1 == 1;
-    if is_io_space {
-        kprintln!(
-            "[E1000] BAR0 is I/O-space ({:#010x}) - not supported yet",
-            bar0
-        );
-        serial_println!("[E1000] BAR0={:#010x} is I/O-space, unsupported", bar0);
-        return;
+    if bar0 & 0x1 == 1 {
+        return Err("e1000 BAR0 is I/O-space - not supported yet");
     }
     // Bits 2:1 of a memory BAR encode its type (0 = 32-bit, 2 = 64-bit);
     // either way the base address itself lives in bits 31:4 - the low 4
     // bits are these flag bits, not part of the address.
     let phys_base = (bar0 & 0xFFFF_FFF0) as u64;
     let mmio_base = PHYS_MEM_OFFSET.load(Ordering::Relaxed) + phys_base;
+    Ok((dev, mmio_base))
+}
 
+/// Reads the device's own MAC address back through RAL0/RAH0.
+fn read_mac(mmio_base: u64) -> [u8; 6] {
+    unsafe {
+        let ral0 = read_reg(mmio_base, REG_RAL0);
+        let rah0 = read_reg(mmio_base, REG_RAH0);
+        [
+            (ral0 & 0xFF) as u8,
+            ((ral0 >> 8) & 0xFF) as u8,
+            ((ral0 >> 16) & 0xFF) as u8,
+            ((ral0 >> 24) & 0xFF) as u8,
+            (rah0 & 0xFF) as u8,
+            ((rah0 >> 8) & 0xFF) as u8,
+        ]
+    }
+}
+
+/// Finds the e1000, reads its BAR0 to locate its register window, and
+/// reads a couple of real registers back through it - proof this kernel
+/// can genuinely talk to real device MMIO, not just enumerate config
+/// space.
+pub fn probe() {
+    let (dev, mmio_base) = match find_mmio_base() {
+        Ok(v) => v,
+        Err(e) => {
+            kprintln!("[E1000] {}", e);
+            serial_println!("[E1000] {}", e);
+            return;
+        }
+    };
+
+    let bar0 = dev.read_bar0();
+    let phys_base = (bar0 & 0xFFFF_FFF0) as u64;
     kprintln!(
         "[E1000] found at {:02x}:{:02x}.{} BAR0={:#010x} phys={:#x}",
         dev.bus,
@@ -98,42 +221,168 @@ pub fn probe() {
         phys_base
     );
 
+    let status = unsafe { read_reg(mmio_base, REG_STATUS) };
+    let mac = read_mac(mmio_base);
+    let rah0 = unsafe { read_reg(mmio_base, REG_RAH0) };
+    let mac_valid = rah0 & (1 << 31) != 0;
+
+    kprintln!(
+        "[E1000] STATUS={:#010x} MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (valid={})",
+        status,
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5],
+        mac_valid
+    );
+    serial_println!(
+        "[E1000] status={:#010x} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} valid={}",
+        status,
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5],
+        mac_valid
+    );
+}
+
+/// Builds a real ARP request and hands it to the hardware through a real
+/// TX descriptor ring - proof this kernel can *drive* the hardware
+/// (program its registers, format a descriptor it accepts, trigger a
+/// dequeue), not just read from it. Sets up a dedicated descriptor ring
+/// and packet buffer using fresh physical frames from the global
+/// allocator (`memory::frame_allocator` - the prerequisite Fase 21 built
+/// for exactly this), writes one descriptor, programs
+/// TDBAL/TDBAH/TDLEN/TIPG/TCTL, advances TDT to hand the descriptor to the
+/// hardware, and polls the descriptor's own DD (Descriptor Done) status
+/// bit.
+///
+/// **Read the module doc's "known limitation" section before assuming
+/// this fully works**: `TDH` (proven, via direct register read) really
+/// does advance the instant `TDT` is written, confirming the hardware
+/// genuinely dequeues the descriptor - but `DD` has never been observed
+/// to actually get set in local testing, across several independently
+/// tested hypotheses. This function currently always returns `Err`; it's
+/// kept and documented as real, verified partial progress rather than
+/// reverted, since the ring-engagement part *is* newly proven working.
+pub fn send_test_frame() -> Result<(), &'static str> {
+    let (dev, mmio_base) = find_mmio_base()?;
+    let _ = dev; // kept for a future success-path message once DD is resolved
+    let src_mac = read_mac(mmio_base);
+
+    let ring_frame = crate::memory::frame_allocator::allocate_frame();
+    let buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let phys_offset = PHYS_MEM_OFFSET.load(Ordering::Relaxed);
+    let ring_virt = (phys_offset + ring_frame.start_address().as_u64()) as *mut TxDescriptor;
+    let buf_virt = (phys_offset + buf_frame.start_address().as_u64()) as *mut u8;
+
+    // A real, valid ARP request ("who has 10.0.2.2? tell 10.0.2.15" -
+    // SLIRP's default gateway/guest addresses) - tried in place of an
+    // experimental-EtherType frame specifically to rule out the backend
+    // silently dropping unrecognized traffic as the cause of the
+    // DD-never-set issue (it wasn't - identical result either way, see
+    // module doc).
+    let frame_len = 42usize; // 14-byte Ethernet header + 28-byte ARP payload
     unsafe {
-        let status = read_reg(mmio_base, REG_STATUS);
-        let ral0 = read_reg(mmio_base, REG_RAL0);
-        let rah0 = read_reg(mmio_base, REG_RAH0);
+        let dst = core::slice::from_raw_parts_mut(buf_virt, frame_len);
+        dst[0..6].copy_from_slice(&[0xFF; 6]); // broadcast dest
+        dst[6..12].copy_from_slice(&src_mac);
+        dst[12] = 0x08;
+        dst[13] = 0x06; // EtherType: ARP
+        dst[14] = 0x00;
+        dst[15] = 0x01; // HTYPE: Ethernet
+        dst[16] = 0x08;
+        dst[17] = 0x00; // PTYPE: IPv4
+        dst[18] = 6; // HLEN
+        dst[19] = 4; // PLEN
+        dst[20] = 0x00;
+        dst[21] = 0x01; // OPER: request
+        dst[22..28].copy_from_slice(&src_mac); // SHA
+        dst[28..32].copy_from_slice(&[10, 0, 2, 15]); // SPA (SLIRP guest default)
+        dst[32..38].copy_from_slice(&[0x00; 6]); // THA: unknown
+        dst[38..42].copy_from_slice(&[10, 0, 2, 2]); // TPA (SLIRP gateway default)
+    }
 
-        let mac = [
-            (ral0 & 0xFF) as u8,
-            ((ral0 >> 8) & 0xFF) as u8,
-            ((ral0 >> 16) & 0xFF) as u8,
-            ((ral0 >> 24) & 0xFF) as u8,
-            (rah0 & 0xFF) as u8,
-            ((rah0 >> 8) & 0xFF) as u8,
-        ];
-        let mac_valid = rah0 & (1 << 31) != 0;
-
-        kprintln!(
-            "[E1000] STATUS={:#010x} MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (valid={})",
-            status,
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5],
-            mac_valid
+    unsafe {
+        // Zero the whole ring first - only descriptor 0 is used, but
+        // stale bytes elsewhere in a freshly-allocated (not necessarily
+        // zeroed) frame could otherwise look like additional pending
+        // descriptors once TDT advances past them.
+        let empty = TxDescriptor {
+            addr: 0,
+            length: 0,
+            cso: 0,
+            cmd: 0,
+            status: 0,
+            css: 0,
+            special: 0,
+        };
+        for i in 0..NUM_TX_DESCRIPTORS {
+            core::ptr::write_volatile(ring_virt.add(i), empty);
+        }
+        core::ptr::write_volatile(
+            ring_virt,
+            TxDescriptor {
+                addr: buf_frame.start_address().as_u64(),
+                length: frame_len as u16,
+                cso: 0,
+                cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
+                status: 0,
+                css: 0,
+                special: 0,
+            },
         );
+
+        // CTRL.SLU (Set Link Up) - standard bring-up step; already set by
+        // default in local testing, kept for completeness/portability.
+        let ctrl = read_reg(mmio_base, REG_CTRL);
+        write_reg(mmio_base, REG_CTRL, ctrl | CTRL_SLU);
+
+        let ring_phys = ring_frame.start_address().as_u64();
+        write_reg(mmio_base, REG_TDBAL, (ring_phys & 0xFFFF_FFFF) as u32);
+        write_reg(mmio_base, REG_TDBAH, (ring_phys >> 32) as u32);
+        write_reg(mmio_base, REG_TDLEN, (NUM_TX_DESCRIPTORS * 16) as u32);
+        write_reg(mmio_base, REG_TDH, 0);
+        write_reg(mmio_base, REG_TDT, 0);
+        write_reg(mmio_base, REG_TIPG, TIPG_DEFAULT);
+        write_reg(
+            mmio_base,
+            REG_TCTL,
+            TCTL_EN | TCTL_PSP | TCTL_CT_DEFAULT | TCTL_COLD_FULL_DUPLEX,
+        );
+
+        // The one line that actually tells the hardware "descriptor 0 is
+        // ready, go send it" - everything above was just setup.
+        write_reg(mmio_base, REG_TDT, 1);
+
+        for _ in 0..MAX_POLL_ITERATIONS {
+            let status = core::ptr::read_volatile(core::ptr::addr_of!((*ring_virt).status));
+            if status & TXD_STATUS_DD != 0 {
+                kprintln!(
+                    "[E1000] sent {} byte ARP request - DD set (hardware confirmed)",
+                    frame_len
+                );
+                serial_println!("[E1000] tx_sent {} bytes dd=true", frame_len);
+                return Ok(());
+            }
+        }
+
+        // Diagnostic left in place for whoever resumes this: shows
+        // exactly what state things were left in on timeout, without
+        // needing to re-add debug prints from scratch.
+        let tdh = read_reg(mmio_base, REG_TDH);
+        let tdt = read_reg(mmio_base, REG_TDT);
+        let raw = core::slice::from_raw_parts(ring_virt as *const u8, 16);
         serial_println!(
-            "[E1000] status={:#010x} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} valid={}",
-            status,
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5],
-            mac_valid
+            "[E1000] tx timeout: TDH={:#x} TDT={:#x} raw_desc0={:02x?}",
+            tdh,
+            tdt,
+            raw
         );
     }
+    Err("e1000 TX: timed out waiting for descriptor DD - hardware dequeued it (TDH advanced) but never confirmed the send; see module doc's known-limitation section")
 }

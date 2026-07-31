@@ -196,6 +196,17 @@ jobs:
           # genuinely reached hardware rather than garbage.
           grep -q "E1000\] found 00:03.0 bar0=0x" boot.log
           grep -q "mac=52:54:00:12:34:56 valid=true" boot.log
+          # e1000 TX (Fase 22) is a documented, honest partial result (see
+          # net/e1000.rs's module doc): the ring genuinely engages the
+          # hardware (TDH advances) but DD confirmation doesn't happen yet
+          # for a reason that remains unresolved. This checks that the
+          # bounded poll actually completes and control returns to
+          # main.rs (proven by every later self-test below still running)
+          # rather than silently regressing into a true hang - both would
+          # otherwise look identical from the outside (the same
+          # timeout-based exit code the healthy end-of-boot idle loop
+          # already produces).
+          grep -q "E1000\] tx_sent -> not yet confirmed" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.
