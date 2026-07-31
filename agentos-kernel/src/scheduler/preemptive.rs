@@ -23,8 +23,29 @@
 //! since the timer can't fire without them, it could never be preempted
 //! again - a silent, total hang). Each task's entry point calls
 //! `interrupts::enable()` itself as its very first action to fix this.
+//!
+//! ## `ps`-visible PCB sync: `try_lock`, never `lock`, inside `tick()`
+//! Unlike everything above, this module *does* now touch one piece of
+//! extra locking from interrupt context: `tick()` optionally updates each
+//! task's entry in the `ps`-visible `SCHEDULER` table (a `spin::Mutex`),
+//! the same unification `context_switch.rs`'s cooperative scheduler
+//! already does from normal code. Taking that lock the ordinary
+//! (blocking) way from *interrupt* context would be a real bug on this
+//! single core: if the timer fires while some normal-context caller
+//! (`ps`, `spawn_cooperative`, ...) is mid-update with the lock held, that
+//! caller cannot possibly release it until this very interrupt handler
+//! returns - and this handler would be spinning forever waiting for a
+//! lock it made unreleasable, a guaranteed permanent deadlock rather than
+//! just a slowdown. `tick()` uses `try_lock()` and simply skips the PCB
+//! update for that one tick if contended; the actual task switch below
+//! never depends on it, and the next tick (roughly 55ms later) retries.
+//! `ps` showing one tick's worth of stale state in the vanishingly rare
+//! contended case is a fully acceptable, self-correcting trade-off for a
+//! diagnostic-only view - blocking here would not be.
 
 use super::context_switch::{prepare_initial_stack, switch_to};
+use crate::scheduler::agent_scheduler::SCHEDULER;
+use crate::scheduler::process::{Priority, ProcessState};
 use crate::{kprintln, serial_println};
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,6 +55,11 @@ const DEMO_TICKS: u64 = 50; // ~2.7s at the PIT's default ~18.2Hz
 
 struct PreemptTask {
     saved_rsp: u64,
+    /// Real PCB pid (see module doc's new "ps unification" section) -
+    /// registered from `run_preemptive_demo` (normal context, safe to
+    /// block on `SCHEDULER.lock()` there); `tick()` itself only ever uses
+    /// `try_lock()` on it, never the blocking form.
+    pid: u32,
     _stack: Box<[u8]>,
 }
 
@@ -103,6 +129,22 @@ pub fn tick() {
         }
 
         let tasks: *mut [Option<PreemptTask>; 2] = core::ptr::addr_of_mut!(PREEMPT_TASKS);
+
+        // Best-effort ps-visible PCB sync - see the module doc's `try_lock`
+        // section for why this must never be the blocking `.lock()`.
+        if let Some(mut sched) = SCHEDULER.try_lock() {
+            if let Some(i) = from {
+                if let Some(t) = (*tasks)[i].as_ref() {
+                    sched.update_process(t.pid, ProcessState::Ready, t.saved_rsp as usize);
+                }
+            }
+            if let Some(i) = next {
+                if let Some(t) = (*tasks)[i].as_ref() {
+                    sched.update_process(t.pid, ProcessState::Running, t.saved_rsp as usize);
+                }
+            }
+        }
+
         let old_rsp_ptr: *mut u64 = match from {
             Some(i) => {
                 let t = (*tasks)[i].as_mut().unwrap();
@@ -144,6 +186,15 @@ fn preempt_task_body(id: usize) -> ! {
     // (and the whole system, since only it can re-arm the timer) would
     // run with interrupts off forever.
     x86_64::instructions::interrupts::enable();
+    if id == 0 {
+        // Proof this task's first-ever entry already has a real PCB
+        // record behind it: by the time execution reaches here, the
+        // `tick()` call that switched into this task has already run its
+        // try_lock'd PCB update - task-preempt-0 should show RUNNING here
+        // (with a real stack pointer), task-preempt-1 still READY (spawned
+        // but not yet switched to).
+        crate::shell::dispatch_command("ps");
+    }
     loop {
         PREEMPT_COUNTERS[id].fetch_add(1, Ordering::Relaxed);
     }
@@ -159,6 +210,21 @@ pub fn run_preemptive_demo() {
     kprintln!("[PREEMPT] Testing real timer-driven preemption (2 tasks, neither ever yields)...");
     serial_println!("[PREEMPT] starting: timer will force-switch 2 non-yielding tasks");
 
+    // Real PCB entries, same as spawn_cooperative - normal (non-interrupt)
+    // context, so the ordinary blocking `.lock()` is fine here even though
+    // `tick()` itself must only ever use `try_lock()`. Neither task has a
+    // real priority relationship (the scheduler just alternates strictly
+    // 0/1/0/1, ignoring priority entirely), so Normal for both is the
+    // honest choice, not a placeholder.
+    let pid0 = SCHEDULER
+        .lock()
+        .spawn("preempt-task-0", Priority::Normal, 0)
+        .expect("PCB table full");
+    let pid1 = SCHEDULER
+        .lock()
+        .spawn("preempt-task-1", Priority::Normal, 0)
+        .expect("PCB table full");
+
     unsafe {
         let tasks: *mut [Option<PreemptTask>; 2] = core::ptr::addr_of_mut!(PREEMPT_TASKS);
 
@@ -167,6 +233,7 @@ pub fn run_preemptive_demo() {
         let rsp0 = prepare_initial_stack(top0, preempt_task_entry_0);
         (*tasks)[0] = Some(PreemptTask {
             saved_rsp: rsp0,
+            pid: pid0,
             _stack: stack0,
         });
 
@@ -175,6 +242,7 @@ pub fn run_preemptive_demo() {
         let rsp1 = prepare_initial_stack(top1, preempt_task_entry_1);
         (*tasks)[1] = Some(PreemptTask {
             saved_rsp: rsp1,
+            pid: pid1,
             _stack: stack1,
         });
 
@@ -199,11 +267,22 @@ pub fn run_preemptive_demo() {
 
     // Both tasks are permanently abandoned mid-loop at this point (forced
     // off by the last tick, never to be switched to again) - safe to
-    // reclaim their stacks now rather than leak them.
+    // reclaim their stacks now rather than leak them. Unlike the
+    // cooperative demo's tasks, these never call anything like
+    // `finish_current_task` (they're infinite loops with zero self-
+    // awareness of the demo ending) - so marking their PCB entries
+    // Terminated has to happen here, from normal context, or `ps` would
+    // keep showing two long-abandoned tasks as perpetually READY/RUNNING.
     unsafe {
         let tasks: *mut [Option<PreemptTask>; 2] = core::ptr::addr_of_mut!(PREEMPT_TASKS);
         for slot in (*tasks).iter_mut() {
-            *slot = None;
+            if let Some(task) = slot.take() {
+                SCHEDULER.lock().update_process(
+                    task.pid,
+                    ProcessState::Terminated,
+                    task.saved_rsp as usize,
+                );
+            }
         }
     }
 }

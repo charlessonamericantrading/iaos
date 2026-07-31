@@ -106,6 +106,19 @@ jobs:
             echo "PREEMPT REGRESSION: both counters are zero - neither task ever ran."
             exit 1
           fi
+          # Same ps/PCB-unification proof as the cooperative scheduler
+          # above, now for the preemptive one - this is the part that
+          # needed tick() (interrupt context) to use SCHEDULER.try_lock(),
+          # never the blocking .lock(), so it's also an indirect regression
+          # guard for that: if try_lock were ever swapped back to a
+          # blocking lock and a normal-context caller got unlucky enough to
+          # be mid-update when the timer fired, this whole boot would hang
+          # instead of reaching these lines. Same address-prefix-only
+          # policy as above for the same reason (Fase 15's lesson).
+          grep -q "PID 8 \[NORM\] RUNNING preempt-task-0 rsp=0x444444" boot.log
+          grep -q "preempt-task-1 rsp=0x0" boot.log
+          grep -q "PID 8 \[NORM\] DEAD preempt-task-0 rsp=0x444444" boot.log
+          grep -q "PID 9 \[NORM\] DEAD preempt-task-1 rsp=0x444444" boot.log
           # device=0x1237 is the real i440FX host bridge's device ID -
           # always present at 00:00.0 on QEMU's default machine, so this
           # confirms PCI config-space reads are actually correct, not just

@@ -258,7 +258,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 7f. Test Real Timer-Driven Preemption
     // Unlike 7d/7e, these two tasks never call yield_now at all - the only
     // reason either one ever stops running is the timer IRQ forcing it.
+    // Also proves ps-visible PCB unification reaches the preemptive
+    // scheduler too now (via try_lock from tick(), see preemptive.rs's
+    // module doc): the demo calls `ps` from inside task-preempt-0's first
+    // entry to show live RUNNING/READY state, and this call afterward
+    // should show both task-preempt-0/1 as real PCB entries in TERMINATED
+    // state with distinct, real stack pointers.
     scheduler::preemptive::run_preemptive_demo();
+    shell::dispatch_command("ps");
 
     kprintln!("==================================================");
     kprintln!("  [SUCCESS] AgentOS Native Kernel Boot Sequence Complete ");
