@@ -137,16 +137,23 @@ jobs:
           # that the lspci command ran without crashing.
           grep -q "device=0x1237" boot.log
           # Confirms real e1000 NIC MMIO access, not just PCI config-space
-          # enumeration. Unlike the FAT12 byte-count/stack-pointer checks
-          # above, these exact values ARE safe to pin here: bar0/mac are
-          # QEMU's OWN internal device-emulation defaults for its default
-          # machine type and default (no `-device` flags) NIC, not
-          # anything influenced by which machine compiled the kernel -
-          # 0xfebc0000 is QEMU's well-documented default e1000 MMIO base,
-          # and 52:54:00:12:34:56 is its equally well-known default MAC
-          # (the exact value this project's own now-superseded-by-this
-          # virtio_net.rs placeholder had hardcoded, coincidentally).
-          grep -q "bar0=0xfebc0000" boot.log
+          # enumeration. First attempt at this check also pinned the exact
+          # BAR0 address (0xfebc0000 locally) - failed on the CI runner's
+          # QEMU, which assigned 0xfeb80000 instead from the identical
+          # source (SeaBIOS's PCI resource allocation apparently isn't
+          # pinned across QEMU versions the way the device's own emulated
+          # register *contents* are). So: don't assert the exact BAR0
+          # value, only that a real one was found and read through. The
+          # MAC/STATUS values, by contrast, matched exactly on both QEMU
+          # versions - they're the e1000 device model's own hardcoded
+          # emulation defaults, unrelated to bus enumeration, so those
+          # stay pinned exactly: 52:54:00:12:34:56 is QEMU's well-known
+          # default NIC MAC (the exact value this project's own
+          # now-superseded-by-this virtio_net.rs placeholder had
+          # hardcoded, coincidentally) - reading it back for real, through
+          # actual MMIO, is the strongest evidence available that this
+          # genuinely reached hardware rather than garbage.
+          grep -q "E1000\] found 00:03.0 bar0=0x" boot.log
           grep -q "mac=52:54:00:12:34:56 valid=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
