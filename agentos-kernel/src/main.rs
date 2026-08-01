@@ -422,6 +422,68 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // 7b-6. Real FAT12 file CREATION - genuinely new, not an overwrite of
+    // something that already existed (Fase 24 covered that case). Built
+    // on new free-cluster/free-directory-entry search logic, scoped to
+    // files that fit in one cluster with a short (8.3) name. Creates
+    // "AGENTOS.TXT" if it doesn't already exist - a repeat boot against
+    // the same unregenerated disk image correctly reports "already
+    // exists" instead of re-creating it (there's no file-deletion
+    // support to reset between repeat boots, and there doesn't need to
+    // be: either way, the read-back below should show the same real
+    // content). Also lists the root directory again afterward to show
+    // the new file genuinely appearing alongside the original 3.
+    kprintln!("[KERNEL INIT] Testing real FAT12 file creation...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(fs) => {
+                let test_content = b"AgentOS created this file for real.";
+                match fs.create_file("AGENTOS.TXT", test_content) {
+                    Ok(()) => {
+                        kprintln!("[FAT12] created AGENTOS.TXT ({} bytes)", test_content.len());
+                        serial_println!("[FAT12] create_test created=true");
+                    }
+                    Err(e) => {
+                        kprintln!("[FAT12] create_file: {}", e);
+                        serial_println!("[FAT12] create_test created=false reason={}", e);
+                    }
+                }
+                match fs.read_file("AGENTOS.TXT") {
+                    Ok(read_back) => {
+                        let matches = read_back == test_content;
+                        kprintln!(
+                            "[FAT12] AGENTOS.TXT read-back ({} bytes): {}",
+                            read_back.len(),
+                            if matches {
+                                "OK (matches expected content)"
+                            } else {
+                                "MISMATCH"
+                            }
+                        );
+                        serial_println!(
+                            "[FAT12] create_test read_back_len={} match={}",
+                            read_back.len(),
+                            matches
+                        );
+                    }
+                    Err(e) => {
+                        kprintln!("[FAT12] create test: read-back failed: {}", e);
+                        serial_println!("[FAT12] create_test read_failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                kprintln!("[FAT12] create test: not FAT12 ({})", e);
+                serial_println!("[FAT12] create_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!("[FAT12] create test: couldn't find FAT partition: {}", e);
+            serial_println!("[FAT12] create_test -> no partition: {}", e);
+        }
+    }
+    shell::dispatch_command("ls");
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real

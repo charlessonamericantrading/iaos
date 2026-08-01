@@ -248,6 +248,21 @@ jobs:
           # even though this run itself already captured its full log.
           grep -qE "FAT12\] write_test file=BOOT-S~2 len=[0-9]+ match=true" boot.log
           grep -q "FAT12\] write_test restored=true" boot.log
+          # Confirms real FAT12 file CREATION (Fase 26) - a genuinely new
+          # file, not an overwrite. Unlike KERNEL~1's size, the test
+          # content here is a fixed byte-string literal
+          # (`b"AgentOS created this file for real."`), so its 35-byte
+          # length is a true compile-time constant on any build machine -
+          # safe to assert exactly, unlike file sizes that depend on the
+          # whole compiled kernel binary. A fresh CI image always creates
+          # this file for the first time (never "already exists" - that
+          # path only shows up on a local repeat boot against the same
+          # unregenerated image), so created=true is the only outcome a
+          # CI run should ever see.
+          grep -q "FAT12\] create_test created=true" boot.log
+          grep -q "FAT12\] create_test read_back_len=35 match=true" boot.log
+          grep -q "SHELL\] ls -> FAT12/16 4 entries" boot.log
+          grep -q "AGENTOS.TXT 35 bytes" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.
