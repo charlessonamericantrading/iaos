@@ -20,10 +20,10 @@ pub fn dispatch_command(line: &str) {
     match cmd {
         "help" => {
             kprintln!(
-                "Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, clear"
+                "Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, clear"
             );
             serial_println!(
-                "[SHELL] help -> Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, clear"
+                "[SHELL] help -> Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, clear"
             );
         }
         "ps" => {
@@ -192,13 +192,36 @@ pub fn dispatch_command(line: &str) {
                 }
             }
         }
-        "ls" => match list_root_directory() {
-            Ok(()) => {}
-            Err(e) => {
+        "ls" => {
+            let dirname = parts.next().unwrap_or("");
+            let result = if dirname.is_empty() {
+                list_root_directory()
+            } else {
+                list_fat_directory(dirname)
+            };
+            if let Err(e) = result {
                 kprintln!("ls: {}", e);
                 serial_println!("[SHELL] ls -> FAILED: {}", e);
             }
-        },
+        }
+        "mkdir" => {
+            let dirname = parts.next().unwrap_or("");
+            if dirname.is_empty() {
+                kprintln!("mkdir: usage: mkdir DIRNAME");
+                serial_println!("[SHELL] mkdir -> no name given");
+            } else {
+                match create_fat_directory(dirname) {
+                    Ok(()) => {
+                        kprintln!("Created directory '{}'.", dirname);
+                        serial_println!("[SHELL] mkdir {} -> created", dirname);
+                    }
+                    Err(e) => {
+                        kprintln!("mkdir: {}", e);
+                        serial_println!("[SHELL] mkdir {} -> FAILED: {}", dirname, e);
+                    }
+                }
+            }
+        }
         "cat" => {
             let filename = parts.next().unwrap_or("");
             if filename.is_empty() {
@@ -398,4 +421,59 @@ fn delete_fat_file(name: &str) -> Result<(), &'static str> {
     }
     let mut fs = crate::fat12::read_bpb(&partition)?;
     fs.delete_file(name)
+}
+
+/// The `mkdir` command's implementation - same FAT12-only reasoning as
+/// `create_fat_file` above.
+fn create_fat_directory(name: &str) -> Result<(), &'static str> {
+    let partition = find_fat_partition()?;
+    if crate::fat32::read_bpb(&partition).is_ok() {
+        return Err(
+            "FAT32 directory creation isn't implemented yet (this disk is FAT12 in practice)",
+        );
+    }
+    let mut fs = crate::fat12::read_bpb(&partition)?;
+    fs.create_directory(name)
+}
+
+/// The `ls DIRNAME` command's implementation - lists a named
+/// SUBdirectory's contents (bare `ls` lists the root instead, via
+/// `list_root_directory` above). FAT12-only, same reasoning as
+/// `create_fat_file`/`delete_fat_file`.
+fn list_fat_directory(name: &str) -> Result<(), &'static str> {
+    let partition = find_fat_partition()?;
+    if crate::fat32::read_bpb(&partition).is_ok() {
+        return Err(
+            "listing a FAT32 subdirectory by name isn't wired up yet (this disk is FAT12 in practice)",
+        );
+    }
+    let fs = crate::fat12::read_bpb(&partition)?;
+    let entry = fs
+        .list_root_directory()?
+        .into_iter()
+        .find(|e| e.name.eq_ignore_ascii_case(name))
+        .ok_or("no file or directory with that name")?;
+    if !entry.is_dir {
+        return Err("that's a file, not a directory - try 'cat' instead");
+    }
+
+    let sub_entries = fs.list_directory(entry.start_cluster)?;
+    kprintln!("{} ({} entries):", name, sub_entries.len());
+    serial_println!("[SHELL] ls {} -> {} entries", name, sub_entries.len());
+    for e in &sub_entries {
+        kprintln!(
+            "  {}{:<12} {} bytes",
+            if e.is_dir { "[DIR] " } else { "      " },
+            e.name,
+            e.size
+        );
+        serial_println!(
+            "  {} {} bytes cluster={} dir={}",
+            e.name,
+            e.size,
+            e.start_cluster,
+            e.is_dir
+        );
+    }
+    Ok(())
 }

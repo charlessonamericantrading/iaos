@@ -324,6 +324,22 @@ jobs:
           # machine-specific, unlike e.g. PCI BAR addresses).
           grep -q "FAT12\] resize_test created_ok=true grow_ok=true shrink_ok=true" boot.log
           grep -q "FAT12\] resize_test cleanup deleted=true gone=true" boot.log
+          # Confirms FAT12 SUBDIRECTORY creation+listing (Fase 31) - mkdir
+          # allocates a real cluster holding "." and ".." entries (the real
+          # FAT convention), distinct from a plain file's opaque-data
+          # cluster. A fresh CI image always creates TESTDIR for the first
+          # time (never "already exists" - that path only shows up on a
+          # local repeat boot, same reasoning as every other create-type
+          # check this session), so created=true is the only outcome CI
+          # should see. The entries=2 count matters more: it's the proof
+          # that create_directory's explicit zeroing of the rest of the new
+          # cluster worked - this kernel's own self-tests create-then-
+          # delete several files every boot, so a freshly-allocated
+          # cluster could easily still hold stale directory-entry-shaped
+          # bytes from one of them if that zeroing were missing or wrong,
+          # which would inflate this count above 2.
+          grep -q "SHELL\] mkdir TESTDIR -> created" boot.log
+          grep -q "SHELL\] ls TESTDIR -> 2 entries" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.

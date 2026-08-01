@@ -453,18 +453,14 @@ impl Fat12Info {
         // completeness than anything currently depended on.
         let time = crate::rtc::read_time();
         let (fat_time, fat_date) = to_fat_datetime(&time);
-
-        let mut entry = [0u8; 32];
-        entry[0..11].copy_from_slice(&short_name);
-        entry[11] = 0x20; // ATTR_ARCHIVE
-        entry[14..16].copy_from_slice(&fat_time.to_le_bytes()); // creation time
-        entry[16..18].copy_from_slice(&fat_date.to_le_bytes()); // creation date
-        entry[18..20].copy_from_slice(&fat_date.to_le_bytes()); // last access date
-        entry[20..22].copy_from_slice(&0u16.to_le_bytes()); // high cluster word - always 0, FAT12 clusters fit in 12 bits
-        entry[22..24].copy_from_slice(&fat_time.to_le_bytes()); // write time
-        entry[24..26].copy_from_slice(&fat_date.to_le_bytes()); // write date
-        entry[26..28].copy_from_slice(&(clusters[0] as u16).to_le_bytes());
-        entry[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        let entry = build_dir_entry(
+            &short_name,
+            0x20, // ATTR_ARCHIVE
+            clusters[0],
+            data.len() as u32,
+            fat_time,
+            fat_date,
+        );
 
         let mut sector_buf = [0u8; 512];
         ata::read_sector(entry_lba, &mut sector_buf)?;
@@ -472,6 +468,91 @@ impl Fat12Info {
         ata::write_sector(entry_lba, &sector_buf)?;
 
         Ok(())
+    }
+
+    /// Creates a new, empty subdirectory in the root directory. Unlike
+    /// the root itself (fixed-location, no cluster of its own), a
+    /// subdirectory is just an ordinary single-cluster chain holding two
+    /// real entries - "." (points to itself) and ".." (points to its
+    /// parent; cluster `0` is the real FAT convention for "the parent is
+    /// the root directory", since the root has no cluster number of its
+    /// own to point back to) - with everything else in the cluster
+    /// zeroed.
+    ///
+    /// That zeroing is deliberate, not just tidiness: a "free" cluster
+    /// (FAT entry `0x000`) says nothing about what's still sitting in
+    /// its actual data bytes on disk - this kernel's own self-tests
+    /// create-then-delete files every boot, so a freshly-allocated
+    /// cluster can easily still hold a previous file's leftover bytes.
+    /// For a plain file that's harmless (only bytes up to its logical
+    /// size are ever read back), but a directory's bytes are always
+    /// interpreted as structured entries - stale data past "."/".."
+    /// could be misread as bogus additional entries if left in place.
+    pub fn create_directory(&mut self, name: &str) -> Result<(), &'static str> {
+        let entries = self.list_root_directory()?;
+        if entries.iter().any(|e| e.name.eq_ignore_ascii_case(name)) {
+            return Err("FAT12: a file or directory with that name already exists");
+        }
+
+        let short_name = to_short_name(name)?;
+        let cluster = self.find_free_clusters(1)?[0];
+        let (entry_lba, entry_offset) = self.find_free_root_entry()?;
+
+        let time = crate::rtc::read_time();
+        let (fat_time, fat_date) = to_fat_datetime(&time);
+
+        let mut dot_name = [b' '; 11];
+        dot_name[0] = b'.';
+        let mut dotdot_name = [b' '; 11];
+        dotdot_name[0] = b'.';
+        dotdot_name[1] = b'.';
+        let dot_entry = build_dir_entry(&dot_name, 0x10, cluster, 0, fat_time, fat_date);
+        let dotdot_entry = build_dir_entry(&dotdot_name, 0x10, 0, 0, fat_time, fat_date);
+
+        let cluster_lba = self.cluster_to_lba(cluster);
+        let mut first_sector = [0u8; 512];
+        first_sector[0..32].copy_from_slice(&dot_entry);
+        first_sector[32..64].copy_from_slice(&dotdot_entry);
+        ata::write_sector(cluster_lba, &first_sector)?;
+        for s in 1..self.sectors_per_cluster as u32 {
+            ata::write_sector(cluster_lba + s, &[0u8; 512])?;
+        }
+
+        self.write_fat_entry_to_disk(cluster, 0x0FFF)?;
+
+        let dir_entry = build_dir_entry(&short_name, 0x10, cluster, 0, fat_time, fat_date);
+        let mut root_sector = [0u8; 512];
+        ata::read_sector(entry_lba, &mut root_sector)?;
+        root_sector[entry_offset..entry_offset + 32].copy_from_slice(&dir_entry);
+        ata::write_sector(entry_lba, &root_sector)?;
+
+        Ok(())
+    }
+
+    /// Lists the entries inside a SUBdirectory by walking its cluster
+    /// chain - unlike `list_root_directory`, which reads the root's
+    /// fixed-location sectors directly, a subdirectory's content is an
+    /// ordinary cluster chain of 32-byte entries (starting with the real
+    /// "." and ".." entries `create_directory` writes - not skipped or
+    /// specially handled here, so they show up in the result like any
+    /// other entry, matching real FAT behavior).
+    pub fn list_directory(&self, start_cluster: u32) -> Result<Vec<DirEntry>, &'static str> {
+        let mut entries = Vec::new();
+        let mut cluster = Some(start_cluster);
+        let mut sector_buf = [0u8; 512];
+
+        while let Some(c) = cluster {
+            let cluster_lba = self.cluster_to_lba(c);
+            for s in 0..self.sectors_per_cluster as u32 {
+                ata::read_sector(cluster_lba + s, &mut sector_buf)?;
+                if fat_common::parse_dir_sector(&sector_buf, &mut entries) {
+                    return Ok(entries);
+                }
+            }
+            cluster = self.next_cluster(c)?;
+        }
+
+        Ok(entries)
     }
 
     /// Finds `name`'s directory entry AND its exact on-disk location
@@ -581,4 +662,34 @@ fn to_fat_datetime(t: &crate::rtc::RtcTime) -> (u16, u16) {
     let year_offset = (t.year.saturating_sub(1980)).min(127);
     let fat_date = (year_offset << 9) | ((t.month as u16) << 5) | (t.day as u16);
     (fat_time, fat_date)
+}
+
+/// Packs one 32-byte FAT directory entry: short name, attribute byte, a
+/// single timestamp used for creation/write/access alike (this driver
+/// doesn't track them separately), starting cluster, and size. Shared
+/// between `create_file` and `create_directory` - both are ultimately
+/// "write one root-directory slot", differing only in the attribute
+/// byte and what `size` means (a real byte count for a file, always 0
+/// for a directory, whose real extent is implied by walking its chain
+/// instead).
+fn build_dir_entry(
+    short_name: &[u8; 11],
+    attr: u8,
+    cluster: u32,
+    size: u32,
+    fat_time: u16,
+    fat_date: u16,
+) -> [u8; 32] {
+    let mut entry = [0u8; 32];
+    entry[0..11].copy_from_slice(short_name);
+    entry[11] = attr;
+    entry[14..16].copy_from_slice(&fat_time.to_le_bytes()); // creation time
+    entry[16..18].copy_from_slice(&fat_date.to_le_bytes()); // creation date
+    entry[18..20].copy_from_slice(&fat_date.to_le_bytes()); // last access date
+    entry[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes()); // high cluster word - always 0, FAT12 clusters fit in 12 bits
+    entry[22..24].copy_from_slice(&fat_time.to_le_bytes()); // write time
+    entry[24..26].copy_from_slice(&fat_date.to_le_bytes()); // write date
+    entry[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+    entry[28..32].copy_from_slice(&size.to_le_bytes());
+    entry
 }

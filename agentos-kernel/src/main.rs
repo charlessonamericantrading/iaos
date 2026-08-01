@@ -698,6 +698,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
+    // 7b-11. Real FAT12 subdirectory creation and listing - mkdir
+    // allocates a real cluster holding "." (self) and ".." (parent,
+    // cluster 0 meaning "the root") entries, the real FAT convention for
+    // a directory - distinct from a plain file's cluster, which just
+    // holds opaque data. Deliberately NOT self-cleaning (no rmdir/
+    // delete_directory yet - out of scope for this Fase, matching how
+    // create_file/delete_file were built as separate steps): TESTDIR
+    // persists across repeat boots the same way AGENTOS.TXT does, and
+    // mkdir on an existing name fails gracefully ("already exists"),
+    // same tolerance create_file already established. The one thing
+    // that must ALWAYS hold, fresh boot or repeat, is that TESTDIR's
+    // own listing shows EXACTLY "." and ".." and nothing else - proving
+    // the rest of its cluster was genuinely zeroed, not left with
+    // leftover bytes from some other file this kernel's own self-tests
+    // created and deleted earlier in the same boot.
+    kprintln!("[KERNEL INIT] Testing FAT12 subdirectory creation...");
+    shell::dispatch_command("mkdir TESTDIR");
+    shell::dispatch_command("ls");
+    shell::dispatch_command("ls TESTDIR");
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real
