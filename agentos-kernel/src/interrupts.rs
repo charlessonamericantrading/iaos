@@ -305,13 +305,11 @@ extern "C" fn syscall_entry_asm() {
 /// raw-register/stack-layout risk is confined to `syscall_entry_asm`
 /// itself, above.
 ///
-/// Deliberately does NOT yet pass `caller_rpl` into `dispatch_syscall`
-/// or use it to change any behavior - this Fase's own scope is proving
-/// the value is read correctly, not yet acting on it. Enforcing that a
-/// ring-3 caller may only pass pointers to memory it could otherwise
-/// access (tightening `memory::paging::pointer_is_mapped`'s own
-/// Fase 74 doc, which named exactly this as real, separate follow-on
-/// work) is real, separate follow-on work, not crammed into this Fase.
+/// Fase 76 puts this value to real use: passed into `dispatch_syscall`
+/// as `caller_rpl == 3`, which `SYS_TENSOR_EVAL`'s own arm now uses to
+/// require `USER_ACCESSIBLE` on every pointer it dereferences, but only
+/// when the call genuinely came from ring-3 - see `syscall.rs`'s own
+/// `pointer_is_mapped_checked` for exactly how the two cases differ.
 extern "C" fn handle_real_syscall(
     sys_nr: u64,
     arg1: u64,
@@ -320,7 +318,7 @@ extern "C" fn handle_real_syscall(
     caller_rpl: u64,
 ) -> u64 {
     SYSCALL_INT_COUNT.fetch_add(1, Ordering::Relaxed);
-    let ret = crate::syscall::dispatch_syscall(sys_nr, arg1, arg2, arg3);
+    let ret = crate::syscall::dispatch_syscall(sys_nr, arg1, arg2, arg3, caller_rpl == 3);
     serial_println!(
         "[SYSCALL] real_syscall_from_ring3 sys_nr={} arg1={} caller_rpl={} returned={}",
         sys_nr,

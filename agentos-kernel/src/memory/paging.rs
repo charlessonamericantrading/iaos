@@ -63,26 +63,50 @@ pub fn with_mapper<R>(f: impl FnOnce(&mut OffsetPageTable<'static>) -> R) -> R {
 /// panics on invalid input defeats its own purpose.
 ///
 /// Only checks the mapping is genuinely PRESENT - deliberately does NOT
-/// require `USER_ACCESSIBLE`. `dispatch_syscall` is reachable from both
-/// ring-0 (this kernel's own internal self-tests, using ordinary,
-/// non-user-accessible heap memory - see main.rs's own `SYS_TENSOR_EVAL`
-/// test) and ring-3 (Fase 72/73), and doesn't currently know which one
-/// a given call came from - requiring `USER_ACCESSIBLE` unconditionally
-/// would reject the kernel's own legitimate ring-0 self-test. Enforcing
-/// "a ring-3 caller may only pass pointers to memory it could otherwise
-/// access" is real, separate follow-on work that needs the dispatch path
-/// to track caller privilege first.
+/// require `USER_ACCESSIBLE`. Safe to call regardless of who the caller
+/// is (ring-0 or ring-3) - see `pointer_is_user_accessible` below for the
+/// stricter check that DOES depend on that, now that Fase 75 made caller
+/// privilege something `dispatch_syscall` can actually know.
 pub fn pointer_is_mapped(addr: u64) -> bool {
+    pointer_has_flags(addr, PageTableFlags::PRESENT)
+}
+
+/// Stricter than `pointer_is_mapped`: also requires `USER_ACCESSIBLE`,
+/// i.e. genuinely safe for RING-3 code to have legitimately obtained -
+/// not just present in the page tables at all. The real motivation
+/// (Fase 76): now that `dispatch_syscall` can tell whether a syscall
+/// genuinely came from ring-3 (Fase 75's own `caller_rpl`), a ring-3
+/// caller passing a pointer to real, PRESENT but kernel-only memory
+/// (the heap, in particular - see `memory/user_page.rs`'s own doc:
+/// every mapping before Fase 70 was `PRESENT | WRITABLE` only, never
+/// `USER_ACCESSIBLE`) should be REJECTED, exactly like an unmapped
+/// pointer already is - a "confused deputy" risk `pointer_is_mapped`
+/// alone can't catch, since kernel memory legitimately passes THAT
+/// check. Only meaningful to call for a ring-3-originated pointer -
+/// see `syscall.rs`'s own call site for how the two checks are chosen.
+pub fn pointer_is_user_accessible(addr: u64) -> bool {
+    pointer_has_flags(
+        addr,
+        PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE,
+    )
+}
+
+fn pointer_has_flags(addr: u64, required: PageTableFlags) -> bool {
     if addr == 0 {
         return false;
     }
+    // Deliberately uses `VirtAddr::try_new`, NOT `VirtAddr::new` - the
+    // latter PANICS on a non-canonical address (bits 48..64 not a proper
+    // sign extension of bit 47), which an arbitrary, untrusted `u64`
+    // from a syscall caller can easily be. A validation function that
+    // itself panics on invalid input defeats its own purpose.
     let Ok(virt) = VirtAddr::try_new(addr) else {
         return false;
     };
     with_mapper(|mapper| {
         matches!(
             mapper.translate(virt),
-            TranslateResult::Mapped { flags, .. } if flags.contains(PageTableFlags::PRESENT)
+            TranslateResult::Mapped { flags, .. } if flags.contains(required)
         )
     })
 }

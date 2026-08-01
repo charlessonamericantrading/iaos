@@ -325,6 +325,106 @@ pub fn run_ring3_exit_test() -> u64 {
     exit_code
 }
 
+/// Proves `SYS_TENSOR_EVAL`'s new `USER_ACCESSIBLE` enforcement (Fase 76)
+/// is real, not just "the code compiles": a genuine ring-3 program calls
+/// it with a `TensorEvalArgs` whose embedded pointers all target
+/// `memory::heap::HEAP_START` - real, `PRESENT` memory (so Fase 74's own
+/// check alone would have let it through), but never `USER_ACCESSIBLE`
+/// (every mapping before Fase 70 was `PRESENT | WRITABLE` only - see
+/// `memory/user_page.rs`'s own doc). Expects `u64::MAX` back: unlike
+/// `run_ring3_exit_test`'s own valid call (which this kernel's own
+/// `syscall.rs` self-test elsewhere still proves works from ring-0), a
+/// ring-3 caller pointing at kernel-only memory should now be rejected.
+///
+/// Reuses the exact same safe-return mechanism as `run_ring3_exit_test`
+/// (`enter_ring3`/`ring3_exit_entry_asm`, Fase 73) - this test also
+/// genuinely returns rather than halting, so it runs unconditionally
+/// like that one does. The `TensorEvalArgs` struct itself is written as
+/// an ordinary Rust value into the user page (not hand-encoded bytes,
+/// unlike the small instruction sequences below it) - only the tiny
+/// ring-3 "program" that invokes the syscall needs raw opcodes, since
+/// it has to run to reach `int 0x80` at all.
+///
+///   `mov rax, 4`    -> `48 B8` + 8-byte imm (`SYS_TENSOR_EVAL`, needs a
+///                       64-bit immediate: `mov eax, imm32` can't reach
+///                       past 4 GiB, and this page's own address can't
+///                       fit in 32 bits)
+///   `mov rdi, addr` -> `48 BF` + 8-byte imm (the `TensorEvalArgs` pointer)
+///   `int 0x80`      -> `CD 80` (leaves the real return value in `rax`)
+///   `int 0x81`      -> `CD 81` (exits with THAT value, untouched, as
+///                       this function's own return - so `u64::MAX`
+///                       here is proof the syscall itself was rejected,
+///                       not an artifact of the exit mechanism)
+pub fn run_ring3_pointer_reject_test() -> u64 {
+    let info = gdt::ring3_info();
+    let user_cs = info.user_code_selector as u64;
+    let user_ss = info.user_data_selector as u64;
+
+    let code_addr = USER_TEST_PAGE_ADDR;
+    let stack_top = USER_TEST_PAGE_ADDR + 4096;
+    // Well clear of the 20-byte code sequence below, still inside the
+    // same 4 KiB page.
+    let args_addr = USER_TEST_PAGE_ADDR + 256;
+
+    let kernel_only_ptr = crate::memory::heap::HEAP_START as u64;
+    let args = crate::syscall::TensorEvalArgs {
+        weights: kernel_only_ptr as *const f32,
+        weights_len: 1,
+        inputs: kernel_only_ptr as *const f32,
+        inputs_len: 1,
+        bias: kernel_only_ptr as *const f32,
+        bias_len: 1,
+        outputs: kernel_only_ptr as *mut f32,
+        outputs_len: 1,
+        in_dim: 1,
+        out_dim: 1,
+    };
+    unsafe {
+        core::ptr::write_volatile(args_addr as *mut crate::syscall::TensorEvalArgs, args);
+    }
+
+    let mut program = [0u8; 20];
+    program[0] = 0x48;
+    program[1] = 0xB8;
+    program[2..10].copy_from_slice(&crate::syscall::SYS_TENSOR_EVAL.to_le_bytes());
+    program[10] = 0x48;
+    program[11] = 0xBF;
+    program[12..20].copy_from_slice(&args_addr.to_le_bytes());
+    unsafe {
+        core::ptr::copy_nonoverlapping(program.as_ptr(), code_addr as *mut u8, program.len());
+        // int 0x80 ; int 0x81, right after the two 10-byte mov's above.
+        core::ptr::write_volatile((code_addr + 20) as *mut u8, 0xCD);
+        core::ptr::write_volatile((code_addr + 21) as *mut u8, 0x80);
+        core::ptr::write_volatile((code_addr + 22) as *mut u8, 0xCD);
+        core::ptr::write_volatile((code_addr + 23) as *mut u8, 0x81);
+    }
+
+    kprintln!("[RING3] Attempting SYS_TENSOR_EVAL from ring-3 with a kernel-only (non-user-accessible) pointer - expecting rejection...");
+    serial_println!(
+        "[RING3] ring3_pointer_reject_test entering rip={:#x} cs={:#06x} ss={:#06x} rsp={:#x} rflags={:#x} kernel_only_ptr={:#x}",
+        code_addr,
+        user_cs,
+        user_ss,
+        stack_top,
+        RING3_TEST_RFLAGS,
+        kernel_only_ptr
+    );
+
+    let exit_code =
+        unsafe { enter_ring3(code_addr, user_cs, user_ss, stack_top, RING3_TEST_RFLAGS) };
+
+    kprintln!(
+        "[RING3] Back in ring-0 - SYS_TENSOR_EVAL from ring-3 returned {:#x}",
+        exit_code
+    );
+    serial_println!(
+        "[RING3] ring3_pointer_reject_test exit_code={:#x}",
+        exit_code
+    );
+
+    exit_code
+}
+
 /// A real ring-3-originated syscall (Fase 72), followed by the same
 /// proven `cli`-fault ending `run_ring3_test` (Fase 71) already
 /// established. The "program" is three real instructions, hand-encoded

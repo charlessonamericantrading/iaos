@@ -254,6 +254,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ring3_exit_code
     );
 
+    // Fase 76: proves SYS_TENSOR_EVAL's new USER_ACCESSIBLE enforcement
+    // is real - a genuine ring-3 call pointing at kernel-only memory
+    // (the heap) must now be rejected, unlike a mere unmapped pointer
+    // (Fase 74's own test) or a valid, user-accessible one (this same
+    // syscall's own passing case, proven from ring-0 further below).
+    // Reuses the SAME safe-return mechanism as the test right above, so
+    // it also runs unconditionally rather than needing an opt-in
+    // command.
+    kprintln!(
+        "[KERNEL INIT] Testing SYS_TENSOR_EVAL rejects a ring-3 pointer to kernel-only memory..."
+    );
+    let ring3_reject_code = ring3::run_ring3_pointer_reject_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - kernel-only pointer test returned {:#x}",
+        ring3_reject_code
+    );
+
     // Hands the SAME allocator instance (cursor already advanced past
     // whatever heap init just claimed) to a global slot so later code -
     // e.g. a future real NIC driver's TX/RX descriptor rings - can keep
@@ -1348,9 +1365,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // 7. Invoke System Calls (Syscalls)
     kprintln!("[KERNEL SYSCALL] Testing Native Agent Syscall Dispatcher...");
-    syscall::dispatch_syscall(syscall::SYS_SERIAL_PRINT, 0, 0, 0);
-    let spawned_pid = syscall::dispatch_syscall(syscall::SYS_AGENT_SPAWN, 10000, 0, 0);
-    syscall::dispatch_syscall(syscall::SYS_KV_ALLOC, spawned_pid, 1024, 0);
+    syscall::dispatch_syscall(syscall::SYS_SERIAL_PRINT, 0, 0, 0, false);
+    let spawned_pid = syscall::dispatch_syscall(syscall::SYS_AGENT_SPAWN, 10000, 0, 0, false);
+    syscall::dispatch_syscall(syscall::SYS_KV_ALLOC, spawned_pid, 1024, 0, false);
 
     // 7a-2. Test SYS_TENSOR_EVAL (Fase 55) - this syscall number has been
     // defined since before this session's own start, but dispatch_syscall
@@ -1398,8 +1415,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             in_dim: 2,
             out_dim: 2,
         };
-        let result =
-            syscall::dispatch_syscall(syscall::SYS_TENSOR_EVAL, &args as *const _ as u64, 0, 0);
+        let result = syscall::dispatch_syscall(
+            syscall::SYS_TENSOR_EVAL,
+            &args as *const _ as u64,
+            0,
+            0,
+            false,
+        );
         let syscall_ok = result == 0;
 
         const EXPECTED_OUTPUTS: [f32; 2] = [4.0, 0.0];
@@ -1440,7 +1462,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!("[KERNEL SYSCALL] Testing SYS_TENSOR_EVAL rejects an unmapped pointer...");
     {
         const DEFINITELY_UNMAPPED: u64 = 0x1000;
-        let result = syscall::dispatch_syscall(syscall::SYS_TENSOR_EVAL, DEFINITELY_UNMAPPED, 0, 0);
+        let result =
+            syscall::dispatch_syscall(syscall::SYS_TENSOR_EVAL, DEFINITELY_UNMAPPED, 0, 0, false);
         let rejected_cleanly = result == u64::MAX;
         kprintln!(
             "[SYSCALL] tensor_eval_invalid_ptr_test: rejected_cleanly={}",

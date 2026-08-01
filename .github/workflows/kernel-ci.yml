@@ -407,6 +407,22 @@ jobs:
           # kernel hang here would have looked exactly like the CI
           # timeout that later self-tests are also checked against.
           grep -q "SYSCALL\] tensor_eval_invalid_ptr_test rejected_cleanly=true" boot.log
+          # Confirms SYS_TENSOR_EVAL's pointer check is now genuinely
+          # CONDITIONAL on the real caller (Fase 76), not just "mapped or
+          # not" (Fase 74) - a real ring-3 program calls it with a
+          # TensorEvalArgs whose pointers all target memory::heap::
+          # HEAP_START: real, PRESENT memory (Fase 74's own check alone
+          # would have let it through) that is NOT USER_ACCESSIBLE
+          # (every mapping before Fase 70 was PRESENT|WRITABLE only).
+          # exit_code=0xffffffffffffffff (u64::MAX, carried untouched
+          # from the syscall's own return value through the real ring-3
+          # exit mechanism - Fase 73) is direct proof the kernel now
+          # tells "present" apart from "present AND legitimately
+          # reachable from ring-3", using Fase 75's own real caller_rpl
+          # to decide which check applies - the SAME syscall's own
+          # valid-pointer test above (a ring-0 call, so unaffected by
+          # this stricter check) still passes unchanged.
+          grep -q "RING3\] ring3_pointer_reject_test exit_code=0xffffffffffffffff" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -
