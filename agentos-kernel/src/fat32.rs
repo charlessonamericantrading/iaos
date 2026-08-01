@@ -118,12 +118,13 @@ impl Fat32Info {
         let mut entries = Vec::new();
         let mut cluster = start_cluster;
         let mut sector_buf = [0u8; 512];
+        let mut lfn = fat_common::LfnState::default();
 
         'outer: loop {
             let cluster_lba = self.cluster_to_lba(cluster);
             for s in 0..self.sectors_per_cluster as u32 {
                 ata::read_sector(cluster_lba + s, &mut sector_buf)?;
-                if fat_common::parse_dir_sector(&sector_buf, &mut entries) {
+                if fat_common::parse_dir_sector(&sector_buf, &mut entries, &mut lfn) {
                     break 'outer;
                 }
             }

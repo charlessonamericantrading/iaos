@@ -412,6 +412,27 @@ jobs:
           # succeed for this exact line to appear; a fresh CI image always
           # takes this same fully-self-cleaning path.
           grep -q "FAT12\] dir_growth_test all_created=true count_ok=true last_ok=true all_deleted=true cleanup_ok=true" boot.log
+          # Confirms VFAT LONG FILE NAMES (Fase 38) - create_file/create_
+          # directory now fall back to a real short-alias-plus-long-entry
+          # VFAT sequence for a name that doesn't fit 8.3 (here, a 13-
+          # character name with an embedded space - this Fase's exact
+          # one-chunk boundary). long_name_shown proves parse_dir_sector
+          # reconstructs the checksum-verified long name for `ls`;
+          # long_name_read_ok AND alias_read_ok both true is the real
+          # proof of this Fase's actual scope: find_entry_location_in
+          # matches by *either* the long name or the generated short
+          # alias, not just whichever one display happens to show.
+          # alias_collision_rejected is a direct regression guard for a
+          # real bug this test caught on its first run locally - a plain
+          # 8.3 name typed directly used to skip collision-checking
+          # against an already-generated VFAT alias, letting two entries
+          # silently share one short name. Repeated for a directory,
+          # deleted by its *long* name this time (the file case above
+          # used the alias) to cover both lookup directions across the
+          # two sub-tests, not just one. All eleven checks must succeed
+          # for this exact line to appear; a fresh CI image always takes
+          # this same fully-self-cleaning path.
+          grep -q "FAT12\] vfat_test file_created=true long_name_shown=true long_name_read_ok=true alias_read_ok=true alias_collision_rejected=true file_delete_ok=true file_gone_ok=true dir_created=true dir_long_name_shown=true dir_delete_ok=true dir_gone_ok=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.

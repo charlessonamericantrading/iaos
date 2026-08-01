@@ -1011,6 +1011,83 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             serial_println!("[FAT12] dir_growth_test -> no partition: {}", e);
         }
     }
+
+    // 7b-2. Test VFAT Long File Names (create, display, lookup by EITHER
+    // name, delete) "long name.txt" is exactly 13 characters - this
+    // Fase's one-chunk limit, deliberately tested right at the boundary
+    // rather than comfortably under it. Doesn't fit 8.3 (a space, and 9
+    // base characters before the extension), so create_file falls back
+    // to build_name_entries' VFAT path: a generated short alias
+    // ("LONGN~1.TXT") plus one real long-name entry. long_name_shown
+    // proves parse_dir_sector reconstructs it correctly (checksum
+    // verified) for `ls`; long_name_read_ok and alias_read_ok both being
+    // true proves find_entry_location_in genuinely matches by either
+    // name, not just whichever one `ls` happens to display -
+    // read_file/delete_file/write_file/create_file's own "already
+    // exists" check all share that one matching path, so this exercises
+    // all of them at once. alias_collision_rejected is a direct
+    // regression guard for a real bug this test caught on its first
+    // run: a plain create using the exact bytes of an already-taken
+    // alias used to succeed instead of being rejected, silently leaving
+    // two entries sharing one short name (fixed in build_name_entries -
+    // see its doc for the full story). Repeated for a directory name
+    // ("My Documents" -> "MYDOC~1", deleted by its *long* name this time
+    // rather than the alias, covering both lookup directions across the
+    // two sub-tests) to prove create_directory_impl/delete_directory_impl
+    // share the identical wiring, not just the file functions.
+    kprintln!("[KERNEL INIT] Testing VFAT long file names (create/display/lookup/delete)...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                const LFN_DATA: &[u8] = b"Real VFAT long name support!";
+                let file_created = fs.create_file("long name.txt", LFN_DATA).is_ok();
+                let entries = fs.list_root_directory().unwrap_or_default();
+                let long_name_shown = entries.iter().any(|e| e.name == "long name.txt");
+                let long_name_read_ok = fs
+                    .read_file("long name.txt")
+                    .map(|d| d == LFN_DATA)
+                    .unwrap_or(false);
+                let alias_read_ok = fs
+                    .read_file("LONGN~1.TXT")
+                    .map(|d| d == LFN_DATA)
+                    .unwrap_or(false);
+                let alias_collision_rejected = fs.create_file("LONGN~1.TXT", b"other").is_err();
+                let file_delete_ok = fs.delete_file("LONGN~1.TXT").is_ok();
+                let file_gone_ok =
+                    fs.read_file("long name.txt").is_err() && fs.read_file("LONGN~1.TXT").is_err();
+
+                let dir_created = fs.create_directory("My Documents").is_ok();
+                let entries = fs.list_root_directory().unwrap_or_default();
+                let dir_long_name_shown =
+                    entries.iter().any(|e| e.name == "My Documents" && e.is_dir);
+                let dir_delete_ok = fs.delete_directory("My Documents").is_ok();
+                let dir_gone_ok = !fs
+                    .list_root_directory()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|e| e.name == "My Documents" || e.name == "MYDOC~1");
+
+                kprintln!(
+                    "[FAT12] vfat test: file_created={} long_name_shown={} long_name_read_ok={} alias_read_ok={} alias_collision_rejected={} file_delete_ok={} file_gone_ok={} dir_created={} dir_long_name_shown={} dir_delete_ok={} dir_gone_ok={}",
+                    file_created, long_name_shown, long_name_read_ok, alias_read_ok, alias_collision_rejected,
+                    file_delete_ok, file_gone_ok, dir_created, dir_long_name_shown, dir_delete_ok, dir_gone_ok
+                );
+                serial_println!(
+                    "[FAT12] vfat_test file_created={} long_name_shown={} long_name_read_ok={} alias_read_ok={} alias_collision_rejected={} file_delete_ok={} file_gone_ok={} dir_created={} dir_long_name_shown={} dir_delete_ok={} dir_gone_ok={}",
+                    file_created, long_name_shown, long_name_read_ok, alias_read_ok, alias_collision_rejected,
+                    file_delete_ok, file_gone_ok, dir_created, dir_long_name_shown, dir_delete_ok, dir_gone_ok
+                );
+            }
+            Err(e) => {
+                kprintln!("[FAT12] vfat test: not FAT12 ({})", e);
+                serial_println!("[FAT12] vfat_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!("[FAT12] vfat test: couldn't find FAT partition: {}", e);
+            serial_println!("[FAT12] vfat_test -> no partition: {}", e);
+        }
+    }
     shell::dispatch_command("ls");
 
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
