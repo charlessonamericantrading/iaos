@@ -22,6 +22,7 @@ pub enum GgufGtype {
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
+    Q8_K = 15,
 }
 
 impl GgufGtype {
@@ -37,6 +38,7 @@ impl GgufGtype {
             12 => Ok(GgufGtype::Q4_K),
             13 => Ok(GgufGtype::Q5_K),
             14 => Ok(GgufGtype::Q6_K),
+            15 => Ok(GgufGtype::Q8_K),
             _ => Err("GGUF: unknown tensor gtype"),
         }
     }
@@ -523,6 +525,68 @@ impl GgufModelLoader {
         values
     }
 
+    /// Decodes `bytes` as real GGML/GGUF Q8_K-quantized data - the LAST
+    /// defined K-quant (`GGML_TYPE_Q8_K = 15`, confirmed against GGML's
+    /// real `ggml.h`), and, despite being listed last, structurally the
+    /// SIMPLEST of the entire K-quant family by a wide margin: no bit-
+    /// packing at all. Confirmed against GGML's actual `ggml-common.h`
+    /// struct (fetched directly, not assumed from the format's name or
+    /// number - the same discipline `Q2_K`'s own research applied after
+    /// getting burned once by an early wrong guess for `Q4_K`):
+    /// ```c
+    /// typedef struct {
+    ///     float   d;              // delta
+    ///     int8_t  qs[QK_K];       // quants
+    ///     int16_t bsums[QK_K/16]; // sum of quants in groups of 16
+    /// } block_q8_K;
+    /// ```
+    /// Two genuinely distinguishing details worth naming explicitly,
+    /// since both would be easy to get wrong by pattern-matching against
+    /// every earlier K-quant instead of checking this one's own real
+    /// layout: (1) `d` is a plain 4-byte `f32` here, NOT the 2-byte
+    /// `ggml_half`/f16 every other K-quant (`Q2_K` through `Q6_K`) uses -
+    /// GGML's own comment ("this is only used for intermediate
+    /// quantization and dot products") explains why: `Q8_K` exists to
+    /// quantize float ACTIVATIONS on the fly for fast dot products
+    /// against already-quantized weights, not to compress a model file
+    /// for storage, so it has no need to save the extra 2 bytes/block an
+    /// f16 delta would. (2) `qs` is `[i8; 256]` - full SIGNED bytes, one
+    /// per value, no packing of multiple values into a shared byte at
+    /// all - the plainest possible representation, a direct consequence
+    /// of the same "speed over size" design goal.
+    ///
+    /// Dequantization is correspondingly trivial: `value[i] = d *
+    /// qs[i] as f32` for all 256 values - a single super-block-wide
+    /// scale, no sub-block scale/min lookup, no recentering, no
+    /// bit-shifting. `bsums[16]` (precomputed per-16-element sums,
+    /// GGML's own fast-dot-product SIMD optimization) is deliberately
+    /// NOT used here - it exists purely to skip re-summing `qs` on every
+    /// dot product in GGML's own optimized kernels, not to reconstruct
+    /// `value[i]` itself, so ignoring it is correct for basic
+    /// decode-to-`f32`, not a shortcut that loses information this
+    /// decoder actually needs.
+    ///
+    /// Struct layout (292 bytes, `QK_K=256`): `d` (4-byte f32, FIRST -
+    /// unlike `Q3_K`/`Q2_K`/`Q6_K`'s scale-last layout) + `qs[256]`
+    /// (`QK_K`, one signed byte per value) + `bsums[16]` (`QK_K/16`,
+    /// 2-byte signed sums, present in the struct but unused by this
+    /// decoder) - summing to 4+256+32=292.
+    pub fn decode_q8_k(bytes: &[u8]) -> Vec<f32> {
+        const BLOCK_SIZE: usize = 292; // 4 (d) + 256 (qs) + 32 (bsums, unused)
+        const QS_LEN: usize = 256;
+
+        let (blocks, _remainder) = bytes.as_chunks::<BLOCK_SIZE>();
+        let mut values = Vec::with_capacity(blocks.len() * QS_LEN);
+        for block in blocks {
+            let d = f32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+            let qs = &block[4..4 + QS_LEN];
+            for &q in qs {
+                values.push(d * (q as i8) as f32);
+            }
+        }
+        values
+    }
+
     /// Decodes `bytes` as real GGML/GGUF Q2_K-quantized data - the
     /// FIFTH K-quant format decoded here, and (after `Q3_K`'s SWAR
     /// scale trick) a genuinely welcome return to simplicity: no bit-
@@ -860,6 +924,7 @@ impl GgufModelLoader {
             GgufGtype::Q4_K => Ok(Self::decode_q4_k(bytes)),
             GgufGtype::Q5_K => Ok(Self::decode_q5_k(bytes)),
             GgufGtype::Q6_K => Ok(Self::decode_q6_k(bytes)),
+            GgufGtype::Q8_K => Ok(Self::decode_q8_k(bytes)),
         }
     }
 

@@ -906,6 +906,49 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 5b-8. Test real GGUF Q8_K super-block quantized tensor decoding
+    // (Fase 67) - the LAST defined K-quant, and, despite being numbered
+    // last, structurally the simplest of the whole family: no bit-
+    // packing at all, a plain f32 delta (not f16, unlike every other
+    // K-quant), and a full signed byte per value. qs[i] = i as u8 for
+    // all 256 values deliberately exercises the ENTIRE i8 range exactly
+    // once (0..127 stay positive, 128..255 wrap to -128..-1 when
+    // reinterpreted as i8) - a stronger, exhaustive check than any
+    // other decoder's test here, since it covers every possible input
+    // byte rather than a handful of hand-picked samples. d=2.0 (not 1.0)
+    // so a bug that forgot to multiply by d, or that misread d as a
+    // 2-byte f16 instead of the real 4-byte f32, would produce visibly
+    // wrong output rather than an accidental pass.
+    kprintln!("[GGUF INFERENCE] Testing Q8_K super-block quantized tensor decoding...");
+    {
+        let mut q8k_block: Vec<u8> = Vec::with_capacity(292);
+        q8k_block.extend_from_slice(&2.0f32.to_le_bytes()); // d = 2.0, FIRST
+        let mut qs = [0u8; 256];
+        for (i, q) in qs.iter_mut().enumerate() {
+            *q = i as u8;
+        }
+        q8k_block.extend_from_slice(&qs);
+        q8k_block.extend(core::iter::repeat_n(0u8, 32)); // bsums[16], unused
+
+        let decoded = GgufModelLoader::decode_q8_k(&q8k_block);
+        let expected_q8k: Vec<f32> = (0..256u32).map(|i| 2.0 * (i as u8 as i8) as f32).collect();
+        let decode_q8_k_ok = decoded == expected_q8k;
+
+        let dispatch_q8_k_ok =
+            GgufModelLoader::decode_tensor(&q8k_block, GgufGtype::Q8_K) == Ok(expected_q8k);
+
+        kprintln!(
+            "[GGUF Q8_K] decode_q8_k_ok={} dispatch_q8_k_ok={}",
+            decode_q8_k_ok,
+            dispatch_q8_k_ok
+        );
+        serial_println!(
+            "[GGUF] q8_k_test decode_q8_k_ok={} dispatch_q8_k_ok={}",
+            decode_q8_k_ok,
+            dispatch_q8_k_ok
+        );
+    }
+
     // 5c. Test real GGUF multi-tensor-info support (Fase 51) -
     // GgufTensorInfo::parse has returned "how many bytes this one entry
     // consumed" since Fase 43 specifically so several could be parsed in
