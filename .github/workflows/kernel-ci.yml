@@ -173,6 +173,18 @@ jobs:
           # computed constants, exercising both branches of the sub-
           # block scale index for all four bit-extracted quadrants.
           grep -q "GGUF\] q6_k_test decode_q6_k_ok=true dispatch_q6_k_ok=true" boot.log
+          # Confirms real GGUF Q5_K super-block decoding (Fase 59) - a
+          # third K-quant format, structurally close to Q4_K (d/dmin
+          # first, scales[12] 6-bit-packed via the SAME get_scale_min_k4
+          # Q4_K already uses, unchanged). The new piece: a 5th bit per
+          # value from qh[32] (added as +16 to a 4-bit qs nibble), with
+          # qh itself never advancing - shifting bit-masks pick a
+          # different single bit position out of the same 32 bytes each
+          # of the block's 4 sub-iterations. decode_q5_k_ok reuses Fase
+          # 57's own already-verified scale/min constants unchanged,
+          # checked against 8 hand-computed dequantized values from a
+          # uniform qh/qs byte pattern.
+          grep -q "GGUF\] q5_k_test decode_q5_k_ok=true dispatch_q5_k_ok=true" boot.log
           # Confirms real GGUF F16 tensor decoding (Fase 54) - the last
           # GgufGtype, completing full decode_tensor coverage. Unlike the
           # quantized formats above, F16 has no block/scale structure at

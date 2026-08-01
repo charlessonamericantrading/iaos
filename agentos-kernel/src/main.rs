@@ -709,6 +709,71 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 5b-7. Test real GGUF Q5_K super-block quantized tensor decoding
+    // (Fase 59) - a third K-quant format, structurally much closer to
+    // Q4_K than to Q6_K: d/dmin come FIRST (like Q4_K), and scales[12]
+    // are 6-bit-packed via the EXACT SAME get_scale_min_k4 Q4_K already
+    // uses - reused completely unchanged, not re-derived, since GGML's
+    // own dequantize_row_q5_K calls it identically to dequantize_row_
+    // q4_K. The only new piece: a 5th bit per value from qh[32], added
+    // as +16 to a 4-bit qs nibble (unsigned 0..31, no recentering) -
+    // and qh itself never advances across the block's 4 sub-iterations,
+    // instead using shifting bit-masks (u1/u2) to pick a different
+    // single bit position out of the SAME 32 bytes each time (u1: bits
+    // 0,2,4,6; u2: bits 1,3,5,7 - together all 8 bits of each byte).
+    // Hand-traced with concrete bytes (qh byte 0xAA, four distinct qs
+    // nibble-pair bytes) before writing any Rust - see decode_q5_k's
+    // own doc for the full derivation.
+    //
+    // decode_q5_k_ok reuses Fase 57's own already-verified SCALES array
+    // unchanged (get_scale_min_k4 itself didn't change, so its already-
+    // proven round trip doesn't need re-deriving) paired with a UNIFORM
+    // qh=0xAA (constant across all 32 bytes) and four distinct uniform
+    // qs chunks (0xAB/0xCD/0xEF/0x12) - giving 8 predictable sub-block
+    // values (11, 26, 13, 28, 15, 30, 2, 17, from low/high nibble +
+    // conditional +16) checked against 8 hand-computed dequantized
+    // constants.
+    kprintln!("[GGUF INFERENCE] Testing Q5_K super-block quantized tensor decoding...");
+    {
+        const SCALES: [u8; 12] = [135, 142, 213, 220, 120, 113, 42, 35, 195, 90, 225, 120];
+
+        let mut q5k_block: Vec<u8> = Vec::with_capacity(176);
+        q5k_block.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+        q5k_block.extend_from_slice(&0x3C00u16.to_le_bytes()); // dmin = 1.0
+        q5k_block.extend_from_slice(&SCALES);
+        q5k_block.extend(core::iter::repeat_n(0xAAu8, 32)); // qh: bits 0,2,4,6=0; 1,3,5,7=1
+        q5k_block.extend(core::iter::repeat_n(0xABu8, 32)); // qs chunk 0: low=11 high=10
+        q5k_block.extend(core::iter::repeat_n(0xCDu8, 32)); // qs chunk 1: low=13 high=12
+        q5k_block.extend(core::iter::repeat_n(0xEFu8, 32)); // qs chunk 2: low=15 high=14
+        q5k_block.extend(core::iter::repeat_n(0x12u8, 32)); // qs chunk 3: low=2 high=1
+
+        let decoded = GgufModelLoader::decode_q5_k(&q5k_block);
+        let mut expected_q5k: Vec<f32> = Vec::with_capacity(256);
+        expected_q5k.extend(core::iter::repeat_n(21.0f32, 32)); // sub0: 7*11-56
+        expected_q5k.extend(core::iter::repeat_n(315.0f32, 32)); // sub1: 14*26-49
+        expected_q5k.extend(core::iter::repeat_n(231.0f32, 32)); // sub2: 21*13-42
+        expected_q5k.extend(core::iter::repeat_n(749.0f32, 32)); // sub3: 28*28-35
+        expected_q5k.extend(core::iter::repeat_n(497.0f32, 32)); // sub4: 35*15-28
+        expected_q5k.extend(core::iter::repeat_n(1239.0f32, 32)); // sub5: 42*30-21
+        expected_q5k.extend(core::iter::repeat_n(84.0f32, 32)); // sub6: 49*2-14
+        expected_q5k.extend(core::iter::repeat_n(945.0f32, 32)); // sub7: 56*17-7
+        let decode_q5_k_ok = decoded == expected_q5k;
+
+        let dispatch_q5_k_ok =
+            GgufModelLoader::decode_tensor(&q5k_block, GgufGtype::Q5_K) == Ok(expected_q5k);
+
+        kprintln!(
+            "[GGUF Q5_K] decode_q5_k_ok={} dispatch_q5_k_ok={}",
+            decode_q5_k_ok,
+            dispatch_q5_k_ok
+        );
+        serial_println!(
+            "[GGUF] q5_k_test decode_q5_k_ok={} dispatch_q5_k_ok={}",
+            decode_q5_k_ok,
+            dispatch_q5_k_ok
+        );
+    }
+
     // 5c. Test real GGUF multi-tensor-info support (Fase 51) -
     // GgufTensorInfo::parse has returned "how many bytes this one entry
     // consumed" since Fase 43 specifically so several could be parsed in

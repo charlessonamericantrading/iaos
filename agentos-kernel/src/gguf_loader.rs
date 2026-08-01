@@ -18,6 +18,7 @@ pub enum GgufGtype {
     Q4_1 = 3,
     Q8_0 = 8,
     Q4_K = 12,
+    Q5_K = 13,
     Q6_K = 14,
 }
 
@@ -30,6 +31,7 @@ impl GgufGtype {
             3 => Ok(GgufGtype::Q4_1),
             8 => Ok(GgufGtype::Q8_0),
             12 => Ok(GgufGtype::Q4_K),
+            13 => Ok(GgufGtype::Q5_K),
             14 => Ok(GgufGtype::Q6_K),
             _ => Err("GGUF: unknown tensor gtype"),
         }
@@ -517,6 +519,101 @@ impl GgufModelLoader {
         values
     }
 
+    /// Decodes `bytes` as real GGML/GGUF Q5_K-quantized data - a third
+    /// K-quant super-block format, structurally much closer to `Q4_K`
+    /// than to `Q6_K`: `d`/`dmin` come FIRST in the struct (like `Q4_K`,
+    /// unlike `Q6_K`'s scale-last layout), and its `scales[12]` are
+    /// 6-bit-packed via the exact same `get_scale_min_k4` `Q4_K` already
+    /// uses - reused here completely unchanged, not re-derived, since
+    /// the packing scheme itself didn't change at all between the two
+    /// formats (confirmed directly from GGML's own `dequantize_row_q5_K`
+    /// source, which calls `get_scale_min_k4` the identical way
+    /// `dequantize_row_q4_K` does). The only genuinely new piece is a
+    /// 5th bit per value: each value is a 4-bit nibble from `qs[128]`
+    /// (same split-half low/high convention as every nibble-packed
+    /// format above) plus `+16` if a corresponding bit in `qh[32]` is
+    /// set - an unsigned 0..31 range, no `-32`/`-8`-style recentering
+    /// (unlike `Q4_0`/`Q6_K`) - dequantized affinely (`d*scale*value -
+    /// dmin*min`), the same shape as `Q4_K`'s formula, just with a
+    /// wider per-value range.
+    ///
+    /// Struct layout (176 bytes, `QK_K=256`): `d`(2) + `dmin`(2) +
+    /// `scales[12]` + `qh[32]` (`QK_K/8` - ONE bit per value) +
+    /// `qs[128]` (`QK_K/2`, same nibble packing as every format above).
+    /// Cross-checked against `dequantize_row_q5_K`'s own pointer/index
+    /// arithmetic before trusting it: `qs` advances 32 bytes per outer
+    /// iteration over 4 iterations (128 bytes total, matching
+    /// `qs[128]`), while **`qh` never advances at all** - all 4
+    /// iterations index the SAME 32-byte `qh` array, extracting a
+    /// DIFFERENT single bit position each time via `u1`/`u2` masks that
+    /// shift left by 2 every iteration (`u1`: bits 0,2,4,6; `u2`: bits
+    /// 1,3,5,7 - together covering all 8 bits of each `qh` byte across
+    /// the 4 iterations, matching `qh[32]`'s `QK_K/8` sizing exactly:
+    /// 32 bytes × 8 bits = 256 individual high-bits, one per value).
+    /// This non-advancing-pointer-plus-shifting-mask scheme is a
+    /// genuinely different design from `Q6_K`'s two-separate-advancing-
+    /// arrays approach, not a variant of it - checked explicitly rather
+    /// than assumed to generalize from the other K-quant formats above.
+    ///
+    /// Hand-traced with concrete byte values before writing any Rust:
+    /// with `qh` byte `0xAA` (bits, LSB first: 0,1,0,1,0,1,0,1) and four
+    /// distinct `qs` nibble-pair bytes (`0xAB`, `0xCD`, `0xEF`, `0x12`)
+    /// for the four 32-byte chunks, the eight extracted values (low/high
+    /// nibble of each chunk, with `+16` applied exactly when that
+    /// sub-block's `u1`/`u2` bit is set) are `11, 26, 13, 28, 15, 30, 2,
+    /// 17` - independently confirmed by re-deriving which of `0xAA`'s
+    /// bits are 0 vs 1 at each shifted mask position.
+    pub fn decode_q5_k(bytes: &[u8]) -> Vec<f32> {
+        const BLOCK_SIZE: usize = 176; // 2(d)+2(dmin)+12(scales)+32(qh)+128(qs)
+        const SCALES_LEN: usize = 12;
+        const QH_LEN: usize = 32;
+        const QS_LEN: usize = 128;
+
+        let (blocks, _remainder) = bytes.as_chunks::<BLOCK_SIZE>();
+        let mut values = Vec::with_capacity(blocks.len() * 256);
+        for block in blocks {
+            let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            let scales = &block[4..4 + SCALES_LEN];
+            let qh = &block[4 + SCALES_LEN..4 + SCALES_LEN + QH_LEN];
+            let qs = &block[4 + SCALES_LEN + QH_LEN..4 + SCALES_LEN + QH_LEN + QS_LEN];
+
+            let mut is = 0;
+            let mut u1: u8 = 1;
+            let mut u2: u8 = 2;
+            let mut q_offset = 0;
+            for _ in 0..4 {
+                let (sc1, m1) = get_scale_min_k4(is, scales);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+                let d1 = d * sc1 as f32;
+                let dm1 = dmin * m1 as f32;
+                let d2 = d * sc2 as f32;
+                let dm2 = dmin * m2 as f32;
+
+                for l in 0..32 {
+                    let byte = qs[q_offset + l];
+                    let low = (byte & 0x0F) as u32 + if qh[l] & u1 != 0 { 16 } else { 0 };
+                    values.push(d1 * low as f32 - dm1);
+                }
+                for l in 0..32 {
+                    let byte = qs[q_offset + l];
+                    let high = (byte >> 4) as u32 + if qh[l] & u2 != 0 { 16 } else { 0 };
+                    values.push(d2 * high as f32 - dm2);
+                }
+
+                q_offset += 32;
+                is += 2;
+                // Final iteration's shifts overflow u8 (64<<2=256,
+                // 128<<2=256) and wrap - harmless, matching GGML's own
+                // C behavior, since neither value is read again after
+                // the loop ends.
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+        }
+        values
+    }
+
     /// Decodes a byte buffer as raw, unquantized half-precision (`F16`)
     /// values - unlike every quantized format above, there's no block
     /// structure or shared scale here at all: each value is simply its
@@ -549,6 +646,7 @@ impl GgufModelLoader {
             GgufGtype::Q4_0 => Ok(Self::decode_q4_0(bytes)),
             GgufGtype::Q4_1 => Ok(Self::decode_q4_1(bytes)),
             GgufGtype::Q4_K => Ok(Self::decode_q4_k(bytes)),
+            GgufGtype::Q5_K => Ok(Self::decode_q5_k(bytes)),
             GgufGtype::Q6_K => Ok(Self::decode_q6_k(bytes)),
         }
     }
