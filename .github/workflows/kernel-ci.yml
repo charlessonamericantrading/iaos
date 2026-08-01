@@ -626,19 +626,28 @@ jobs:
           # 0), completes correctly (tx_phase=ok). This is the
           # reliable, honestly-assertable part of Fase 66's own attempt
           # at a full VirtIO RX proof (net::e1000's own Fase 45
-          # equivalent): the RX side (a genuine received reply actually
-          # landing in the buffer init_rx_queue armed) was investigated
-          # at length - QEMU's own real virtio-net.c source was read to
-          # rule out several plausible gating conditions (promiscuous-
-          # mode default, unicast MAC filtering, multiqueue queue-pair
-          # count, an explicit -netdev wiring question tested
-          # empirically) - but does not yet reliably succeed, so is
-          # deliberately NOT asserted here as a passing check. This
-          # mirrors net::e1000's own DD-bit mystery, which took two
-          # separate investigation rounds (Fase 22, Fase 32) before its
-          # real resolution (Fase 44) - see net/virtio.rs's own module
-          # doc and the persistent project history for the full
-          # investigation trail whenever this gets picked back up.
+          # equivalent).
+          #
+          # Fase 78 update: the ORIGINAL Fase 66 mystery ("used index
+          # never advances") is now understood and fixed - it was a
+          # test-design bug, not a device/backend one. init_rx_queue
+          # (Fase 65) only ever arms ONE descriptor; send_test_frame's
+          # own earlier request's reply generally consumes it before
+          # this function's own wait even starts, re-armed here so this
+          # function's own reply has somewhere fresh to land. A second,
+          # narrower mystery remains open even after that fix (this
+          # function's own freshly re-armed, byte-verified-correct,
+          # TX-confirmed request still never observes a reply) - see
+          # net/virtio.rs's own module doc for the full investigation
+          # trail (ruled out: malformed frame, wait duration, same-vs-
+          # different target IP). Separately, this exact boot command
+          # (`-device virtio-net-pci`, no explicit `-netdev`) gives the
+          # device NO working network backend at all (confirmed - see
+          # the same module doc) - e1000, QEMU's implicit default NIC,
+          # appears to claim the one implicit backend QEMU creates when
+          # no `-net`/`-netdev`/`-nic` flag is given. Both are genuinely
+          # comparable to net::e1000's own DD-bit mystery (Fase 22 ->
+          # 32 -> 44) - left honestly open for whoever resumes this.
           grep -q "VIRTIO\] rx_test tx_phase=ok" boot.log
           # e1000 TX (Fase 22, fully confirmed working Fase 44) - the ring
           # genuinely engages the hardware (TDH advances) AND the

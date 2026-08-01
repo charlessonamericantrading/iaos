@@ -612,30 +612,69 @@ pub struct RxRecvInfo {
 /// kernel has tried, matching `net::e1000`'s own Fase 45
 /// `receive_test_frame`.
 ///
-/// **Honest status (Fase 66)**: the TX half reliably works - the
-/// request genuinely completes through the device (`tx_phase=ok`,
-/// identical across repeated boots) - but the RX half does not yet:
-/// the armed buffer is observed to stay entirely untouched (all zeros)
-/// and the RX queue's used index never advances, even though SLIRP is
-/// independently confirmed still answering ARP/ICMP correctly in the
-/// exact same boot (`net::e1000`'s own later tests succeed normally).
-/// Investigated at length against QEMU's own real `hw/net/virtio-net.c`
-/// source (fetched via `gh api`, not guessed) rather than left
-/// unexamined: `virtio_net_can_receive`'s gating gates (`vm_running`,
-/// `curr_queue_pairs`, `virtio_queue_ready`/`DRIVER_OK`) all check out
-/// favorably from their real reset defaults; `receive_filter`'s
-/// unicast-MAC check is bypassed entirely since `n->promisc` itself
-/// defaults to `1` on device reset; an explicit `-netdev` was tested
-/// empirically in case the device had no backend at all (it changed
-/// which NIC claimed the default slot, but did not fix the timeout
-/// either, ruling that out too). None of these individually-plausible
-/// hypotheses panned out, so the real cause remains open - genuinely
-/// comparable to `net::e1000`'s own DD-bit mystery, which took two
-/// separate investigation rounds (Fase 22, Fase 32) before its actual
-/// resolution (Fase 44) turned up while researching something else
-/// entirely. Left honestly unresolved rather than forced, with a
-/// diagnostic dump (ISR + raw descriptor + raw buffer bytes) left in
-/// place on the timeout path for whoever resumes this.
+/// **Honest status (Fase 78, supersedes Fase 66's own account below)**:
+/// the ORIGINAL Fase 66 mystery ("the armed buffer stays entirely
+/// untouched and the used index never advances") is now understood and
+/// fixed - it was never a device/backend problem. `init_rx_queue`
+/// (Fase 65) arms exactly ONE descriptor, once, at boot; `send_test_frame`
+/// (Fase 64, called before this function) sends its own ARP request
+/// earlier still, and SLIRP's real reply to THAT request generally lands
+/// and consumes the ring's one and only buffer before this function ever
+/// gets a chance to look - proven directly via a temporary diagnostic
+/// that showed `used_idx_before` already equal to `avail_idx` (both 1)
+/// at the very start of this function's own wait, before any re-arming
+/// happened. The RX mechanism itself (DMA write + used-ring update +
+/// ISR) was working correctly the entire time, just for a reception this
+/// function structurally could never observe. Fixed by re-arming a
+/// fresh descriptor here - see the inline comment below for why that
+/// re-arm must happen before this function's own TX request goes out,
+/// not after (a real, self-caught ordering bug in an earlier version of
+/// this same fix).
+///
+/// **A second, narrower mystery remains open after that fix**: even with
+/// a freshly re-armed descriptor in place before this function's own
+/// request goes out, and that request confirmed byte-perfect (a
+/// temporary diagnostic dumped the actual queued TX bytes - correct
+/// broadcast dest, correct source MAC, correct EtherType/HTYPE/PTYPE/
+/// HLEN/PLEN/OPER/SHA/SPA) and TX-completed by the device
+/// (`used_elem_id` matching the right descriptor), no reply is ever
+/// observed for THIS function's own request - not within the normal
+/// ~5-second wait, nor an extended ~22-second one tried specifically to
+/// rule out "just needs more time" (identical result either way, so not
+/// a timing issue). Querying a different target IP than
+/// `send_test_frame`'s own (in case of some SLIRP-side repeat-query
+/// suppression) made no difference either, tested and ruled out. So: two
+/// genuinely independent ARP request/reply round trips through this same
+/// queue in the same boot - the first (via `send_test_frame`'s request)
+/// demonstrably completes, the second (this function's own) does not,
+/// with the TX side confirmed fine on both. The remaining, narrowed
+/// question is specific to QEMU/virtio-net's own handling of a second
+/// receive on an already-once-used queue, not this driver's request
+/// construction or ring bookkeeping. Genuinely comparable in spirit to
+/// `net::e1000`'s own DD-bit mystery (Fase 22 -> 32 -> 44) - left
+/// honestly open rather than forced, with a diagnostic dump (ISR, both
+/// ring indices, raw descriptor, raw buffer bytes) left in place on the
+/// timeout path for whoever resumes this.
+///
+/// **Separately, and orthogonally**: the kernel's own standard boot
+/// command (`kernel-ci.yml`'s invocation, matching `boot_kernel.bat`)
+/// adds `-device virtio-net-pci` with no explicit `-netdev` of its own;
+/// empirically, under that exact command this device has NO working
+/// network backend at all (confirmed: `raw_buf_head` stays all-zero and
+/// `used_idx` never advances even once, all boot long - contrast an
+/// explicit, independent `-netdev` per NIC, under which the first round
+/// trip above demonstrably succeeds). QEMU's implicit default NIC
+/// (e1000, added because no `-net`/`-netdev`/`-nic` flag is given at
+/// all) appears to claim the one implicit backend QEMU creates in that
+/// case, leaving the explicitly-added `-device virtio-net-pci` with
+/// nothing attached. This means CI will keep showing a timeout for this
+/// test regardless of the fix above, but for this separate, now-understood
+/// reason - not evidence the fix is wrong. Left unchanged in this Fase:
+/// giving virtio-net-pci its own explicit `-netdev` would fix this half
+/// but not the second-round-trip mystery above, so it wouldn't flip this
+/// specific test to a pass either way, and touching the shared boot
+/// command used by every other test is a bigger-blast-radius change than
+/// this Fase's own scope justifies without that payoff.
 ///
 /// Deliberately a NEW, independent function rather than reusing or
 /// refactoring `send_test_frame` - its exact behavior and log output are
@@ -652,6 +691,24 @@ pub fn receive_test_frame(
     rx_info: &RxQueueInfo,
 ) -> Result<RxRecvInfo, &'static str> {
     let mac = read_mac_at(tx_info.io_base, VIRTIO_PCI_CONFIG_OFF_NO_MSIX);
+
+    // Fase 78 fix (full reasoning in this function's own module doc
+    // above): re-arm a fresh descriptor into the RX avail ring, BEFORE
+    // building/sending this function's own ARP request below - not
+    // after, which was a real, self-caught race in an earlier version
+    // of this same fix (a fast-arriving reply could otherwise land
+    // with no available descriptor yet and be silently dropped).
+    let (_rx_desc_off, rx_avail_off, rx_used_off) =
+        vring_offsets(rx_info.queue_num as u64, VRING_ALIGN);
+    let rx_avail_ptr = (rx_info.virt_base + rx_avail_off) as *mut u16;
+    unsafe {
+        core::ptr::write_bytes(rx_info.buf_virt as *mut u8, 0, rx_info.buf_len);
+        let avail_idx = core::ptr::read_volatile(rx_avail_ptr.add(1));
+        let ring_slot = (avail_idx as u64 % rx_info.queue_num as u64) as usize;
+        core::ptr::write_volatile(rx_avail_ptr.add(2 + ring_slot), 0u16); // descriptor 0
+        core::ptr::write_volatile(rx_avail_ptr.add(1), avail_idx.wrapping_add(1));
+        write_port_u16(tx_info.io_base, VIRTIO_PCI_QUEUE_NOTIFY, RX_QUEUE_INDEX);
+    }
 
     let frame_len = 42usize; // 14-byte Ethernet header + 28-byte ARP payload
     let buf_len = VIRTIO_NET_HDR_LEN + frame_len;
@@ -728,14 +785,12 @@ pub fn receive_test_frame(
         return Err("virtio: RX test's own ARP request TX never completed");
     }
 
-    // Now wait for SLIRP's reply to land in the RX buffer armed by
-    // init_rx_queue (Fase 65) - a genuine network round trip, so this
-    // yields the CPU via hlt() for real wall-clock time (~90 ticks,
-    // about 5 seconds at this kernel's ~18.2Hz rate) rather than a
-    // tight busy-spin, the same reasoning net::e1000::receive_test_frame
+    // Now wait for SLIRP's reply to land in the freshly re-armed RX
+    // buffer above - a genuine network round trip, so this yields the
+    // CPU via hlt() for real wall-clock time (~90 ticks, about 5
+    // seconds at this kernel's ~18.2Hz rate) rather than a tight
+    // busy-spin, the same reasoning net::e1000::receive_test_frame
     // already established for the identical kind of wait.
-    let (_rx_desc_off, _rx_avail_off, rx_used_off) =
-        vring_offsets(rx_info.queue_num as u64, VRING_ALIGN);
     let rx_used_ptr = (rx_info.virt_base + rx_used_off) as *mut u8;
     let rx_used_idx_ptr = unsafe { (rx_used_ptr as *mut u16).add(1) };
     let used_idx_before = unsafe { core::ptr::read_volatile(rx_used_idx_ptr) };
@@ -761,15 +816,27 @@ pub fn receive_test_frame(
         // them apart without needing to re-add debug prints from
         // scratch.
         let isr = unsafe { read_port_u8(tx_info.io_base, VIRTIO_PCI_ISR) };
-        let (rx_desc_off, _rx_avail_off2, _rx_used_off2) =
+        let (rx_desc_off, rx_avail_off, _rx_used_off2) =
             vring_offsets(rx_info.queue_num as u64, VRING_ALIGN);
         let rx_desc_ptr = (rx_info.virt_base + rx_desc_off) as *const u8;
         let raw_desc = unsafe { core::slice::from_raw_parts(rx_desc_ptr, 16) };
         let raw_buf_head =
             unsafe { core::slice::from_raw_parts(rx_info.buf_virt as *const u8, 16) };
+        // used_idx_before is the value this SAME call's own poll loop
+        // started from, captured a few lines above - printing it tells
+        // us whether the ring was already sitting past 0 (meaning some
+        // EARLIER reception, e.g. send_test_frame's own ARP request's
+        // reply, already consumed the single descriptor init_rx_queue
+        // ever arms) before this function's own wait even began, versus
+        // genuinely stuck at 0 (no reception at all, ever).
+        let rx_avail_ptr = (rx_info.virt_base + rx_avail_off) as *const u16;
+        let avail_idx_now = unsafe { core::ptr::read_volatile(rx_avail_ptr.add(1)) };
         serial_println!(
-            "[VIRTIO] rx timeout: isr={:#04x} raw_desc0={:02x?} raw_buf_head={:02x?}",
+            "[VIRTIO] rx timeout: isr={:#04x} used_idx_before={} used_idx_after={} avail_idx_now={} raw_desc0={:02x?} raw_buf_head={:02x?}",
             isr,
+            used_idx_before,
+            used_idx_after,
+            avail_idx_now,
             raw_desc,
             raw_buf_head
         );
