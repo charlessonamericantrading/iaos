@@ -718,6 +718,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("ls");
     shell::dispatch_command("ls TESTDIR");
 
+    // 7b-12. Real FAT12 subdirectory DELETION - frees a directory's
+    // cluster and marks its root entry deleted, refusing to delete a
+    // non-empty one (checked via its own "."/".." -only content). Uses
+    // its own dedicated directory ("RMDTEST"), fully self-cleaning -
+    // unlike the TESTDIR test above, which deliberately stays around to
+    // keep testing mkdir's "already exists" tolerance across repeat
+    // boots (no rmdir existed yet when that test was written).
+    kprintln!("[KERNEL INIT] Testing FAT12 subdirectory deletion...");
+    shell::dispatch_command("mkdir RMDTEST");
+    shell::dispatch_command("rmdir RMDTEST");
+    shell::dispatch_command("ls");
+    shell::dispatch_command("ls RMDTEST");
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real

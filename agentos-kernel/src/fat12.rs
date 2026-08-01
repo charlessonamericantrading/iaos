@@ -628,6 +628,45 @@ impl Fat12Info {
 
         Ok(())
     }
+
+    /// Deletes an EMPTY subdirectory: frees its cluster chain and marks
+    /// its root-directory entry deleted (`0xE5`) - same mechanics as
+    /// `delete_file`, since freeing a chain and marking an entry deleted
+    /// doesn't care whether the chain held file bytes or directory
+    /// entries. Refuses to delete a non-empty directory (anything beyond
+    /// the `.`/`..` entries every directory `create_directory` writes) -
+    /// the standard, safe `rmdir` semantic. This can't currently be
+    /// exercised against a genuinely non-empty directory in practice,
+    /// since nothing yet puts a real file *inside* a subdirectory
+    /// (`create_file`/`read_file`/`write_file` are still root-only) - but
+    /// the check is correct and forward-looking regardless, not
+    /// speculative dead code: it's exactly what would matter the moment
+    /// subdirectory-scoped file I/O is added.
+    pub fn delete_directory(&mut self, name: &str) -> Result<(), &'static str> {
+        let (entry_lba, entry_offset, entry) = self.find_entry_location(name)?;
+        if !entry.is_dir {
+            return Err("FAT12: delete_directory does not support files - use rm");
+        }
+
+        let entries = self.list_directory(entry.start_cluster)?;
+        if entries.len() > 2 {
+            return Err("FAT12: directory is not empty");
+        }
+
+        let mut cluster = Some(entry.start_cluster);
+        while let Some(c) = cluster {
+            let next = self.next_cluster(c)?;
+            self.write_fat_entry_to_disk(c, 0x0000)?;
+            cluster = next;
+        }
+
+        let mut sector_buf = [0u8; 512];
+        ata::read_sector(entry_lba, &mut sector_buf)?;
+        sector_buf[entry_offset] = 0xE5;
+        ata::write_sector(entry_lba, &sector_buf)?;
+
+        Ok(())
+    }
 }
 
 /// Converts a "NAME" or "NAME.EXT" string into the padded 8.3 short-name

@@ -20,10 +20,10 @@ pub fn dispatch_command(line: &str) {
     match cmd {
         "help" => {
             kprintln!(
-                "Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, clear"
+                "Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, clear"
             );
             serial_println!(
-                "[SHELL] help -> Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, clear"
+                "[SHELL] help -> Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, clear"
             );
         }
         "ps" => {
@@ -218,6 +218,24 @@ pub fn dispatch_command(line: &str) {
                     Err(e) => {
                         kprintln!("mkdir: {}", e);
                         serial_println!("[SHELL] mkdir {} -> FAILED: {}", dirname, e);
+                    }
+                }
+            }
+        }
+        "rmdir" => {
+            let dirname = parts.next().unwrap_or("");
+            if dirname.is_empty() {
+                kprintln!("rmdir: usage: rmdir DIRNAME");
+                serial_println!("[SHELL] rmdir -> no name given");
+            } else {
+                match delete_fat_directory(dirname) {
+                    Ok(()) => {
+                        kprintln!("Deleted directory '{}'.", dirname);
+                        serial_println!("[SHELL] rmdir {} -> deleted", dirname);
+                    }
+                    Err(e) => {
+                        kprintln!("rmdir: {}", e);
+                        serial_println!("[SHELL] rmdir {} -> FAILED: {}", dirname, e);
                     }
                 }
             }
@@ -434,6 +452,19 @@ fn create_fat_directory(name: &str) -> Result<(), &'static str> {
     }
     let mut fs = crate::fat12::read_bpb(&partition)?;
     fs.create_directory(name)
+}
+
+/// The `rmdir` command's implementation - same FAT12-only reasoning as
+/// `create_fat_file` above.
+fn delete_fat_directory(name: &str) -> Result<(), &'static str> {
+    let partition = find_fat_partition()?;
+    if crate::fat32::read_bpb(&partition).is_ok() {
+        return Err(
+            "FAT32 directory deletion isn't implemented yet (this disk is FAT12 in practice)",
+        );
+    }
+    let mut fs = crate::fat12::read_bpb(&partition)?;
+    fs.delete_directory(name)
 }
 
 /// The `ls DIRNAME` command's implementation - lists a named

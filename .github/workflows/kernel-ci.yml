@@ -340,6 +340,16 @@ jobs:
           # which would inflate this count above 2.
           grep -q "SHELL\] mkdir TESTDIR -> created" boot.log
           grep -q "SHELL\] ls TESTDIR -> 2 entries" boot.log
+          # Confirms FAT12 SUBDIRECTORY deletion (Fase 33) - rmdir frees the
+          # directory's cluster and marks its root entry deleted, same
+          # mechanics delete_file already uses. Uses its own dedicated,
+          # fully self-cleaning directory (RMDTEST) rather than TESTDIR
+          # above (which deliberately stays around to keep testing mkdir's
+          # "already exists" tolerance) - a fresh CI image always creates
+          # then deletes RMDTEST successfully, so these exact lines are the
+          # only outcome CI should ever see.
+          grep -q "SHELL\] mkdir RMDTEST -> created" boot.log
+          grep -q "SHELL\] rmdir RMDTEST -> deleted" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.
