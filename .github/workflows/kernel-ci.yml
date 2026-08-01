@@ -172,6 +172,18 @@ jobs:
           # by decode_tensor, not just structurally similar to what it
           # expects.
           grep -q "GGUF\] multi_tensor_test parse_many_ok=true tensor1_decode_ok=true tensor2_decode_ok=true" boot.log
+          # Confirms GgufTensorInfo::parse_many now works through REAL
+          # FAT12 disk I/O (Fase 56), not just the synthetic in-memory
+          # buffer the check above uses - the exact gap Fase 51's own
+          # notes flagged as unclosed. A genuine 2-tensor GGUF file
+          # (different gtypes again: F32 + Q8_0) is written to its own
+          # dedicated file, read back, and both tensors are parsed AND
+          # decoded from the disk-read bytes - each tensor's offset is
+          # relative to the full file, matching the original single-
+          # tensor disk-load test's own established convention.
+          # cleanup_ok confirms this is fully self-cleaning, same
+          # discipline as every other dedicated-file FAT12 test.
+          grep -q "GGUF\] multi_tensor_disk_test write_ok=true round_trip_ok=true header_ok=true parse_many_disk_ok=true tensor1_disk_decode_ok=true tensor2_disk_decode_ok=true cleanup_ok=true" boot.log
           # Confirms SYS_TENSOR_EVAL (Fase 55) genuinely dispatches to the
           # real tensor engine now, not "Unknown System Call Number" (this
           # syscall number had been defined but never wired to any match

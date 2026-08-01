@@ -659,6 +659,148 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 5c-2. Test real GGUF multi-tensor DISK loading (Fase 56) - the
+    // previous test proved parse_many correct against a synthetic
+    // in-memory buffer; this proves the same capability through real
+    // FAT12 disk I/O for the first time, the exact gap Fase 51's own
+    // memory notes flagged as not yet closed. Builds a genuine 2-tensor
+    // GGUF file (24-byte header + 2 tensor-info entries, parsed via
+    // parse_many, + both tensors' real data - "weights" F32 and
+    // "scale_bias" Q8_0, deliberately different gtypes again), writes it
+    // to a dedicated real file (distinct from the original single-tensor
+    // disk-load test's own MODEL.BIN, so the two tests can never
+    // interact), reads it back, then parses and decodes BOTH tensors
+    // from the DISK-READ bytes - not the in-memory buffer used to
+    // construct them. Each tensor's offset field is relative to the FULL
+    // FILE (matching the convention the original single-tensor disk-load
+    // test already established), not just the tensor-info section, since
+    // parse_many is called on a slice starting right after the header.
+    kprintln!("[GGUF INFERENCE] Testing GGUF multi-tensor DISK loading...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                use gguf_loader::{GgufModelLoader, GgufTensorInfo};
+
+                const T1_NAME: &str = "weights";
+                const T2_NAME: &str = "scale_bias";
+                const T1_DATA: [f32; 4] = [1.0, -2.0, 3.5, 0.0];
+
+                let mut model_bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                model_bytes.extend_from_slice(&gguf_loader::GGUF_MAGIC.to_le_bytes());
+                model_bytes.extend_from_slice(&3u32.to_le_bytes()); // version
+                model_bytes.extend_from_slice(&2u64.to_le_bytes()); // tensor_count = 2
+                model_bytes.extend_from_slice(&0u64.to_le_bytes()); // kv_count = 0
+
+                model_bytes.extend_from_slice(&(T1_NAME.len() as u32).to_le_bytes());
+                model_bytes.extend_from_slice(T1_NAME.as_bytes());
+                model_bytes.extend_from_slice(&2u32.to_le_bytes()); // dim0
+                model_bytes.extend_from_slice(&2u32.to_le_bytes()); // dim1
+                model_bytes.extend_from_slice(&(GgufGtype::F32 as u32).to_le_bytes());
+                let offset1_pos = model_bytes.len();
+                model_bytes.extend_from_slice(&0u32.to_le_bytes()); // offset placeholder
+
+                model_bytes.extend_from_slice(&(T2_NAME.len() as u32).to_le_bytes());
+                model_bytes.extend_from_slice(T2_NAME.as_bytes());
+                model_bytes.extend_from_slice(&32u32.to_le_bytes()); // dim0
+                model_bytes.extend_from_slice(&1u32.to_le_bytes()); // dim1
+                model_bytes.extend_from_slice(&(GgufGtype::Q8_0 as u32).to_le_bytes());
+                let offset2_pos = model_bytes.len();
+                model_bytes.extend_from_slice(&0u32.to_le_bytes()); // offset placeholder
+
+                let tensor1_data_offset = model_bytes.len();
+                model_bytes[offset1_pos..offset1_pos + 4]
+                    .copy_from_slice(&(tensor1_data_offset as u32).to_le_bytes());
+                for v in T1_DATA {
+                    model_bytes.extend_from_slice(&v.to_le_bytes());
+                }
+
+                let tensor2_data_offset = model_bytes.len();
+                model_bytes[offset2_pos..offset2_pos + 4]
+                    .copy_from_slice(&(tensor2_data_offset as u32).to_le_bytes());
+                model_bytes.extend_from_slice(&0x3800u16.to_le_bytes()); // f16 scale = 0.5
+                let qs2: [i8; 32] = core::array::from_fn(|i| (i as i8) - 16);
+                for &v in &qs2 {
+                    model_bytes.push(v as u8);
+                }
+
+                let write_ok = fs.create_file("MULTIGF.BIN", &model_bytes).is_ok();
+                let read_back = fs.read_file("MULTIGF.BIN");
+                let round_trip_ok = read_back.as_deref() == Ok(model_bytes.as_slice());
+
+                let mut header_ok = false;
+                let mut parse_many_disk_ok = false;
+                let mut tensor1_disk_decode_ok = false;
+                let mut tensor2_disk_decode_ok = false;
+
+                if let Ok(full_bytes) = &read_back {
+                    header_ok = GgufModelLoader::parse_header(&full_bytes[0..24])
+                        .map(|h| h.tensor_count == 2 && h.kv_count == 0)
+                        .unwrap_or(false);
+
+                    if let Ok((infos, consumed)) = GgufTensorInfo::parse_many(&full_bytes[24..], 2)
+                    {
+                        parse_many_disk_ok = infos.len() == 2
+                            && infos[0].name == T1_NAME
+                            && infos[0].dimensions == [2, 2]
+                            && infos[0].gtype == GgufGtype::F32
+                            && infos[0].offset == tensor1_data_offset
+                            && infos[1].name == T2_NAME
+                            && infos[1].dimensions == [32, 1]
+                            && infos[1].gtype == GgufGtype::Q8_0
+                            && infos[1].offset == tensor2_data_offset
+                            && consumed == tensor1_data_offset - 24;
+
+                        tensor1_disk_decode_ok = infos
+                            .first()
+                            .map(|info| {
+                                GgufModelLoader::decode_tensor(
+                                    &full_bytes[info.offset..info.offset + 16],
+                                    info.gtype,
+                                ) == Ok(T1_DATA.to_vec())
+                            })
+                            .unwrap_or(false);
+
+                        let expected2: alloc::vec::Vec<f32> =
+                            qs2.iter().map(|&v| v as f32 * 0.5).collect();
+                        tensor2_disk_decode_ok = infos
+                            .get(1)
+                            .map(|info| {
+                                GgufModelLoader::decode_tensor(
+                                    &full_bytes[info.offset..info.offset + 34],
+                                    info.gtype,
+                                ) == Ok(expected2)
+                            })
+                            .unwrap_or(false);
+                    }
+                }
+
+                let cleanup_ok = fs.delete_file("MULTIGF.BIN").is_ok();
+
+                kprintln!(
+                    "[GGUF MULTI-TENSOR DISK] write_ok={} round_trip_ok={} header_ok={} parse_many_disk_ok={} tensor1_disk_decode_ok={} tensor2_disk_decode_ok={} cleanup_ok={}",
+                    write_ok, round_trip_ok, header_ok, parse_many_disk_ok,
+                    tensor1_disk_decode_ok, tensor2_disk_decode_ok, cleanup_ok
+                );
+                serial_println!(
+                    "[GGUF] multi_tensor_disk_test write_ok={} round_trip_ok={} header_ok={} parse_many_disk_ok={} tensor1_disk_decode_ok={} tensor2_disk_decode_ok={} cleanup_ok={}",
+                    write_ok, round_trip_ok, header_ok, parse_many_disk_ok,
+                    tensor1_disk_decode_ok, tensor2_disk_decode_ok, cleanup_ok
+                );
+            }
+            Err(e) => {
+                kprintln!("[GGUF] multi-tensor disk test: not FAT12 ({})", e);
+                serial_println!("[GGUF] multi_tensor_disk_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!(
+                "[GGUF] multi-tensor disk test: couldn't find FAT partition: {}",
+                e
+            );
+            serial_println!("[GGUF] multi_tensor_disk_test -> no partition: {}", e);
+        }
+    }
+
     // 6. Test Native VirtIO-Net & TCP/IPv4 Network Stack
     kprintln!("[NET INIT] Initializing VirtIO-Net Hardware Adapter & TCP/IP Stack...");
     NativeNetworkStack::send_ipv4_packet([192, 168, 1, 1], b"AgentOS Kernel Online");
