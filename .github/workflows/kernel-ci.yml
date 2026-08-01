@@ -248,6 +248,18 @@ jobs:
           # completed and control returned to main.rs, but that the
           # hardware's own completion signal genuinely arrived.
           grep -q "E1000\] tx_sent 42 bytes dd=true" boot.log
+          # Confirms real e1000 RX (Fase 45) - receive_test_frame arms a
+          # real receive descriptor ring, triggers the TX ARP request
+          # above, and QEMU's SLIRP backend genuinely replies. is_arp_
+          # reply=true is the strongest check here: it means the ARP
+          # OPER field reads 0x0002 (reply, not request) AND the Sender
+          # Hardware Address matches the Ethernet source MAC - real
+          # internal cross-consistency a malformed or coincidental frame
+          # wouldn't have, not just that 64 bytes of *something* arrived.
+          # gateway_ip matching exactly the IP the original request asked
+          # about is the final, independent confirmation this is a real,
+          # correctly-addressed reply from the network, not noise.
+          grep -q "E1000\] rx_received 64 bytes eop=true is_arp_reply=true gateway_ip=Some(\[10, 0, 2, 2\])" boot.log
           # Confirms the new ATA write path (Fase 23) genuinely wrote and
           # read back matching bytes - not just that write_sector()
           # returned without erroring. Deliberately NOT asserting the

@@ -181,7 +181,7 @@ const TCTL_COLD_FULL_DUPLEX: u32 = 0x40 << 12; // recommended collision distance
 // IEEE 802.3's standard Inter Packet Gap timing (IPGT=10, IPGR1=8, IPGR2=6,
 // packed into TIPG's low three 10-bit fields). Written for correctness/
 // completeness even though it reads back as 0 regardless in local testing
-// - see the module doc's "known limitation" section.
+// - see the module doc's "TX DD-bit mystery, resolved" section.
 const TIPG_DEFAULT: u32 = 0x0060_200A;
 
 const TXD_CMD_EOP: u8 = 0x01; // End Of Packet - this is the last (only) descriptor of the frame
@@ -190,6 +190,35 @@ const TXD_CMD_RS: u8 = 0x08; // Report Status - hardware sets DD in `status` onc
 const TXD_STATUS_DD: u8 = 0x01; // Descriptor Done
 
 const NUM_TX_DESCRIPTORS: usize = 8; // 8 * 16 bytes = 128, satisfies TDLEN's 128-byte-multiple rule
+
+// RX registers - offsets verified (Fase 44) against QEMU's actual
+// hw/net/e1000_regs.h/e1000x_regs.h, the same discipline Fase 22/32 used
+// for the TX side.
+const REG_RDBAL: u64 = 0x2800;
+const REG_RDBAH: u64 = 0x2804;
+const REG_RDLEN: u64 = 0x2808;
+const REG_RDH: u64 = 0x2810;
+const REG_RDT: u64 = 0x2818;
+const REG_RCTL: u64 = 0x0100;
+
+const RCTL_EN: u32 = 1 << 1; // Receiver Enable
+const RCTL_BAM: u32 = 1 << 15; // Broadcast Accept Mode - defensive; a unicast
+                               // reply to our own (already-filtered) MAC
+                               // shouldn't need this, but costs nothing
+const RCTL_SECRC: u32 = 1 << 26; // Strip Ethernet CRC - simplifies reading
+                                 // a received frame back (no trailing
+                                 // 4-byte FCS to account for)
+                                 // RCTL's buffer-size bits (17:16) are left at their reset value 00, which
+                                 // (with BSEX also 0, also left at reset) selects the 2048-byte default -
+                                 // comfortably larger than anything this test expects to receive.
+
+const RXD_STAT_DD: u8 = 0x01; // Descriptor Done
+const RXD_STAT_EOP: u8 = 0x02; // End Of Packet
+
+const NUM_RX_DESCRIPTORS: usize = 8; // matches NUM_TX_DESCRIPTORS - same
+                                     // likely ring-length alignment rule,
+                                     // even though only descriptor 0 is
+                                     // ever given a real buffer below
 
 /// Legacy transmit descriptor - 16 bytes, exact field order matters (this
 /// is read by the NIC's own DMA engine, not just other Rust code).
@@ -204,6 +233,21 @@ struct TxDescriptor {
     cmd: u8,
     status: u8,
     css: u8,
+    special: u16,
+}
+
+/// Legacy receive descriptor - 16 bytes, same packing reasoning as
+/// `TxDescriptor` (this is DMA'd into by the NIC itself, not just read by
+/// Rust code). Field layout verified (Fase 44) against QEMU's actual
+/// `struct e1000_rx_desc` in `hw/net/e1000x_regs.h`.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct RxDescriptor {
+    addr: u64,
+    length: u16,
+    checksum: u16,
+    status: u8,
+    errors: u8,
     special: u16,
 }
 
@@ -485,5 +529,141 @@ pub fn send_test_frame() -> Result<(), &'static str> {
             raw
         );
     }
-    Err("e1000 TX: timed out waiting for descriptor DD - hardware dequeued it (TDH advanced) but never confirmed the send; see module doc's known-limitation section")
+    Err("e1000 TX: timed out waiting for descriptor DD - hardware dequeued it (TDH advanced) but never confirmed the send; see module doc's \"TX DD-bit mystery, resolved\" section (this path should be unreachable since Fase 44's bus-mastering fix - a real regression if it fires)")
+}
+
+/// Sets up a real receive descriptor ring, triggers a real ARP request
+/// via `send_test_frame` (SLIRP's default gateway at `10.0.2.2` should
+/// reply to it), and polls for a genuine received frame - the first real
+/// RX attempt this driver has made. Register offsets, `RCTL` bits, and
+/// the legacy RX descriptor layout were verified (Fase 44) against
+/// QEMU's actual `hw/net/e1000x_regs.h`/`e1000x_common.c` source, the
+/// same discipline the TX side's own investigation used.
+///
+/// The RX ring is armed *before* the TX send, not after - a reply could
+/// arrive at any point once the request goes out, and `send_test_frame`
+/// itself already waits several real seconds internally for its own DD
+/// confirmation, during which an un-armed RX ring would simply drop
+/// anything QEMU's SLIRP backend sent back.
+///
+/// Only descriptor 0 is ever given a real buffer; the rest are left
+/// zeroed (`addr = 0`), which QEMU's own model explicitly tolerates ("as
+/// per intel docs; skip descriptors with null buf addr" - confirmed by
+/// reading `e1000_receive_iov`'s source directly) - fine for a 42-byte
+/// ARP reply that fits entirely in one 2048-byte buffer, never spilling
+/// into a second descriptor.
+pub fn receive_test_frame() -> Result<(), &'static str> {
+    let (dev, mmio_base) = find_mmio_base()?;
+    dev.enable_bus_mastering();
+
+    let ring_frame = crate::memory::frame_allocator::allocate_frame();
+    let buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let phys_offset = PHYS_MEM_OFFSET.load(Ordering::Relaxed);
+    let ring_virt = (phys_offset + ring_frame.start_address().as_u64()) as *mut RxDescriptor;
+
+    unsafe {
+        let empty = RxDescriptor {
+            addr: 0,
+            length: 0,
+            checksum: 0,
+            status: 0,
+            errors: 0,
+            special: 0,
+        };
+        for i in 0..NUM_RX_DESCRIPTORS {
+            core::ptr::write_volatile(ring_virt.add(i), empty);
+        }
+        // Only descriptor 0 gets a real buffer - the only one this test
+        // ever expects hardware to fill in.
+        core::ptr::write_volatile(
+            ring_virt,
+            RxDescriptor {
+                addr: buf_frame.start_address().as_u64(),
+                length: 0,
+                checksum: 0,
+                status: 0,
+                errors: 0,
+                special: 0,
+            },
+        );
+
+        let ring_phys = ring_frame.start_address().as_u64();
+        write_reg(mmio_base, REG_RDBAL, (ring_phys & 0xFFFF_FFFF) as u32);
+        write_reg(mmio_base, REG_RDBAH, (ring_phys >> 32) as u32);
+        write_reg(mmio_base, REG_RDLEN, (NUM_RX_DESCRIPTORS * 16) as u32);
+        write_reg(mmio_base, REG_RDH, 0);
+        // Exactly descriptor 0 available to hardware - confirmed via
+        // QEMU's own `e1000_has_rxbufs` source that the ring uses a
+        // [RDH, RDT) convention where RDH == RDT reads as "nothing
+        // available", not "everything" - so RDT must sit one slot past
+        // the single descriptor this test actually wants filled.
+        write_reg(mmio_base, REG_RDT, 1);
+        write_reg(mmio_base, REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
+    }
+
+    // Trigger the real ARP request this ring is now waiting to see a
+    // reply to. Its own internal DD-confirmation wait already yields the
+    // CPU via hlt() for up to ~5 real seconds - plenty of time for
+    // SLIRP's virtual gateway to answer, if it's going to.
+    let tx_result = send_test_frame();
+    serial_println!(
+        "[E1000] rx_test tx_phase={}",
+        if tx_result.is_ok() { "ok" } else { "failed" }
+    );
+
+    unsafe {
+        let start_tick = crate::interrupts::timer_ticks();
+        loop {
+            let status = core::ptr::read_volatile(core::ptr::addr_of!((*ring_virt).status));
+            if status & RXD_STAT_DD != 0 {
+                let length = core::ptr::read_volatile(core::ptr::addr_of!((*ring_virt).length));
+                let eop = status & RXD_STAT_EOP != 0;
+                let buf_virt = (phys_offset + buf_frame.start_address().as_u64()) as *const u8;
+                let data = core::slice::from_raw_parts(buf_virt, length as usize);
+
+                // Beyond the Ethernet header (dest MAC ours, EtherType
+                // ARP - already true of any frame this filter would ever
+                // pass through to us at all), check the ARP payload
+                // itself is a genuine *reply*, not just a same-shaped
+                // coincidence: OPER at bytes 20-21 should be 0x0002
+                // (reply), and SHA at bytes 22-27 (the replying device's
+                // own MAC) should match the Ethernet header's source MAC
+                // - real, internal cross-consistency a malformed or
+                // unrelated frame wouldn't have.
+                let is_arp_reply = data.len() >= 28
+                    && data[12] == 0x08
+                    && data[13] == 0x06
+                    && data[20] == 0x00
+                    && data[21] == 0x02
+                    && data[22..28] == data[6..12];
+                let gateway_ip = if data.len() >= 32 {
+                    Some([data[28], data[29], data[30], data[31]])
+                } else {
+                    None
+                };
+
+                kprintln!(
+                    "[E1000] received {} bytes (EOP={}) - a real frame from the network, is_arp_reply={}",
+                    length, eop, is_arp_reply
+                );
+                serial_println!(
+                    "[E1000] rx_received {} bytes eop={} is_arp_reply={} gateway_ip={:?} src_mac={:02x?}",
+                    length, eop, is_arp_reply, gateway_ip, &data[6..12]
+                );
+                return Ok(());
+            }
+            if crate::interrupts::timer_ticks() - start_tick > 90 {
+                break;
+            }
+            x86_64::instructions::hlt();
+        }
+
+        serial_println!(
+            "[E1000] rx timeout: ring_phys={:#x} RDH={:#x} RDT={:#x}",
+            ring_frame.start_address().as_u64(),
+            read_reg(mmio_base, REG_RDH),
+            read_reg(mmio_base, REG_RDT)
+        );
+    }
+    Err("e1000 RX: timed out waiting for a received frame - either SLIRP didn't reply, or something in this ring's own setup is wrong; see rx timeout diagnostic above")
 }

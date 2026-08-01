@@ -359,21 +359,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // net/e1000.rs's module doc), and read its real STATUS/MAC registers.
     net::e1000::probe();
 
-    // 7b-3. Real e1000 TX attempt: build a real transmit descriptor ring
-    // (using fresh physical frames from the global allocator - Fase 21)
-    // and hand a real ARP request to the hardware. Fully confirmed
-    // working as of Fase 44: the ring's physical address and descriptor
-    // content are correct, the hardware genuinely dequeues the
-    // descriptor (TDH advances), AND the Descriptor-Done status bit now
-    // gets written back too - see net/e1000.rs's module doc for the
-    // two-round investigation and its actual resolution
-    // (`PciDevice::enable_bus_mastering` - PCI Bus Mastering was never
-    // enabled, so the DMA write had nowhere real to land).
-    match net::e1000::send_test_frame() {
+    // 7b-3/7b-4. Real e1000 TX+RX attempt: `receive_test_frame` arms a
+    // real receive descriptor ring FIRST, then calls `send_test_frame`
+    // internally (building a real transmit descriptor ring using fresh
+    // physical frames from the global allocator - Fase 21 - and handing
+    // a real ARP request to the hardware), then polls for a genuine
+    // reply. TX is fully confirmed working as of Fase 44: the ring's
+    // physical address and descriptor content are correct, the hardware
+    // genuinely dequeues the descriptor (TDH advances), AND the
+    // Descriptor-Done status bit now gets written back too - see
+    // net/e1000.rs's module doc for the two-round investigation and its
+    // actual resolution (`PciDevice::enable_bus_mastering` - PCI Bus
+    // Mastering was never enabled, so the DMA write had nowhere real to
+    // land). RX (Fase 45) is the first real attempt at receiving
+    // anything - honestly uncertain going in whether QEMU's SLIRP
+    // backend actually replies to the ARP request in a way this ring
+    // picks up; see net/e1000.rs's own doc and this Fase's README/memory
+    // notes for the real, observed outcome rather than an assumption.
+    match net::e1000::receive_test_frame() {
         Ok(()) => {}
         Err(e) => {
-            kprintln!("[E1000] send_test_frame: {}", e);
-            serial_println!("[E1000] tx_sent -> not yet confirmed: {}", e);
+            kprintln!("[E1000] receive_test_frame: {}", e);
+            serial_println!("[E1000] rx_test -> not confirmed: {}", e);
         }
     }
 
