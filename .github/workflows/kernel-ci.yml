@@ -63,6 +63,7 @@ jobs:
           timeout 25 qemu-system-x86_64 \
             -drive format=raw,file=agentos-kernel/target/disk-image/agentos-bios.img \
             -serial stdio -display none -no-reboot -no-shutdown \
+            -device virtio-net-pci \
             | tee boot.log || true
           echo "----- full boot.log -----"
           cat boot.log
@@ -375,6 +376,25 @@ jobs:
           # genuinely reached hardware rather than garbage.
           grep -q "E1000\] found 00:03.0 bar0=0x" boot.log
           grep -q "mac=52:54:00:12:34:56 valid=true" boot.log
+          # Confirms real VirtIO-net PCI access (Fase 62) - a second,
+          # structurally different real NIC alongside e1000, reachable
+          # because the boot command above now adds `-device virtio-
+          # net-pci` (confirmed empirically to land at a NEW PCI slot,
+          # 00:04.0, leaving e1000's 00:03.0 completely unaffected - the
+          # two e1000 checks immediately above this one are unchanged).
+          # Unlike e1000's memory-mapped BAR0, VirtIO's legacy PCI
+          # transport uses an I/O-port BAR0 (confirmed by checking BAR0
+          # bit 0) - real in/out port reads, not read_volatile through a
+          # mapped address. mac_feature=true confirms VIRTIO_NET_F_MAC
+          # is set in the real features bitmask read back; the exact MAC
+          # (52:54:00:12:34:57, one past e1000's own 52:54:00:12:34:56)
+          # is QEMU's own default per-NIC MAC-assignment scheme for this
+          # exact device list - a fixed property of the emulated
+          # hardware/boot-command combination, the same "safe to pin
+          # exactly" class as e1000's own MAC check above, not something
+          # environment-dependent like a BAR0 address or binary size.
+          grep -q "VIRTIO\] found 00:04.0 bar0=0x" boot.log
+          grep -q "mac_feature=true mac=52:54:00:12:34:57" boot.log
           # e1000 TX (Fase 22, fully confirmed working Fase 44) - the ring
           # genuinely engages the hardware (TDH advances) AND the
           # descriptor's DD status bit now gets written back too, since

@@ -1256,6 +1256,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // net/e1000.rs's module doc), and read its real STATUS/MAC registers.
     net::e1000::probe();
 
+    // 7b-2-2. First real step toward a real VirtIO-net driver (Fase
+    // 62) - a second, structurally different real NIC alongside e1000,
+    // now reachable because this kernel's boot command adds `-device
+    // virtio-net-pci` (confirmed empirically to land at a new PCI slot,
+    // 00:04.0, leaving e1000's 00:03.0 completely unaffected). Unlike
+    // e1000's memory-mapped BAR0, VirtIO's legacy PCI transport uses an
+    // I/O-port BAR0 - real `in`/`out` port reads, not read_volatile
+    // through a mapped address. See net/virtio.rs's own module doc for
+    // the full register-offset verification story.
+    net::virtio::probe();
+
     // 7b-3/7b-4. Real e1000 TX+RX attempt: `receive_test_frame` arms a
     // real receive descriptor ring FIRST, then calls `send_test_frame`
     // internally (building a real transmit descriptor ring using fresh

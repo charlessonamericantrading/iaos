@@ -41,11 +41,11 @@ echo [4/4] Launching AgentOS Kernel...
 where qemu-system-x86_64 >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
     echo Launching QEMU...
-    qemu-system-x86_64 -drive format=raw,file=target\disk-image\agentos-bios.img -serial stdio
+    qemu-system-x86_64 -drive format=raw,file=target\disk-image\agentos-bios.img -serial stdio -device virtio-net-pci
 ) else (
     echo [NOTE] QEMU is not installed in system PATH.
     echo To run the kernel in a virtual machine, execute:
-    echo     qemu-system-x86_64 -drive format=raw,file=target\disk-image\agentos-bios.img -serial stdio
+    echo     qemu-system-x86_64 -drive format=raw,file=target\disk-image\agentos-bios.img -serial stdio -device virtio-net-pci
 )
 
 echo ==================================================
