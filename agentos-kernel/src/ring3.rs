@@ -510,6 +510,97 @@ pub fn run_ring3_slice_overrun_test() -> u64 {
     exit_code
 }
 
+/// Fase 79, first step toward eventual multi-ring3-process scheduling:
+/// proves the timer interrupt can genuinely tell it interrupted RING-3
+/// code specifically, not just that a tick happened (`interrupts.rs`'s
+/// own `TIMER_TICKS_WHILE_RING3`, incremented from the CPU's own
+/// `code_segment.rpl()` on every tick). `scheduler::preemptive`'s
+/// existing timer-driven preemption only ever switches between ring-0
+/// tasks (see its own module doc) - genuinely scheduling ring-3
+/// "processes" needs the timer handler to be able to save/restore a
+/// FULL ring-3 register + privilege-level context, not just the
+/// callee-saved registers `switch_to` currently handles. This is
+/// deliberately NOT that larger mechanism - just the first, narrower
+/// thing it depends on: can this kernel even tell, from inside the
+/// timer handler, that ring-3 code was running when the tick fired?
+///
+/// The ring-3 "program" spins in a tight hand-encoded decrement loop
+/// (20,000,000 iterations - generous headroom over the ~55ms a single
+/// tick takes at this kernel's ~18.2Hz PIT rate, chosen the same
+/// empirically-verified-not-just-assumed way `ata.rs`'s own
+/// `MAX_POLL_ITERATIONS` was) before exiting voluntarily via `int 0x81`,
+/// reusing `enter_ring3`/`ring3_exit_entry_asm` (Fase 73) exactly as
+/// `run_ring3_exit_test` does: this also genuinely returns rather than
+/// halting, and runs unconditionally like that one does.
+///
+///   `mov ecx, 20000000` -> `B9` + 4-byte imm (loop counter)
+///   `dec ecx`           -> `FF C9`
+///   `jnz <dec ecx>`     -> `75 FC` (rel8 = -4, back to the `dec`)
+///   `mov eax, 77`       -> `B8` + 4-byte imm (distinct exit code)
+///   `int 0x81`          -> `CD 81`
+pub fn run_ring3_timer_tick_test() -> u64 {
+    let info = gdt::ring3_info();
+    let user_cs = info.user_code_selector as u64;
+    let user_ss = info.user_data_selector as u64;
+
+    let code_addr = USER_TEST_PAGE_ADDR;
+    let stack_top = USER_TEST_PAGE_ADDR + 4096;
+
+    const LOOP_COUNT: u32 = 20_000_000;
+    const EXIT_CODE: u32 = 77;
+
+    let mut program = [0u8; 16];
+    program[0] = 0xB9; // mov ecx, imm32
+    program[1..5].copy_from_slice(&LOOP_COUNT.to_le_bytes());
+    program[5] = 0xFF; // dec ecx
+    program[6] = 0xC9;
+    program[7] = 0x75; // jnz rel8
+    program[8] = 0xFC; // -4: back to `dec ecx` at offset 5
+    program[9] = 0xB8; // mov eax, imm32
+    program[10..14].copy_from_slice(&EXIT_CODE.to_le_bytes());
+    program[14] = 0xCD; // int
+    program[15] = 0x81;
+    unsafe {
+        core::ptr::copy_nonoverlapping(program.as_ptr(), code_addr as *mut u8, program.len());
+    }
+
+    let ticks_before = crate::interrupts::ticks_while_ring3();
+
+    kprintln!("[RING3] Attempting a real ring-3 spin loop long enough for a real timer tick to land mid-execution...");
+    serial_println!(
+        "[RING3] ring3_timer_tick_test entering rip={:#x} cs={:#06x} ss={:#06x} rsp={:#x} rflags={:#x} loop_count={} ticks_while_ring3_before={}",
+        code_addr,
+        user_cs,
+        user_ss,
+        stack_top,
+        RING3_TEST_RFLAGS,
+        LOOP_COUNT,
+        ticks_before
+    );
+
+    let exit_code =
+        unsafe { enter_ring3(code_addr, user_cs, user_ss, stack_top, RING3_TEST_RFLAGS) };
+
+    let ticks_after = crate::interrupts::ticks_while_ring3();
+    let ticked_during_ring3 = ticks_after > ticks_before;
+
+    kprintln!(
+        "[RING3] Back in ring-0 - exit_code={} ticks_while_ring3 before={} after={} (a real timer tick fired while ring-3 code was running: {})",
+        exit_code,
+        ticks_before,
+        ticks_after,
+        ticked_during_ring3
+    );
+    serial_println!(
+        "[RING3] ring3_timer_tick_test exit_code={} ticks_while_ring3_after={} ticked_during_ring3={}",
+        exit_code,
+        ticks_after,
+        ticked_during_ring3
+    );
+
+    exit_code
+}
+
 /// A real ring-3-originated syscall (Fase 72), followed by the same
 /// proven `cli`-fault ending `run_ring3_test` (Fase 71) already
 /// established. The "program" is three real instructions, hand-encoded

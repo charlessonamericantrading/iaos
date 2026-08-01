@@ -17,6 +17,23 @@ pub fn timer_ticks() -> u64 {
     TIMER_TICKS.load(Ordering::Relaxed)
 }
 
+/// Counts real timer ticks that interrupted ring-3 code specifically -
+/// Fase 79's own first step toward eventual ring-3-aware preemption
+/// (currently `scheduler::preemptive` only ever switches between ring-0
+/// tasks; see its own module doc). `InterruptStackFrame`'s `code_segment`
+/// field already carries this for free via the CPU's own interrupt-entry
+/// mechanism - no naked asm needed, unlike `syscall_entry_asm`'s own
+/// CS.RPL read (Fase 75), which needed one specifically because THAT
+/// handler had to be naked for an unrelated reason (exposing general-
+/// purpose registers). `timer_interrupt_handler` stays an ordinary
+/// `extern "x86-interrupt"` fn - ring-3 detection alone never needed
+/// that.
+static TIMER_TICKS_WHILE_RING3: AtomicU64 = AtomicU64::new(0);
+
+pub fn ticks_while_ring3() -> u64 {
+    TIMER_TICKS_WHILE_RING3.load(Ordering::Relaxed)
+}
+
 /// The legacy 8259 PIC defaults to delivering IRQ0-7 on vectors 0x08-0x0F,
 /// which collide head-on with CPU exceptions (0x08 is literally our
 /// double-fault vector). Remapping both PICs to start at 0x20 (32) is what
@@ -156,8 +173,11 @@ pub fn init_pics() {
     );
 }
 
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+    if stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3 {
+        TIMER_TICKS_WHILE_RING3.fetch_add(1, Ordering::Relaxed);
+    }
 
     // EOI must happen before `preemptive::tick()`, which may switch to a
     // different context and never return from *this* call - if we hadn't

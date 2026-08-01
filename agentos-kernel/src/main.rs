@@ -286,6 +286,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ring3_overrun_code
     );
 
+    // Fase 79: first step toward eventual multi-ring3-process scheduling
+    // - proves the timer interrupt can tell a tick landed while ring-3
+    // code was running, not just that a tick happened. Same safe-return
+    // mechanism, same "runs unconditionally" reasoning as the three
+    // tests above.
+    kprintln!(
+        "[KERNEL INIT] Testing whether a real timer tick can be detected while ring-3 code is running..."
+    );
+    let ring3_timer_tick_code = ring3::run_ring3_timer_tick_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - timer-tick-detection test returned exit_code={}",
+        ring3_timer_tick_code
+    );
+
     // Hands the SAME allocator instance (cursor already advanced past
     // whatever heap init just claimed) to a global slot so later code -
     // e.g. a future real NIC driver's TX/RX descriptor rings - can keep

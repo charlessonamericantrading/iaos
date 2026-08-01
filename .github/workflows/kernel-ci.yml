@@ -437,6 +437,26 @@ jobs:
           # same clean u64::MAX every other rejection case above
           # produces, this time for a genuinely new reason.
           grep -q "RING3\] ring3_slice_overrun_test exit_code=0xffffffffffffffff" boot.log
+          # Confirms the timer interrupt can tell it interrupted RING-3
+          # code specifically, not just that a tick happened (Fase 79) -
+          # the first, narrower step toward eventual multi-ring3-process
+          # scheduling (`scheduler::preemptive` today only ever switches
+          # between ring-0 tasks; see that module's own doc for why real
+          # ring-3 preemption needs a fuller register-save mechanism this
+          # Fase deliberately doesn't attempt yet). A real ring-3 program
+          # spins in a 20,000,000-iteration hand-encoded loop - generous
+          # headroom over the ~55ms one tick takes at this kernel's
+          # ~18.2Hz PIT rate - before exiting voluntarily (same safe-
+          # return mechanism as the tests above). exit_code=77 confirms
+          # the loop ran to completion and exited cleanly;
+          # ticked_during_ring3=true confirms `interrupts.rs`'s new
+          # `TIMER_TICKS_WHILE_RING3` counter (read from the CPU's own
+          # `code_segment.rpl()` on the interrupt frame - a safe,
+          # structured `x86_64` crate accessor, no naked asm needed for
+          # this step) genuinely advanced during that loop's execution,
+          # not just that SOME tick happened somewhere in the whole boot.
+          grep -q "RING3\] ring3_timer_tick_test exit_code=77" boot.log
+          grep -q "ticked_during_ring3=true" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -
