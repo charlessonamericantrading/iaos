@@ -132,6 +132,23 @@ jobs:
           # nothing runs in ring-3 yet to prove the bit makes an actual
           # difference, that's separate, substantial follow-on work.
           grep -q "MEMORY\] user_page_test present=true writable=true user_accessible=true write_read_back_ok=true" boot.log
+          # Confirms a SAFE ring-3 -> ring-0 return (Fase 73) - unlike
+          # ring3test/ring3syscall above (both deliberately opt-in, not
+          # asserted here, since both end in a permanent halt by
+          # design), this one genuinely resumes normal kernel execution
+          # afterward, so it runs unconditionally and IS asserted here
+          # like any other Fase. exit_code=42 is the value the ring-3
+          # program itself set via `mov eax, 42` right before `int 0x81`
+          # - direct proof this specific value made a full round trip
+          # from a real ring-3 program, through a hand-written naked
+          # asm stub that switches to a previously-saved kernel stack
+          # instead of resuming ring-3, back into a normal Rust function
+          # call's own return value - not a coincidence or a hardcoded
+          # default. The FRAME ALLOC check below is the real regression
+          # guard for "did the kernel actually keep running afterward":
+          # it is the very next self-test in main()'s own sequence, so
+          # its presence here already proves execution didn't stop.
+          grep -q "RING3\] ring3_exit_test exit_code=42" boot.log
           # Fase 71 (the actual ring-0 -> ring-3 transition, `ring3.rs`)
           # is deliberately NOT asserted here, unlike every other Fase -
           # not an oversight. Its own shell command (`ring3test`) ends in

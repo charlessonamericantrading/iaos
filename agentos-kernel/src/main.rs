@@ -232,6 +232,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // Fase 73: closes the ring-3 arc's own last remaining gap - a SAFE
+    // ring-3 -> ring-0 return, unlike every earlier ring-3 test (Fase 71/
+    // 72's ring3test/ring3syscall, both deliberately-opt-in shell
+    // commands that end in a permanent halt). This one genuinely
+    // resumes normal kernel execution afterward, so - unlike those two -
+    // it runs right here, unconditionally, as a normal self-test.
+    kprintln!("[KERNEL INIT] Testing a real ring-3 program that exits voluntarily...");
+    let ring3_exit_code = ring3::run_ring3_exit_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 for good - exit_code={}",
+        ring3_exit_code
+    );
+
     // Hands the SAME allocator instance (cursor already advanced past
     // whatever heap init just claimed) to a global slot so later code -
     // e.g. a future real NIC driver's TX/RX descriptor rings - can keep

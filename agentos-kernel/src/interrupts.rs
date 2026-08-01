@@ -64,6 +64,19 @@ pub const ATA_PRIMARY_IRQ_VECTOR: u8 = PIC_2_OFFSET + 6;
 /// are meant to be a controlled entry point into the kernel).
 pub const SYSCALL_INT_VECTOR: u8 = 0x80;
 
+/// A second, dedicated DPL=3 vector (Fase 73) - a ring-3 program's
+/// voluntary "I'm done" signal, deliberately separate from
+/// `SYSCALL_INT_VECTOR` rather than another `dispatch_syscall` number:
+/// its handler (`ring3::ring3_exit_entry_asm`) does something
+/// structurally different from every other handler in this file - it
+/// never returns to whatever invoked it, it switches to a completely
+/// different, previously-saved kernel stack instead. Keeping that
+/// firmly separate from the normal, resuming-as-usual syscall path (one
+/// dedicated vector each) is simpler to reason about than one handler
+/// that sometimes resumes ring-3 and sometimes doesn't, branching on a
+/// magic syscall number.
+pub const RING3_EXIT_INT_VECTOR: u8 = 0x81;
+
 /// Counts real invocations of the DPL=3 syscall gate - lets a self-test
 /// verify the gate genuinely fired (not just "the CPU didn't crash"),
 /// the same reasoning `TIMER_TICKS` already established for verifying
@@ -102,6 +115,17 @@ lazy_static! {
         unsafe {
             idt[SYSCALL_INT_VECTOR]
                 .set_handler_addr(VirtAddr::new(syscall_entry_asm as *const () as u64))
+                .set_privilege_level(PrivilegeLevel::Ring3);
+        }
+        // Same reasoning as SYSCALL_INT_VECTOR above (DPL=3, raw
+        // set_handler_addr) - see RING3_EXIT_INT_VECTOR's own doc for
+        // why this is a second, dedicated vector rather than folded
+        // into the syscall dispatcher above.
+        unsafe {
+            idt[RING3_EXIT_INT_VECTOR]
+                .set_handler_addr(VirtAddr::new(
+                    crate::ring3::ring3_exit_entry_asm as *const () as u64,
+                ))
                 .set_privilege_level(PrivilegeLevel::Ring3);
         }
         idt
