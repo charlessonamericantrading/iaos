@@ -350,6 +350,19 @@ jobs:
           # only outcome CI should ever see.
           grep -q "SHELL\] mkdir RMDTEST -> created" boot.log
           grep -q "SHELL\] rmdir RMDTEST -> deleted" boot.log
+          # Confirms FAT12 file I/O INSIDE A SUBDIRECTORY (Fase 34) - the
+          # biggest remaining gap from Fase 31: create_file/read_file/
+          # write_file/delete_file previously only ever operated on the
+          # root. The new _in variants share the exact same internal logic
+          # via a DirLocation abstraction, so this test exercises create,
+          # a real multi-cluster grow via write_file_in (1500 bytes),
+          # delete, and cleanup (deleting the now-empty test directory
+          # itself) all inside a subdirectory - all four must succeed for
+          # this exact line to appear, so it's a strong single assertion.
+          # A fresh CI image always takes this same fully-self-cleaning
+          # path (analogous to RMDTEST above), so this is the only outcome
+          # CI should ever see.
+          grep -q "FAT12\] subdir_file_test created_ok=true write_ok=true delete_ok=true cleanup_ok=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.

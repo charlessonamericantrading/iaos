@@ -731,6 +731,94 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("ls");
     shell::dispatch_command("ls RMDTEST");
 
+    // 7b-14. Real FAT12 file I/O INSIDE a subdirectory - create_file/
+    // read_file/write_file/delete_file previously only ever operated on
+    // the root directory; the new _in variants (create_file_in/
+    // read_file_in/write_file_in/delete_file_in) target an arbitrary
+    // subdirectory's cluster instead, sharing the exact same internal
+    // logic via a small DirLocation abstraction so this needed zero new
+    // low-level disk-I/O code - multi-cluster allocation, resize, and
+    // cluster-chain entry-scanning all already existed (Fase 29/30/31).
+    // Deliberately NOT exposed as new shell commands yet (that needs
+    // path syntax like "SUBTEST/FILE.TXT", a separate concern) - proven
+    // here at the Fat12Info API level first, same order Fase 26/28
+    // proved create_file before exposing it via touch. Fully self-
+    // cleaning: creates its own dedicated directory and removes it at
+    // the end, same discipline as Fase 33's RMDTEST.
+    kprintln!("[KERNEL INIT] Testing FAT12 file I/O inside a subdirectory...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                let _ = fs.create_directory("SUBTEST");
+                let dir_cluster = fs
+                    .list_root_directory()
+                    .ok()
+                    .and_then(|entries| entries.into_iter().find(|e| e.name == "SUBTEST"))
+                    .map(|e| e.start_cluster);
+
+                match dir_cluster {
+                    Some(cluster) => {
+                        let initial = b"hello from inside a subdirectory";
+                        let grown: alloc::vec::Vec<u8> =
+                            (0..1500u32).map(|i| (i % 211) as u8).collect();
+
+                        let _ = fs.create_file_in(cluster, "INSIDE.TXT", initial);
+                        let created_ok = fs
+                            .read_file_in(cluster, "INSIDE.TXT")
+                            .map(|d| d == initial)
+                            .unwrap_or(false);
+
+                        let write_ok = match fs.write_file_in(cluster, "INSIDE.TXT", &grown) {
+                            Ok(()) => fs
+                                .read_file_in(cluster, "INSIDE.TXT")
+                                .map(|d| d == grown)
+                                .unwrap_or(false),
+                            Err(_) => false,
+                        };
+
+                        let delete_ok = match fs.delete_file_in(cluster, "INSIDE.TXT") {
+                            Ok(()) => fs.read_file_in(cluster, "INSIDE.TXT").is_err(),
+                            Err(_) => false,
+                        };
+
+                        let cleanup_ok = fs.delete_directory("SUBTEST").is_ok();
+
+                        kprintln!(
+                            "[FAT12] subdir file I/O test: created_ok={} write_ok={} delete_ok={} cleanup_ok={}",
+                            created_ok,
+                            write_ok,
+                            delete_ok,
+                            cleanup_ok
+                        );
+                        serial_println!(
+                            "[FAT12] subdir_file_test created_ok={} write_ok={} delete_ok={} cleanup_ok={}",
+                            created_ok,
+                            write_ok,
+                            delete_ok,
+                            cleanup_ok
+                        );
+                    }
+                    None => {
+                        kprintln!("[FAT12] subdir file I/O test: couldn't find SUBTEST's cluster");
+                        serial_println!("[FAT12] subdir_file_test -> no dir cluster");
+                    }
+                }
+            }
+            Err(e) => {
+                kprintln!("[FAT12] subdir file I/O test: not FAT12 ({})", e);
+                serial_println!("[FAT12] subdir_file_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!(
+                "[FAT12] subdir file I/O test: couldn't find FAT partition: {}",
+                e
+            );
+            serial_println!("[FAT12] subdir_file_test -> no partition: {}", e);
+        }
+    }
+    shell::dispatch_command("ls");
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real

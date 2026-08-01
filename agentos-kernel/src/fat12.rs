@@ -30,6 +30,21 @@ pub struct Fat12Info {
     fat_bytes: Vec<u8>,
 }
 
+/// Where a directory's entries physically live - the root has a
+/// special, fixed-location layout (see the module doc); any
+/// subdirectory is just an ordinary cluster chain, the same shape
+/// `create_directory`'s own content already assumes. Lets
+/// `create_file`/`read_file`/`write_file`/`delete_file` (and their
+/// internal helpers) target either without duplicating their logic -
+/// see the `_in` variants of each, added once multi-cluster/resize
+/// support (Fase 29/30) made a subdirectory's cluster-chain-based
+/// storage no harder to write into than the root's fixed sectors.
+#[derive(Clone, Copy)]
+enum DirLocation {
+    Root,
+    Cluster(u32),
+}
+
 pub fn read_bpb(partition: &PartitionEntry) -> Result<Fat12Info, &'static str> {
     let mut sector = [0u8; 512];
     ata::read_sector(partition.start_lba, &mut sector)?;
@@ -125,6 +140,41 @@ impl Fat12Info {
         }
     }
 
+    /// Returns the sector LBAs holding a directory's entries, in order -
+    /// either the root's fixed range, or a subdirectory's cluster chain
+    /// walked to completion. Unifies the root-vs-cluster-chain
+    /// distinction into one flat list every entry-scanning helper below
+    /// can iterate the same way, since a directory here is never more
+    /// than a handful of sectors (FAT12 volumes are small; today's
+    /// single-cluster subdirectories doubly so).
+    fn directory_sectors(&self, dir: DirLocation) -> Result<Vec<u32>, &'static str> {
+        match dir {
+            DirLocation::Root => Ok((0..self.root_dir_sectors())
+                .map(|s| self.first_root_dir_sector() + s)
+                .collect()),
+            DirLocation::Cluster(start_cluster) => {
+                let mut lbas = Vec::new();
+                let mut cluster = Some(start_cluster);
+                while let Some(c) = cluster {
+                    let cluster_lba = self.cluster_to_lba(c);
+                    lbas.extend((0..self.sectors_per_cluster as u32).map(|s| cluster_lba + s));
+                    cluster = self.next_cluster(c)?;
+                }
+                Ok(lbas)
+            }
+        }
+    }
+
+    /// Lists a directory's entries regardless of where it lives -
+    /// dispatches to the two existing, independently-verified listing
+    /// functions rather than reimplementing either.
+    fn list_entries_in(&self, dir: DirLocation) -> Result<Vec<DirEntry>, &'static str> {
+        match dir {
+            DirLocation::Root => self.list_root_directory(),
+            DirLocation::Cluster(c) => self.list_directory(c),
+        }
+    }
+
     /// Lists the fixed-location root directory - FAT12/16's root isn't a
     /// cluster chain like FAT32's, it's a plain run of sectors right
     /// after the FAT(s).
@@ -149,7 +199,28 @@ impl Fat12Info {
     /// from the other direction - freeing the excess trailing clusters
     /// instead of allocating extra ones.
     pub fn write_file(&mut self, name: &str, data: &[u8]) -> Result<(), &'static str> {
-        let (entry_lba, entry_offset, entry) = self.find_entry_location(name)?;
+        self.write_file_impl(DirLocation::Root, name, data)
+    }
+
+    /// Same as `write_file`, but for a file inside the subdirectory
+    /// whose own cluster is `dir_cluster` (found via a prior `ls`/
+    /// `list_directory` lookup) instead of the root.
+    pub fn write_file_in(
+        &mut self,
+        dir_cluster: u32,
+        name: &str,
+        data: &[u8],
+    ) -> Result<(), &'static str> {
+        self.write_file_impl(DirLocation::Cluster(dir_cluster), name, data)
+    }
+
+    fn write_file_impl(
+        &mut self,
+        dir: DirLocation,
+        name: &str,
+        data: &[u8],
+    ) -> Result<(), &'static str> {
+        let (entry_lba, entry_offset, entry) = self.find_entry_location_in(dir, name)?;
         if entry.is_dir {
             return Err("FAT12: write_file does not support directories");
         }
@@ -225,11 +296,25 @@ impl Fat12Info {
     /// directory and reads its full contents by walking its cluster
     /// chain through the in-memory FAT.
     pub fn read_file(&self, name: &str) -> Result<Vec<u8>, &'static str> {
-        let entries = self.list_root_directory()?;
+        self.read_file_impl(DirLocation::Root, name)
+    }
+
+    /// Same as `read_file`, but for a file inside the subdirectory whose
+    /// own cluster is `dir_cluster` instead of the root.
+    pub fn read_file_in(&self, dir_cluster: u32, name: &str) -> Result<Vec<u8>, &'static str> {
+        self.read_file_impl(DirLocation::Cluster(dir_cluster), name)
+    }
+
+    fn read_file_impl(&self, dir: DirLocation, name: &str) -> Result<Vec<u8>, &'static str> {
+        let not_found = match dir {
+            DirLocation::Root => "FAT12: file not found in root directory",
+            DirLocation::Cluster(_) => "FAT12: file not found in directory",
+        };
+        let entries = self.list_entries_in(dir)?;
         let entry = entries
             .iter()
             .find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(name))
-            .ok_or("FAT12: file not found in root directory")?;
+            .ok_or(not_found)?;
 
         if entry.size == 0 {
             return Ok(Vec::new());
@@ -304,9 +389,17 @@ impl Fat12Info {
     /// the slot's absolute sector LBA and byte offset within that
     /// sector.
     fn find_free_root_entry(&self) -> Result<(u32, usize), &'static str> {
+        self.find_free_entry_in(DirLocation::Root)
+    }
+
+    /// Same as `find_free_root_entry`, generalized to a subdirectory's
+    /// cluster chain too. Deliberately does NOT grow the chain with a
+    /// fresh cluster if every existing slot is taken - same single-
+    /// cluster-only limitation `create_directory` already has, honestly
+    /// surfaced as an error rather than silently attempted.
+    fn find_free_entry_in(&self, dir: DirLocation) -> Result<(u32, usize), &'static str> {
         let mut sector_buf = [0u8; 512];
-        for s in 0..self.root_dir_sectors() {
-            let lba = self.first_root_dir_sector() + s;
+        for lba in self.directory_sectors(dir)? {
             ata::read_sector(lba, &mut sector_buf)?;
             for (i, raw) in sector_buf.as_chunks::<32>().0.iter().enumerate() {
                 if raw[0] == 0x00 || raw[0] == 0xE5 {
@@ -314,7 +407,7 @@ impl Fat12Info {
                 }
             }
         }
-        Err("FAT12: root directory is full, no free entry slot")
+        Err("FAT12: directory is full, no free entry slot")
     }
 
     /// Packs `value` (12 bits used) into `cluster`'s entry and writes the
@@ -407,7 +500,27 @@ impl Fat12Info {
     /// entries) and only updates the first on-disk FAT copy, same
     /// reasoning as `write_fat_entry_to_disk`.
     pub fn create_file(&mut self, name: &str, data: &[u8]) -> Result<(), &'static str> {
-        if self.read_file(name).is_ok() {
+        self.create_file_impl(DirLocation::Root, name, data)
+    }
+
+    /// Same as `create_file`, but for a new file inside the subdirectory
+    /// whose own cluster is `dir_cluster` instead of the root.
+    pub fn create_file_in(
+        &mut self,
+        dir_cluster: u32,
+        name: &str,
+        data: &[u8],
+    ) -> Result<(), &'static str> {
+        self.create_file_impl(DirLocation::Cluster(dir_cluster), name, data)
+    }
+
+    fn create_file_impl(
+        &mut self,
+        dir: DirLocation,
+        name: &str,
+        data: &[u8],
+    ) -> Result<(), &'static str> {
+        if self.read_file_impl(dir, name).is_ok() {
             return Err("FAT12: a file with that name already exists");
         }
 
@@ -419,7 +532,7 @@ impl Fat12Info {
         // directory entry's start_cluster field to.
         let clusters_needed = data.len().div_ceil(cluster_bytes).max(1);
         let clusters = self.find_free_clusters(clusters_needed)?;
-        let (entry_lba, entry_offset) = self.find_free_root_entry()?;
+        let (entry_lba, entry_offset) = self.find_free_entry_in(dir)?;
 
         // Write the file's data across its clusters in order, chaining
         // each to the next as we go - a partially-used final sector is
@@ -564,13 +677,29 @@ impl Fat12Info {
     /// `parse_dir_sector`, since that only returns a `Vec<DirEntry>` with
     /// no indication of which raw 32-byte slot each one came from.
     fn find_entry_location(&self, name: &str) -> Result<(u32, usize, DirEntry), &'static str> {
+        self.find_entry_location_in(DirLocation::Root, name)
+    }
+
+    /// Same as `find_entry_location`, generalized to a subdirectory's
+    /// cluster chain too - the `0x00` "no more entries" check and the
+    /// deleted/VFAT/volume-label skip logic apply identically either
+    /// way, since both directory shapes share the exact same 32-byte
+    /// entry format.
+    fn find_entry_location_in(
+        &self,
+        dir: DirLocation,
+        name: &str,
+    ) -> Result<(u32, usize, DirEntry), &'static str> {
+        let not_found = match dir {
+            DirLocation::Root => "FAT12: file not found in root directory",
+            DirLocation::Cluster(_) => "FAT12: file not found in directory",
+        };
         let mut sector_buf = [0u8; 512];
-        for s in 0..self.root_dir_sectors() {
-            let lba = self.first_root_dir_sector() + s;
+        for lba in self.directory_sectors(dir)? {
             ata::read_sector(lba, &mut sector_buf)?;
             for (i, raw) in sector_buf.as_chunks::<32>().0.iter().enumerate() {
                 if raw[0] == 0x00 {
-                    return Err("FAT12: file not found in root directory");
+                    return Err(not_found);
                 }
                 if raw[0] == 0xE5 || raw[11] == 0x0F || raw[11] & 0x08 != 0 {
                     continue; // deleted / long-filename (VFAT) / volume label
@@ -594,7 +723,7 @@ impl Fat12Info {
                 }
             }
         }
-        Err("FAT12: file not found in root directory")
+        Err(not_found)
     }
 
     /// Deletes `name`: frees every cluster in its chain (each FAT entry
@@ -605,7 +734,17 @@ impl Fat12Info {
     /// the slot to be treated as free/reusable by `find_free_root_entry`
     /// (or any other FAT-aware reader).
     pub fn delete_file(&mut self, name: &str) -> Result<(), &'static str> {
-        let (entry_lba, entry_offset, entry) = self.find_entry_location(name)?;
+        self.delete_file_impl(DirLocation::Root, name)
+    }
+
+    /// Same as `delete_file`, but for a file inside the subdirectory
+    /// whose own cluster is `dir_cluster` instead of the root.
+    pub fn delete_file_in(&mut self, dir_cluster: u32, name: &str) -> Result<(), &'static str> {
+        self.delete_file_impl(DirLocation::Cluster(dir_cluster), name)
+    }
+
+    fn delete_file_impl(&mut self, dir: DirLocation, name: &str) -> Result<(), &'static str> {
+        let (entry_lba, entry_offset, entry) = self.find_entry_location_in(dir, name)?;
         if entry.is_dir {
             return Err("FAT12: delete_file does not support directories");
         }
