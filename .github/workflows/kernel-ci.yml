@@ -161,6 +161,19 @@ jobs:
           # hand-checked, not just re-fetched and trusted). decode_q4_k_ok
           # checks all 256 decoded values (4 distinct 32-byte qs chunks)
           # against 8 hand-computed constants covering every sub-block.
+          # Confirms real GGUF Q3_K super-block decoding (Fase 60) - the
+          # fourth K-quant format, structurally the most intricate yet:
+          # 16 sub-blocks of 16 elements (not 8 of 32), a signed 3-bit
+          # value (2 bits from qs + 1 bit from hmask, recentered -4),
+          # and a scale-reconstruction scheme that is NOT get_scale_
+          # min_k4 (no separate min field - GGML treats scales[12] as
+          # three u32 words and SWAR-reconstructs a fourth). The
+          # reduced per-index formula was cross-checked by re-
+          # implementing GGML's exact packed-word logic in a scratch
+          # script across 2000 random byte inputs before any Rust was
+          # written - the full value-extraction loop was verified the
+          # same way, not just hand arithmetic.
+          grep -q "GGUF\] q3_k_test decode_q3_k_ok=true dispatch_q3_k_ok=true" boot.log
           grep -q "GGUF\] q4_k_test get_scale_min_k4_ok=true decode_q4_k_ok=true dispatch_q4_k_ok=true" boot.log
           # Confirms real GGUF Q6_K super-block decoding (Fase 58) - a
           # 210-byte block (ql[128]+qh[64]+scales[16]+d, d LAST unlike

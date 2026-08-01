@@ -774,6 +774,81 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 5b-8. Test real GGUF Q3_K super-block quantized tensor decoding
+    // (Fase 60) - the fourth K-quant format, and structurally the most
+    // intricate yet: 16 sub-blocks of 16 elements each (not 8 of 32),
+    // a signed 3-bit value (2 low bits from qs + 1 high bit from
+    // hmask, recentered -4), and - genuinely new - a scale-
+    // reconstruction scheme that is NOT get_scale_min_k4 (Q3_K has no
+    // separate min field, just one signed 6-bit scale per sub-block).
+    // GGML's real dequantize_row_q3_K treats scales[12] as three u32
+    // words and reconstructs a fourth via a SWAR (SIMD-within-a-
+    // register) bit trick - reduced here to a plain per-index formula,
+    // NOT trusted from derivation alone: cross-checked by re-
+    // implementing GGML's exact packed-word logic in a scratch script
+    // and comparing outputs across 2000 random byte inputs before any
+    // of this Rust was written. See decode_q3_k's own doc for the full
+    // formula and derivation story.
+    //
+    // decode_q3_k_ok builds one full real 110-byte block: scales
+    // chosen (via the verified formula's own inverse) to decode to a
+    // full-range arithmetic sequence (3,7,11,...,63, step 4) covering
+    // all 16 sub-blocks; hmask alternating 0xAA (first 16 bytes) /
+    // 0x55 (second 16, the exact inverse bit pattern) so every one of
+    // the 8 total shifting-mask positions differs between the two
+    // halves; qs uniform 0xE4 (whose four 2-bit fields are exactly
+    // 0,1,2,3, the same convenient byte Q6_K's own test already used) -
+    // giving 16 predictable sub-block values, independently confirmed
+    // via the same scratch-script cross-check as the scale formula
+    // itself, not just hand arithmetic.
+    kprintln!("[GGUF INFERENCE] Testing Q3_K super-block quantized tensor decoding...");
+    {
+        const RAW_SCALES: [u8; 12] = [
+            0x33, 0x77, 0xBB, 0xFF, 0x33, 0x77, 0xBB, 0xFF, 0xE4, 0xE4, 0xE4, 0xE4,
+        ];
+
+        let mut q3k_block: Vec<u8> = Vec::with_capacity(110);
+        q3k_block.extend(core::iter::repeat_n(0xAAu8, 16)); // hmask[0..16)
+        q3k_block.extend(core::iter::repeat_n(0x55u8, 16)); // hmask[16..32)
+        q3k_block.extend(core::iter::repeat_n(0xE4u8, 64)); // qs[64]
+        q3k_block.extend_from_slice(&RAW_SCALES);
+        q3k_block.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0, LAST
+
+        let decoded = GgufModelLoader::decode_q3_k(&q3k_block);
+        let mut expected_q3k: Vec<f32> = Vec::with_capacity(256);
+        expected_q3k.extend(core::iter::repeat_n(116.0f32, 16)); // is=0
+        expected_q3k.extend(core::iter::repeat_n(0.0f32, 16)); // is=1
+        expected_q3k.extend(core::iter::repeat_n(-21.0f32, 16)); // is=2
+        expected_q3k.extend(core::iter::repeat_n(51.0f32, 16)); // is=3
+        expected_q3k.extend(core::iter::repeat_n(26.0f32, 16)); // is=4
+        expected_q3k.extend(core::iter::repeat_n(-18.0f32, 16)); // is=5
+        expected_q3k.extend(core::iter::repeat_n(-15.0f32, 16)); // is=6
+        expected_q3k.extend(core::iter::repeat_n(1.0f32, 16)); // is=7
+        expected_q3k.extend(core::iter::repeat_n(-12.0f32, 16)); // is=8
+        expected_q3k.extend(core::iter::repeat_n(0.0f32, 16)); // is=9
+        expected_q3k.extend(core::iter::repeat_n(11.0f32, 16)); // is=10
+        expected_q3k.extend(core::iter::repeat_n(-45.0f32, 16)); // is=11
+        expected_q3k.extend(core::iter::repeat_n(-38.0f32, 16)); // is=12
+        expected_q3k.extend(core::iter::repeat_n(46.0f32, 16)); // is=13
+        expected_q3k.extend(core::iter::repeat_n(81.0f32, 16)); // is=14
+        expected_q3k.extend(core::iter::repeat_n(-31.0f32, 16)); // is=15
+        let decode_q3_k_ok = decoded == expected_q3k;
+
+        let dispatch_q3_k_ok =
+            GgufModelLoader::decode_tensor(&q3k_block, GgufGtype::Q3_K) == Ok(expected_q3k);
+
+        kprintln!(
+            "[GGUF Q3_K] decode_q3_k_ok={} dispatch_q3_k_ok={}",
+            decode_q3_k_ok,
+            dispatch_q3_k_ok
+        );
+        serial_println!(
+            "[GGUF] q3_k_test decode_q3_k_ok={} dispatch_q3_k_ok={}",
+            decode_q3_k_ok,
+            dispatch_q3_k_ok
+        );
+    }
+
     // 5c. Test real GGUF multi-tensor-info support (Fase 51) -
     // GgufTensorInfo::parse has returned "how many bytes this one entry
     // consumed" since Fase 43 specifically so several could be parsed in
