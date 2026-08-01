@@ -406,50 +406,80 @@ fn list_root_directory() -> Result<(), &'static str> {
     }
 }
 
-/// Splits a "DIR/FILE" path into its directory and file name components,
-/// or `None` for a plain name with no subdirectory - this kernel only
-/// supports one level of subdirectory nesting (see `fat12.rs`'s
-/// `DirLocation`), so a path with more than one `/` is rejected rather
-/// than silently mishandled.
-fn split_path(path: &str) -> Result<Option<(&str, &str)>, &'static str> {
-    match path.split_once('/') {
-        None => Ok(None),
-        Some((dir, file)) => {
-            if dir.is_empty() || file.is_empty() || file.contains('/') {
-                return Err("invalid path - use DIRNAME/FILENAME.EXT, one level deep");
-            }
-            Ok(Some((dir, file)))
-        }
+/// Splits a "DIR1/DIR2/.../NAME" path into ALL of its `/`-separated
+/// segments, in order. Used directly by `list_fat_directory` (every
+/// segment names a directory to descend into - the whole path names the
+/// directory to list) and via `split_path` below by every other path-
+/// taking command (the *last* segment names the file/directory actually
+/// being acted on, everything before it the parent chain to resolve
+/// first). Rejects an empty segment (a leading/trailing/doubled `/`)
+/// rather than silently mishandling it.
+fn split_segments(path: &str) -> Result<alloc::vec::Vec<&str>, &'static str> {
+    let segments: alloc::vec::Vec<&str> = path.split('/').collect();
+    if segments.iter().any(|s| s.is_empty()) {
+        return Err("invalid path - check for a leading/trailing/double '/'");
     }
+    Ok(segments)
 }
 
-/// Resolves a subdirectory name (found in the root) to its own cluster
-/// number - the "handle" every `*_in` `Fat12Info` method needs.
-fn resolve_dir_cluster(fs: &crate::fat12::Fat12Info, dir_name: &str) -> Result<u32, &'static str> {
-    let entry = fs
-        .list_root_directory()?
-        .into_iter()
-        .find(|e| e.name.eq_ignore_ascii_case(dir_name))
-        .ok_or("no such directory in root")?;
-    if !entry.is_dir {
-        return Err("that's a file, not a directory");
+/// Splits a "DIR1/DIR2/.../NAME" path into its directory segments (the
+/// parent chain to resolve, in order from the root) and the final
+/// component - a plain name with no `/` yields an empty segment list,
+/// meaning "directly in the root". Any number of segments deep, unlike
+/// the one-level-only limit this replaces: `Fat12Info`'s own
+/// `DirLocation::Cluster` doesn't care how many `create_directory_in`
+/// calls deep a cluster came from, so the shell doesn't need an
+/// arbitrary depth limit either.
+fn split_path(path: &str) -> Result<(alloc::vec::Vec<&str>, &str), &'static str> {
+    let mut segments = split_segments(path)?;
+    let name = segments
+        .pop()
+        .expect("split('/') always yields at least one segment");
+    Ok((segments, name))
+}
+
+/// Resolves a sequence of directory names, walked in order from the
+/// root, to the innermost one's own cluster - replaces the old, root-
+/// only `resolve_dir_cluster` now that a path can be more than one level
+/// deep. `None` means the sequence was empty ("the root itself"), which
+/// callers pass to a plain (non-`_in`) `Fat12Info` method rather than a
+/// cluster number, since the root has none of its own.
+fn resolve_dir_path(
+    fs: &crate::fat12::Fat12Info,
+    segments: &[&str],
+) -> Result<Option<u32>, &'static str> {
+    let mut cluster: Option<u32> = None;
+    for &name in segments {
+        let entries = match cluster {
+            None => fs.list_root_directory()?,
+            Some(c) => fs.list_directory(c)?,
+        };
+        let entry = entries
+            .into_iter()
+            .find(|e| e.name.eq_ignore_ascii_case(name))
+            .ok_or("no such directory in path")?;
+        if !entry.is_dir {
+            return Err("that's a file, not a directory");
+        }
+        cluster = Some(entry.start_cluster);
     }
-    Ok(entry.start_cluster)
+    Ok(cluster)
 }
 
 /// The `cat` command's implementation - same FAT32-then-FAT12/16 fallback
-/// as `list_root_directory`. A `DIR/FILE` path (see `split_path`) reaches
-/// a file inside a subdirectory via `read_file_in`; a plain name behaves
-/// exactly as before.
+/// as `list_root_directory`. A "`DIR1/DIR2/.../FILE`" path (see
+/// `split_path`) reaches a file any number of levels deep via
+/// `read_file_in`; a plain name behaves exactly as before.
 fn read_fat_file(name: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
     let partition = find_fat_partition()?;
     match crate::fat32::read_bpb(&partition) {
         Ok(fs) => fs.read_file(name),
         Err(_) => {
             let fs = crate::fat12::read_bpb(&partition)?;
-            match split_path(name)? {
-                None => fs.read_file(name),
-                Some((dir, file)) => fs.read_file_in(resolve_dir_cluster(&fs, dir)?, file),
+            let (dirs, file) = split_path(name)?;
+            match resolve_dir_path(&fs, &dirs)? {
+                None => fs.read_file(file),
+                Some(cluster) => fs.read_file_in(cluster, file),
             }
         }
     }
@@ -459,25 +489,23 @@ fn read_fat_file(name: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
 /// above: `fat32.rs` has no write support at all yet, so a real FAT32 disk
 /// would get a clear, honest error here rather than a silent no-op - a
 /// currently-untested path in practice, since our own disk is FAT12 (see
-/// the FAT32/FAT12 README row), not a gap papered over. Same `DIR/FILE`
-/// path support as `read_fat_file`, via `create_file_in`.
+/// the FAT32/FAT12 README row), not a gap papered over. Same path support
+/// as `read_fat_file`, via `create_file_in`.
 fn create_fat_file(name: &str, data: &[u8]) -> Result<(), &'static str> {
     let partition = find_fat_partition()?;
     if crate::fat32::read_bpb(&partition).is_ok() {
         return Err("FAT32 file creation isn't implemented yet (this disk is FAT12 in practice)");
     }
     let mut fs = crate::fat12::read_bpb(&partition)?;
-    match split_path(name)? {
-        None => fs.create_file(name, data),
-        Some((dir, file)) => {
-            let cluster = resolve_dir_cluster(&fs, dir)?;
-            fs.create_file_in(cluster, file, data)
-        }
+    let (dirs, file) = split_path(name)?;
+    match resolve_dir_path(&fs, &dirs)? {
+        None => fs.create_file(file, data),
+        Some(cluster) => fs.create_file_in(cluster, file, data),
     }
 }
 
 /// The `rm` command's implementation - same FAT12-only reasoning as
-/// `create_fat_file` above, and the same `DIR/FILE` path support via
+/// `create_fat_file` above, and the same path support via
 /// `delete_file_in`.
 fn delete_fat_file(name: &str) -> Result<(), &'static str> {
     let partition = find_fat_partition()?;
@@ -485,17 +513,21 @@ fn delete_fat_file(name: &str) -> Result<(), &'static str> {
         return Err("FAT32 file deletion isn't implemented yet (this disk is FAT12 in practice)");
     }
     let mut fs = crate::fat12::read_bpb(&partition)?;
-    match split_path(name)? {
-        None => fs.delete_file(name),
-        Some((dir, file)) => {
-            let cluster = resolve_dir_cluster(&fs, dir)?;
-            fs.delete_file_in(cluster, file)
-        }
+    let (dirs, file) = split_path(name)?;
+    match resolve_dir_path(&fs, &dirs)? {
+        None => fs.delete_file(file),
+        Some(cluster) => fs.delete_file_in(cluster, file),
     }
 }
 
 /// The `mkdir` command's implementation - same FAT12-only reasoning as
-/// `create_fat_file` above.
+/// `create_fat_file` above. `name` may be a path ("A/B" creates `B`
+/// inside already-existing `A`) - the same parent-chain-plus-final-
+/// component split as file paths, since "the last segment is the thing
+/// being acted on, everything before it is the parent chain to resolve"
+/// applies identically whether that segment ends up a file or a
+/// directory. Matches plain `mkdir`'s usual behavior, not `-p`: every
+/// parent segment must already exist.
 fn create_fat_directory(name: &str) -> Result<(), &'static str> {
     let partition = find_fat_partition()?;
     if crate::fat32::read_bpb(&partition).is_ok() {
@@ -504,11 +536,15 @@ fn create_fat_directory(name: &str) -> Result<(), &'static str> {
         );
     }
     let mut fs = crate::fat12::read_bpb(&partition)?;
-    fs.create_directory(name)
+    let (dirs, dir_name) = split_path(name)?;
+    match resolve_dir_path(&fs, &dirs)? {
+        None => fs.create_directory(dir_name),
+        Some(cluster) => fs.create_directory_in(cluster, dir_name),
+    }
 }
 
 /// The `rmdir` command's implementation - same FAT12-only reasoning as
-/// `create_fat_file` above.
+/// `create_fat_file` above, and the same path support as `mkdir`.
 fn delete_fat_directory(name: &str) -> Result<(), &'static str> {
     let partition = find_fat_partition()?;
     if crate::fat32::read_bpb(&partition).is_ok() {
@@ -517,13 +553,20 @@ fn delete_fat_directory(name: &str) -> Result<(), &'static str> {
         );
     }
     let mut fs = crate::fat12::read_bpb(&partition)?;
-    fs.delete_directory(name)
+    let (dirs, dir_name) = split_path(name)?;
+    match resolve_dir_path(&fs, &dirs)? {
+        None => fs.delete_directory(dir_name),
+        Some(cluster) => fs.delete_directory_in(cluster, dir_name),
+    }
 }
 
-/// The `ls DIRNAME` command's implementation - lists a named
-/// SUBdirectory's contents (bare `ls` lists the root instead, via
-/// `list_root_directory` above). FAT12-only, same reasoning as
-/// `create_fat_file`/`delete_fat_file`.
+/// The `ls DIR1/DIR2/...` command's implementation - lists a named
+/// subdirectory's contents, any number of levels deep (bare `ls` lists
+/// the root instead, via `list_root_directory` above). Unlike `mkdir`/
+/// `create_fat_file`'s split, every segment here (including the last)
+/// names a directory to descend into - the whole path resolves to the
+/// directory being listed, not a parent-plus-new-component. FAT12-only,
+/// same reasoning as `create_fat_file`/`delete_fat_file`.
 fn list_fat_directory(name: &str) -> Result<(), &'static str> {
     let partition = find_fat_partition()?;
     if crate::fat32::read_bpb(&partition).is_ok() {
@@ -532,16 +575,10 @@ fn list_fat_directory(name: &str) -> Result<(), &'static str> {
         );
     }
     let fs = crate::fat12::read_bpb(&partition)?;
-    let entry = fs
-        .list_root_directory()?
-        .into_iter()
-        .find(|e| e.name.eq_ignore_ascii_case(name))
-        .ok_or("no file or directory with that name")?;
-    if !entry.is_dir {
-        return Err("that's a file, not a directory - try 'cat' instead");
-    }
+    let segments = split_segments(name)?;
+    let cluster = resolve_dir_path(&fs, &segments)?.ok_or("no file or directory with that name")?;
 
-    let sub_entries = fs.list_directory(entry.start_cluster)?;
+    let sub_entries = fs.list_directory(cluster)?;
     kprintln!("{} ({} entries):", name, sub_entries.len());
     serial_println!("[SHELL] ls {} -> {} entries", name, sub_entries.len());
     for e in &sub_entries {

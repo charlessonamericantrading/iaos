@@ -1090,6 +1090,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
+    // 7b-3. Test Multi-Segment Shell Paths ("A/B/FILE", any number of
+    // levels deep) - through the REAL dispatch_command parsing path, not
+    // by calling Fat12Info's own already-nesting-capable _in methods
+    // directly (Fase 36 proved those work; this proves the *shell* can
+    // finally reach them). Before this Fase, shell.rs's own split_path
+    // hard-rejected a second '/' and mkdir/rmdir/ls never split a path at
+    // all, so a person at the prompt had no way to create, populate, or
+    // even list a nested directory - only Fase 36's internal self-test
+    // could. mkdir MULTIOUT/MULTIIN is the key new capability: creating
+    // a directory *inside* another one by name, from the shell, for the
+    // first time. The final `cat` correctly asserts the subdirectory-
+    // specific "not found in directory" message (not "in root
+    // directory") - proof the path genuinely routed to the nested
+    // location two levels down, not a coincidental pass.
+    kprintln!("[KERNEL INIT] Testing multi-segment shell paths (A/B/FILE)...");
+    shell::dispatch_command("mkdir MULTIOUT");
+    shell::dispatch_command("mkdir MULTIOUT/MULTIIN");
+    shell::dispatch_command("touch MULTIOUT/MULTIIN/DEEP.TXT nested two levels deep");
+    shell::dispatch_command("cat MULTIOUT/MULTIIN/DEEP.TXT");
+    shell::dispatch_command("ls MULTIOUT/MULTIIN");
+    shell::dispatch_command("rm MULTIOUT/MULTIIN/DEEP.TXT");
+    shell::dispatch_command("cat MULTIOUT/MULTIIN/DEEP.TXT");
+    shell::dispatch_command("rmdir MULTIOUT/MULTIIN");
+    shell::dispatch_command("rmdir MULTIOUT");
+    shell::dispatch_command("ls");
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real

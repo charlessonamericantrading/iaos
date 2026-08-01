@@ -433,6 +433,33 @@ jobs:
           # for this exact line to appear; a fresh CI image always takes
           # this same fully-self-cleaning path.
           grep -q "FAT12\] vfat_test file_created=true long_name_shown=true long_name_read_ok=true alias_read_ok=true alias_collision_rejected=true file_delete_ok=true file_gone_ok=true dir_created=true dir_long_name_shown=true dir_delete_ok=true dir_gone_ok=true" boot.log
+          # Confirms MULTI-SEGMENT SHELL PATHS (Fase 39) - touch/cat/rm/
+          # mkdir/rmdir/ls now understand "DIR1/DIR2/.../NAME" any number of
+          # levels deep, through the REAL dispatch_command parsing path, not
+          # by calling Fat12Info's own already-nesting-capable _in methods
+          # directly (Fase 36 proved those work; this proves the shell can
+          # finally reach them). "mkdir MULTIOUT/MULTIIN -> created" is the
+          # key new capability: creating a directory *inside* another one by
+          # name, from the shell, for the first time - before this Fase,
+          # mkdir/rmdir/ls never split a path at all. The test content is a
+          # fixed literal ("nested two levels deep"), so its 22-byte length
+          # and first-4-bytes hex are safe to assert exactly, same reasoning
+          # as every other fixed-literal-content check. The final cat
+          # correctly asserts the subdirectory-specific "not found in
+          # directory" message (not "in root directory") - proof the path
+          # genuinely routed two levels down, not a coincidental pass.
+          # Fully self-cleaning, so this is the only outcome a fresh CI
+          # image should ever see.
+          grep -q "SHELL\] mkdir MULTIOUT -> created" boot.log
+          grep -q "SHELL\] mkdir MULTIOUT/MULTIIN -> created" boot.log
+          grep -q "SHELL\] touch MULTIOUT/MULTIIN/DEEP.TXT -> created 22 bytes" boot.log
+          grep -q "SHELL\] cat MULTIOUT/MULTIIN/DEEP.TXT -> 22 bytes" boot.log
+          grep -q "first4=6e657374" boot.log
+          grep -q "SHELL\] ls MULTIOUT/MULTIIN -> 3 entries" boot.log
+          grep -q "SHELL\] rm MULTIOUT/MULTIIN/DEEP.TXT -> deleted" boot.log
+          grep -q "SHELL\] cat MULTIOUT/MULTIIN/DEEP.TXT -> FAILED: FAT12: file not found in directory" boot.log
+          grep -q "SHELL\] rmdir MULTIOUT/MULTIIN -> deleted" boot.log
+          grep -q "SHELL\] rmdir MULTIOUT -> deleted" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.
