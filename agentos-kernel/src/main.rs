@@ -436,7 +436,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!("[KERNEL INIT] Testing real FAT12 file creation...");
     match shell::find_fat_partition() {
         Ok(partition) => match fat12::read_bpb(&partition) {
-            Ok(fs) => {
+            Ok(mut fs) => {
                 let test_content = b"AgentOS created this file for real.";
                 match fs.create_file("AGENTOS.TXT", test_content) {
                     Ok(()) => {
@@ -480,6 +480,55 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Err(e) => {
             kprintln!("[FAT12] create test: couldn't find FAT partition: {}", e);
             serial_println!("[FAT12] create_test -> no partition: {}", e);
+        }
+    }
+    shell::dispatch_command("ls");
+
+    // 7b-7. Real FAT12 file DELETION - frees a file's whole cluster chain
+    // (each FAT entry set back to 0x000) and marks its directory entry
+    // deleted (0xE5). Uses its own dedicated test file ("DELETEME.TXT")
+    // rather than touching AGENTOS.TXT above, so this test's cleanup
+    // can't interact with that one's already-verified "already exists on
+    // repeat boots" behavior. Creates it fresh (ignoring "already
+    // exists" - a prior interrupted run may have left it behind),
+    // confirms it exists, deletes it, then confirms it's genuinely gone
+    // (read_file fails, ls count drops back down) - fully self-cleaning,
+    // so this test behaves identically whether the disk was just
+    // regenerated or this is a repeat boot against the same image.
+    kprintln!("[KERNEL INIT] Testing real FAT12 file deletion...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                let _ = fs.create_file("DELETEME.TXT", b"temporary file for delete_file test");
+                let existed_before = fs.read_file("DELETEME.TXT").is_ok();
+                match fs.delete_file("DELETEME.TXT") {
+                    Ok(()) => {
+                        let gone_after = fs.read_file("DELETEME.TXT").is_err();
+                        kprintln!(
+                            "[FAT12] delete test: existed_before={} gone_after={}",
+                            existed_before,
+                            gone_after
+                        );
+                        serial_println!(
+                            "[FAT12] delete_test existed_before={} gone_after={}",
+                            existed_before,
+                            gone_after
+                        );
+                    }
+                    Err(e) => {
+                        kprintln!("[FAT12] delete_file: {}", e);
+                        serial_println!("[FAT12] delete_test failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                kprintln!("[FAT12] delete test: not FAT12 ({})", e);
+                serial_println!("[FAT12] delete_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!("[FAT12] delete test: couldn't find FAT partition: {}", e);
+            serial_println!("[FAT12] delete_test -> no partition: {}", e);
         }
     }
     shell::dispatch_command("ls");

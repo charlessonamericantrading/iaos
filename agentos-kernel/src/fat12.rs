@@ -295,7 +295,18 @@ impl Fat12Info {
     /// ...) the two-byte pair straddles a 512-byte sector boundary, so
     /// both sectors are read/written together when that happens rather
     /// than assumed to never occur.
-    fn write_fat_entry_to_disk(&self, cluster: u32, value: u16) -> Result<(), &'static str> {
+    ///
+    /// Also writes the same two bytes into `self.fat_bytes` afterward,
+    /// keeping the in-memory cache coherent with disk. Found the hard
+    /// way: without this, `delete_file` on a file created earlier in the
+    /// same mount would call `next_cluster` and see the cluster's *old*
+    /// (stale, still-free) entry instead of the one just written here,
+    /// failing with "hit a free (0) entry unexpectedly". `read_file`
+    /// never hit this because its loop returns as soon as it has enough
+    /// bytes, so a single-cluster file never reaches its own
+    /// `next_cluster` call - `delete_file` is the first caller that
+    /// walks the chain unconditionally, regardless of file size.
+    fn write_fat_entry_to_disk(&mut self, cluster: u32, value: u16) -> Result<(), &'static str> {
         let byte_offset = (cluster * 3 / 2) as usize;
         if byte_offset + 1 >= self.fat_bytes.len() {
             return Err("FAT12: cluster number out of range for this FAT");
@@ -337,6 +348,10 @@ impl Fat12Info {
             buf0[offset0 + 1] = out[1];
             ata::write_sector(sector0, &buf0)?;
         }
+
+        self.fat_bytes[byte_offset] = out[0];
+        self.fat_bytes[byte_offset + 1] = out[1];
+
         Ok(())
     }
 
@@ -351,7 +366,7 @@ impl Fat12Info {
     /// short-name directory entry (no VFAT long-name entries) and only
     /// updates the first on-disk FAT copy, same reasoning as
     /// `write_fat_entry_to_disk`.
-    pub fn create_file(&self, name: &str, data: &[u8]) -> Result<(), &'static str> {
+    pub fn create_file(&mut self, name: &str, data: &[u8]) -> Result<(), &'static str> {
         let cluster_bytes = self.sectors_per_cluster as usize * 512;
         if data.len() > cluster_bytes {
             return Err("FAT12: create_file only supports files that fit in one cluster");
@@ -406,6 +421,80 @@ impl Fat12Info {
         let mut sector_buf = [0u8; 512];
         ata::read_sector(entry_lba, &mut sector_buf)?;
         sector_buf[entry_offset..entry_offset + 32].copy_from_slice(&entry);
+        ata::write_sector(entry_lba, &sector_buf)?;
+
+        Ok(())
+    }
+
+    /// Finds `name`'s directory entry AND its exact on-disk location
+    /// (sector LBA plus byte offset within that sector) - unlike
+    /// `list_root_directory`, which only returns the parsed `DirEntry`
+    /// fields, this is needed to actually modify the entry in place
+    /// (`delete_file` marking it deleted). Mirrors `fat_common`'s own
+    /// entry-parsing logic directly rather than reusing
+    /// `parse_dir_sector`, since that only returns a `Vec<DirEntry>` with
+    /// no indication of which raw 32-byte slot each one came from.
+    fn find_entry_location(&self, name: &str) -> Result<(u32, usize, DirEntry), &'static str> {
+        let mut sector_buf = [0u8; 512];
+        for s in 0..self.root_dir_sectors() {
+            let lba = self.first_root_dir_sector() + s;
+            ata::read_sector(lba, &mut sector_buf)?;
+            for (i, raw) in sector_buf.as_chunks::<32>().0.iter().enumerate() {
+                if raw[0] == 0x00 {
+                    return Err("FAT12: file not found in root directory");
+                }
+                if raw[0] == 0xE5 || raw[11] == 0x0F || raw[11] & 0x08 != 0 {
+                    continue; // deleted / long-filename (VFAT) / volume label
+                }
+                let entry_name = fat_common::format_short_name(&raw[0..8], &raw[8..11]);
+                if entry_name.eq_ignore_ascii_case(name) {
+                    let is_dir = raw[11] & 0x10 != 0;
+                    let hi = u16::from_le_bytes([raw[20], raw[21]]) as u32;
+                    let lo = u16::from_le_bytes([raw[26], raw[27]]) as u32;
+                    let size = u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]);
+                    return Ok((
+                        lba,
+                        i * 32,
+                        DirEntry {
+                            name: entry_name,
+                            is_dir,
+                            size,
+                            start_cluster: (hi << 16) | lo,
+                        },
+                    ));
+                }
+            }
+        }
+        Err("FAT12: file not found in root directory")
+    }
+
+    /// Deletes `name`: frees every cluster in its chain (each FAT entry
+    /// set back to `0x000`) and marks its directory entry deleted (first
+    /// byte `0xE5`, the standard FAT convention) - the rest of the
+    /// entry's bytes are left as-is, matching how real FAT filesystems
+    /// handle deletion; only that one byte actually needs to change for
+    /// the slot to be treated as free/reusable by `find_free_root_entry`
+    /// (or any other FAT-aware reader).
+    pub fn delete_file(&mut self, name: &str) -> Result<(), &'static str> {
+        let (entry_lba, entry_offset, entry) = self.find_entry_location(name)?;
+        if entry.is_dir {
+            return Err("FAT12: delete_file does not support directories");
+        }
+
+        if entry.size > 0 {
+            let mut cluster = Some(entry.start_cluster);
+            while let Some(c) = cluster {
+                // Capture the next link before zeroing this entry - once
+                // it's zeroed, the chain onward from here is lost.
+                let next = self.next_cluster(c)?;
+                self.write_fat_entry_to_disk(c, 0x0000)?;
+                cluster = next;
+            }
+        }
+
+        let mut sector_buf = [0u8; 512];
+        ata::read_sector(entry_lba, &mut sector_buf)?;
+        sector_buf[entry_offset] = 0xE5;
         ata::write_sector(entry_lba, &sector_buf)?;
 
         Ok(())

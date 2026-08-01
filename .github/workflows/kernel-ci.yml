@@ -263,6 +263,22 @@ jobs:
           grep -q "FAT12\] create_test read_back_len=35 match=true" boot.log
           grep -q "SHELL\] ls -> FAT12/16 4 entries" boot.log
           grep -q "AGENTOS.TXT 35 bytes" boot.log
+          # Confirms real FAT12 file DELETION (Fase 27) - both fields matter:
+          # existed_before=true proves DELETEME.TXT was genuinely there first
+          # (this test creates it itself, right before deleting it), and
+          # gone_after=true proves read_file can no longer find it - not just
+          # that delete_file() returned Ok. A fresh CI image always creates
+          # this file for the first time and always deletes it successfully
+          # (the "already exists"/failure paths only show up on a local
+          # repeat boot against an image where a previous delete failed), so
+          # this exact line is the only outcome a CI run should ever see.
+          # This test caught a real stale-cache bug locally: write_fat_entry
+          # _to_disk wrote the new FAT value to disk but never updated the
+          # in-memory fat_bytes copy, so delete_file's cluster-chain walk
+          # (next_cluster) saw the cluster's old, pre-creation value and
+          # failed with "hit a free (0) entry unexpectedly" - see README's
+          # new FAT12 file deletion row for the full story.
+          grep -q "FAT12\] delete_test existed_before=true gone_after=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.
