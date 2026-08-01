@@ -231,15 +231,24 @@ impl Fat12Info {
         }
     }
 
-    /// Finds the first free cluster (a FAT entry of exactly 0) at or
-    /// after cluster 2 - clusters 0/1 aren't real data clusters, they're
+    /// Finds `count` distinct free clusters (FAT entry == 0) at or after
+    /// cluster 2 - clusters 0/1 aren't real data clusters, they're
     /// reserved by the format itself. Searches the in-memory FAT copy
-    /// (loaded once at mount time in `read_bpb`), which is safe here
-    /// since nothing else writes to this disk concurrently in a
-    /// single-threaded kernel.
-    fn find_free_cluster(&self) -> Option<u32> {
+    /// (loaded once at mount time in `read_bpb`) in a single pass,
+    /// collecting entries as it goes - unlike calling a "find one free
+    /// cluster" function `count` times in a row, which would return the
+    /// *same* cluster every time, since nothing marks a cluster "taken"
+    /// until its FAT entry is actually written. Returns them in
+    /// ascending order; safe to search the cached copy rather than disk
+    /// directly since nothing else writes to this disk concurrently in
+    /// a single-threaded kernel.
+    fn find_free_clusters(&self, count: usize) -> Result<alloc::vec::Vec<u32>, &'static str> {
+        let mut found = alloc::vec::Vec::with_capacity(count);
         let total_entries = (self.fat_bytes.len() * 2 / 3) as u32;
         for cluster in 2..total_entries {
+            if found.len() == count {
+                break;
+            }
             let byte_offset = (cluster * 3 / 2) as usize;
             if byte_offset + 1 >= self.fat_bytes.len() {
                 break;
@@ -252,10 +261,13 @@ impl Fat12Info {
                 raw16 >> 4
             };
             if entry == 0 {
-                return Some(cluster);
+                found.push(cluster);
             }
         }
-        None
+        if found.len() < count {
+            return Err("FAT12: not enough free clusters available for this file");
+        }
+        Ok(found)
     }
 
     /// Finds a free slot in the fixed-location root directory - either a
@@ -357,47 +369,56 @@ impl Fat12Info {
 
     /// Creates a new file in the root directory with `name` (short 8.3
     /// form) and `data` as its content - genuinely new, not an overwrite
-    /// of something that already exists. Deliberately limited to files
-    /// that fit in a *single* cluster (checked up front, clear error
-    /// otherwise): a multi-cluster file needs several free-cluster
-    /// lookups tracked against each other within one call so the same
-    /// free cluster is never handed out twice - real, meaningfully more
-    /// bookkeeping, saved for separate future work. Only writes a
-    /// short-name directory entry (no VFAT long-name entries) and only
-    /// updates the first on-disk FAT copy, same reasoning as
-    /// `write_fat_entry_to_disk`.
+    /// of something that already exists. Handles files of any size,
+    /// chaining as many clusters together as needed (originally limited
+    /// to a single cluster - see the multi-cluster note on
+    /// `find_free_clusters` for why that needed its own design pass:
+    /// allocating several free clusters safely means finding them all
+    /// in one pass, not calling a "find one free cluster" function
+    /// several times, which would hand out the same cluster repeatedly).
+    /// Only writes a short-name directory entry (no VFAT long-name
+    /// entries) and only updates the first on-disk FAT copy, same
+    /// reasoning as `write_fat_entry_to_disk`.
     pub fn create_file(&mut self, name: &str, data: &[u8]) -> Result<(), &'static str> {
-        let cluster_bytes = self.sectors_per_cluster as usize * 512;
-        if data.len() > cluster_bytes {
-            return Err("FAT12: create_file only supports files that fit in one cluster");
-        }
         if self.read_file(name).is_ok() {
             return Err("FAT12: a file with that name already exists");
         }
 
         let short_name = to_short_name(name)?;
-        let cluster = self
-            .find_free_cluster()
-            .ok_or("FAT12: no free cluster available")?;
+        let cluster_bytes = self.sectors_per_cluster as usize * 512;
+        // At least one cluster even for an empty (0-byte) file, matching
+        // this method's existing convention from before multi-cluster
+        // support: every created file gets a real cluster to anchor its
+        // directory entry's start_cluster field to.
+        let clusters_needed = data.len().div_ceil(cluster_bytes).max(1);
+        let clusters = self.find_free_clusters(clusters_needed)?;
         let (entry_lba, entry_offset) = self.find_free_root_entry()?;
 
-        // Write the file's data into its one cluster - a partially-used
-        // final sector is zero-padded, same as write_file already does.
-        let cluster_lba = self.cluster_to_lba(cluster);
-        for s in 0..self.sectors_per_cluster as u32 {
-            let mut sector_buf = [0u8; 512];
-            let start = s as usize * 512;
-            if start < data.len() {
-                let end = (start + 512).min(data.len());
-                sector_buf[..end - start].copy_from_slice(&data[start..end]);
+        // Write the file's data across its clusters in order, chaining
+        // each to the next as we go - a partially-used final sector is
+        // zero-padded, same as write_file already does; with sizing
+        // rounded up via div_ceil above, only the last cluster's tail
+        // sectors can ever be partially used, never a whole cluster.
+        let mut written = 0usize;
+        for (i, &cluster) in clusters.iter().enumerate() {
+            let cluster_lba = self.cluster_to_lba(cluster);
+            for s in 0..self.sectors_per_cluster as u32 {
+                let mut sector_buf = [0u8; 512];
+                if written < data.len() {
+                    let end = (written + 512).min(data.len());
+                    sector_buf[..end - written].copy_from_slice(&data[written..end]);
+                    written = end;
+                }
+                ata::write_sector(cluster_lba + s, &sector_buf)?;
             }
-            ata::write_sector(cluster_lba + s, &sector_buf)?;
+            let next_entry = match clusters.get(i + 1) {
+                Some(&next_cluster) => next_cluster as u16,
+                // 0x0FFF is comfortably within the `>= 0x0FF8` end-of-
+                // chain range `next_cluster` already checks for.
+                None => 0x0FFF,
+            };
+            self.write_fat_entry_to_disk(cluster, next_entry)?;
         }
-
-        // Mark this cluster as a complete (single-cluster) chain in its
-        // own right - 0x0FFF is comfortably within the `>= 0x0FF8` end-
-        // of-chain range `next_cluster` already checks for.
-        self.write_fat_entry_to_disk(cluster, 0x0FFF)?;
 
         // A real timestamp from the CMOS RTC (Fase 20) rather than a
         // zeroed/fake one - nothing in this kernel reads FAT timestamps
@@ -415,7 +436,7 @@ impl Fat12Info {
         entry[20..22].copy_from_slice(&0u16.to_le_bytes()); // high cluster word - always 0, FAT12 clusters fit in 12 bits
         entry[22..24].copy_from_slice(&fat_time.to_le_bytes()); // write time
         entry[24..26].copy_from_slice(&fat_date.to_le_bytes()); // write date
-        entry[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+        entry[26..28].copy_from_slice(&(clusters[0] as u16).to_le_bytes());
         entry[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
 
         let mut sector_buf = [0u8; 512];

@@ -548,6 +548,78 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("cat SHELLNEW.TXT");
     shell::dispatch_command("ls");
 
+    // 7b-9. Real FAT12 MULTI-CLUSTER file creation - create_file previously
+    // only handled files that fit in a single cluster (1024 bytes on this
+    // disk's 2-sector clusters); this proves it now allocates and chains
+    // several. Content is a deterministic byte pattern (not a giant string
+    // literal) so it can be checked byte-for-byte on read-back, sized to
+    // comfortably need multiple clusters on any plausible small-FAT12-
+    // volume geometry, not just this exact disk's measured 1024-byte
+    // cluster size. Also exercises delete_file's existing cluster-chain
+    // walk against a genuine multi-cluster chain for the first time -
+    // Fase 27 only ever proved it against single-cluster files.
+    kprintln!("[KERNEL INIT] Testing FAT12 multi-cluster file creation...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                let big_content: alloc::vec::Vec<u8> =
+                    (0..3100u32).map(|i| (i % 256) as u8).collect();
+                match fs.create_file("BIGFILE.TXT", &big_content) {
+                    Ok(()) => match fs.read_file("BIGFILE.TXT") {
+                        Ok(read_back) => {
+                            let matches = read_back == big_content;
+                            kprintln!(
+                                "[FAT12] multi-cluster test: read_back_len={} match={}",
+                                read_back.len(),
+                                matches
+                            );
+                            serial_println!(
+                                "[FAT12] multi_cluster_test created=true read_back_len={} match={}",
+                                read_back.len(),
+                                matches
+                            );
+                        }
+                        Err(e) => {
+                            kprintln!("[FAT12] multi-cluster read_file: {}", e);
+                            serial_println!("[FAT12] multi_cluster_test read_failed: {}", e);
+                        }
+                    },
+                    Err(e) => {
+                        kprintln!("[FAT12] multi-cluster create_file: {}", e);
+                        serial_println!("[FAT12] multi_cluster_test create_failed: {}", e);
+                    }
+                }
+                // Clean up regardless of the outcome above, so this test
+                // is self-cleaning across repeat boots against the same
+                // unregenerated image - same discipline as Fase 27's
+                // delete_file test.
+                match fs.delete_file("BIGFILE.TXT") {
+                    Ok(()) => {
+                        let gone = fs.read_file("BIGFILE.TXT").is_err();
+                        kprintln!("[FAT12] multi-cluster cleanup: deleted, gone={}", gone);
+                        serial_println!("[FAT12] multi_cluster_test deleted=true gone={}", gone);
+                    }
+                    Err(e) => {
+                        kprintln!("[FAT12] multi-cluster cleanup delete_file: {}", e);
+                        serial_println!("[FAT12] multi_cluster_test delete_failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                kprintln!("[FAT12] multi-cluster test: not FAT12 ({})", e);
+                serial_println!("[FAT12] multi_cluster_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!(
+                "[FAT12] multi-cluster test: couldn't find FAT partition: {}",
+                e
+            );
+            serial_println!("[FAT12] multi_cluster_test -> no partition: {}", e);
+        }
+    }
+    shell::dispatch_command("ls");
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real

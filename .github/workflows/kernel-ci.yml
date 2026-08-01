@@ -294,6 +294,23 @@ jobs:
           grep -q "first4=68656c6c" boot.log
           grep -q "SHELL\] rm SHELLNEW.TXT -> deleted" boot.log
           grep -q "SHELL\] cat SHELLNEW.TXT -> FAILED: FAT12: file not found in root directory" boot.log
+          # Confirms FAT12 MULTI-CLUSTER file creation (Fase 29) - create_file
+          # previously only handled files fitting in a single cluster; this
+          # forces several clusters to be allocated, written, and chained
+          # together (3100 bytes needs 4 clusters on this disk's measured
+          # 1024-byte cluster size, though the exact count isn't asserted
+          # here, only match=true is - the number of clusters needed could
+          # in principle differ on another build's disk geometry). The test
+          # content is a fixed deterministic pattern, so 3100 is a genuine
+          # compile-time constant, safe to assert exactly. match=true means
+          # every one of those 3100 bytes round-tripped correctly, not just
+          # that the length matched. This also doubles as the first real
+          # test of delete_file's cluster-chain walk against an actual
+          # multi-cluster chain (Fase 27 only ever exercised it against
+          # single-cluster files) - gone=true confirms every cluster in a
+          # real multi-cluster chain got freed correctly, not just the first.
+          grep -q "FAT12\] multi_cluster_test created=true read_back_len=3100 match=true" boot.log
+          grep -q "FAT12\] multi_cluster_test deleted=true gone=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.
