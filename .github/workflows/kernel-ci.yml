@@ -279,6 +279,21 @@ jobs:
           # failed with "hit a free (0) entry unexpectedly" - see README's
           # new FAT12 file deletion row for the full story.
           grep -q "FAT12\] delete_test existed_before=true gone_after=true" boot.log
+          # Confirms touch/rm (Fase 28) work through the REAL dispatch_command
+          # parsing path, not just by calling Fat12Info's create_file/
+          # delete_file directly the way the tests above do - before this,
+          # create_file/delete_file existed but nothing let a real person at
+          # the AgentOS> prompt actually reach them. The test content is a
+          # fixed literal ("hello from the real shell") re-joined with
+          # single spaces by touch's arg-parsing, so its 25-byte length and
+          # first 4 bytes are genuine compile-time constants, same
+          # reasoning as the AGENTOS.TXT check above - safe to assert
+          # exactly, unlike file sizes that depend on the compiled kernel.
+          grep -q "SHELL\] touch SHELLNEW.TXT -> created 25 bytes" boot.log
+          grep -q "SHELL\] cat SHELLNEW.TXT -> 25 bytes" boot.log
+          grep -q "first4=68656c6c" boot.log
+          grep -q "SHELL\] rm SHELLNEW.TXT -> deleted" boot.log
+          grep -q "SHELL\] cat SHELLNEW.TXT -> FAILED: FAT12: file not found in root directory" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.

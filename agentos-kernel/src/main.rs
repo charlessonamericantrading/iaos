@@ -533,6 +533,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
+    // 7b-8. Real shell-command-level file create/read/delete - proves the
+    // *interactive* path (dispatch_command parsing an actual typed line),
+    // not just the underlying Fat12Info methods the tests above already
+    // exercise directly. Before this, a real person at the AgentOS>
+    // prompt had no way to create or delete a file themselves, even
+    // though the kernel could do both internally - the same class of gap
+    // Shift-key support closed for typing at all. Uses its own dedicated
+    // filename, independent of AGENTOS.TXT/DELETEME.TXT above.
+    kprintln!("[KERNEL INIT] Testing touch/rm shell commands...");
+    shell::dispatch_command("touch SHELLNEW.TXT hello from the real shell");
+    shell::dispatch_command("cat SHELLNEW.TXT");
+    shell::dispatch_command("rm SHELLNEW.TXT");
+    shell::dispatch_command("cat SHELLNEW.TXT");
+    shell::dispatch_command("ls");
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real

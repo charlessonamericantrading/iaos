@@ -19,9 +19,11 @@ pub fn dispatch_command(line: &str) {
     let cmd = parts.next().unwrap_or("");
     match cmd {
         "help" => {
-            kprintln!("Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, clear");
+            kprintln!(
+                "Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, clear"
+            );
             serial_println!(
-                "[SHELL] help -> Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, clear"
+                "[SHELL] help -> Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, clear"
             );
         }
         "ps" => {
@@ -231,6 +233,52 @@ pub fn dispatch_command(line: &str) {
                 }
             }
         }
+        "touch" => {
+            let filename = parts.next().unwrap_or("");
+            if filename.is_empty() {
+                kprintln!("touch: usage: touch FILENAME.EXT [content...]");
+                serial_println!("[SHELL] touch -> no filename given");
+            } else {
+                // Whatever's left on the line becomes the file's content -
+                // words are re-joined with single spaces, since this shell
+                // has no quoting, so original spacing/formatting between
+                // words isn't preserved. Good enough for a real person to
+                // create a real file at the prompt; not a general editor.
+                let content = parts.collect::<alloc::vec::Vec<&str>>().join(" ");
+                match create_fat_file(filename, content.as_bytes()) {
+                    Ok(()) => {
+                        kprintln!("Created '{}' ({} bytes).", filename, content.len());
+                        serial_println!(
+                            "[SHELL] touch {} -> created {} bytes",
+                            filename,
+                            content.len()
+                        );
+                    }
+                    Err(e) => {
+                        kprintln!("touch: {}", e);
+                        serial_println!("[SHELL] touch {} -> FAILED: {}", filename, e);
+                    }
+                }
+            }
+        }
+        "rm" => {
+            let filename = parts.next().unwrap_or("");
+            if filename.is_empty() {
+                kprintln!("rm: usage: rm FILENAME.EXT");
+                serial_println!("[SHELL] rm -> no filename given");
+            } else {
+                match delete_fat_file(filename) {
+                    Ok(()) => {
+                        kprintln!("Deleted '{}'.", filename);
+                        serial_println!("[SHELL] rm {} -> deleted", filename);
+                    }
+                    Err(e) => {
+                        kprintln!("rm: {}", e);
+                        serial_println!("[SHELL] rm {} -> FAILED: {}", filename, e);
+                    }
+                }
+            }
+        }
         "clear" => {
             crate::vga_buffer::clear_screen();
             serial_println!("[SHELL] clear -> VGA screen cleared");
@@ -325,4 +373,29 @@ fn read_fat_file(name: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
         Ok(fs) => fs.read_file(name),
         Err(_) => crate::fat12::read_bpb(&partition)?.read_file(name),
     }
+}
+
+/// The `touch` command's implementation. FAT12-only, unlike `read_fat_file`
+/// above: `fat32.rs` has no write support at all yet, so a real FAT32 disk
+/// would get a clear, honest error here rather than a silent no-op - a
+/// currently-untested path in practice, since our own disk is FAT12 (see
+/// the FAT32/FAT12 README row), not a gap papered over.
+fn create_fat_file(name: &str, data: &[u8]) -> Result<(), &'static str> {
+    let partition = find_fat_partition()?;
+    if crate::fat32::read_bpb(&partition).is_ok() {
+        return Err("FAT32 file creation isn't implemented yet (this disk is FAT12 in practice)");
+    }
+    let mut fs = crate::fat12::read_bpb(&partition)?;
+    fs.create_file(name, data)
+}
+
+/// The `rm` command's implementation - same FAT12-only reasoning as
+/// `create_fat_file` above.
+fn delete_fat_file(name: &str) -> Result<(), &'static str> {
+    let partition = find_fat_partition()?;
+    if crate::fat32::read_bpb(&partition).is_ok() {
+        return Err("FAT32 file deletion isn't implemented yet (this disk is FAT12 in practice)");
+    }
+    let mut fs = crate::fat12::read_bpb(&partition)?;
+    fs.delete_file(name)
 }
