@@ -371,6 +371,20 @@ jobs:
           # ReLU's clipping branch on row 1's deliberately negative
           # pre-activation - not just that some output happened to be 0.
           grep -q "SYSCALL\] tensor_eval_test syscall_ok=true tensor_eval_correct=true outputs=\[4.00, 0.00\]" boot.log
+          # Confirms SYS_TENSOR_EVAL now validates its pointer argument
+          # before dereferencing it (Fase 74) - a real gap once ring-3
+          # code can genuinely invoke syscalls with real arguments (Fase
+          # 72) and cleanly return afterward (Fase 73): before this Fase,
+          # a bad pointer here would trigger a real #PF from INSIDE the
+          # syscall handler, hitting the existing page_fault_handler,
+          # which halts the kernel forever - turning one bad syscall
+          # argument into a dead machine instead of a rejected call.
+          # rejected_cleanly=true means dispatch_syscall returned u64::MAX
+          # for a deliberately unmapped pointer (0x1000) - and this line
+          # appearing at all is itself part of the proof, since a real
+          # kernel hang here would have looked exactly like the CI
+          # timeout that later self-tests are also checked against.
+          grep -q "SYSCALL\] tensor_eval_invalid_ptr_test rejected_cleanly=true" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -

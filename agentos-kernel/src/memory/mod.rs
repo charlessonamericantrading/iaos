@@ -1,6 +1,7 @@
 pub mod frame_allocator;
 pub mod heap;
 pub mod kv_allocator;
+pub mod paging;
 pub mod user_page;
 
 use x86_64::registers::control::Cr3;

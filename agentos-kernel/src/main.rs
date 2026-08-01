@@ -191,10 +191,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!("[KERNEL INIT] Mapping physical memory & initializing heap allocator...");
     let phys_mem_offset =
         x86_64::VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap_or(0));
-    let mut mapper = unsafe { memory::init(phys_mem_offset) };
+    // Fase 74: installed globally right away, not kept as a local - only
+    // one `OffsetPageTable` can safely exist at a time (it wraps a unique
+    // `&'static mut PageTable`), so every use from here on, including the
+    // two right below, goes through `memory::paging::with_mapper` instead
+    // of a plain `&mut mapper` - see that module's own doc for why.
+    memory::paging::install_global(unsafe { memory::init(phys_mem_offset) });
     let mut frame_allocator =
         unsafe { memory::frame_allocator::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
-    memory::heap::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+    memory::paging::with_mapper(|mapper| memory::heap::init_heap(mapper, &mut frame_allocator))
+        .expect("heap initialization failed");
     kprintln!(
         "[KERNEL INIT] Heap mapped at {:#x}, {} KiB - alloc (Vec/Box/String) now live.",
         memory::heap::HEAP_START,
@@ -212,10 +218,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // a future Fase still needs the actual ring-3 entry to prove the
     // USER_ACCESSIBLE bit is what makes the real difference.
     kprintln!("[KERNEL INIT] Mapping a real user-accessible test page...");
-    memory::user_page::map_user_test_page(&mut mapper, &mut frame_allocator)
-        .expect("user test page mapping failed");
+    memory::paging::with_mapper(|mapper| {
+        memory::user_page::map_user_test_page(mapper, &mut frame_allocator)
+    })
+    .expect("user test page mapping failed");
     {
-        let info = memory::user_page::inspect_user_test_page(&mapper);
+        let info =
+            memory::paging::with_mapper(|mapper| memory::user_page::inspect_user_test_page(mapper));
         kprintln!(
             "[MEMORY] user_page_test present={} writable={} user_accessible={} write_read_back_ok={}",
             info.present,
@@ -1351,11 +1360,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // unused gtype field. Deliberately picked as this Fase's own area
     // switch after five straight GGUF Fases (50-54): a small, ring-0-only
     // slice of "make syscalls real" - wiring the dispatcher to the actual
-    // tensor engine - distinct from the much larger, still-deferred real
-    // ring-3/ring-0 transition (no user-mode GDT segments, no RSP0, no
-    // SYSCALL/SYSRET or DPL=3 interrupt gate exist at all yet - see
-    // syscall.rs's own TensorEvalArgs doc and this project's memory notes
-    // for why that larger undertaking keeps getting deferred).
+    // tensor engine - distinct from what was then the much larger,
+    // still-deferred real ring-3/ring-0 transition, since closed for
+    // real by Fase 68-73 (see syscall.rs's own TensorEvalArgs arm, which
+    // now validates this exact pointer argument before dereferencing it,
+    // per Fase 74).
     //
     // weights/inputs/bias/in_dim/out_dim are a small, fully hand-computable
     // 2x2 layer: row0 = ReLU(1*1 + 2*1 + 1) = ReLU(4) = 4.0; row1 =
@@ -1412,6 +1421,34 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             tensor_eval_correct,
             outputs[0],
             outputs[1]
+        );
+    }
+
+    // 7a-3. Test that SYS_TENSOR_EVAL rejects an invalid pointer cleanly
+    // (Fase 74), instead of trusting it blindly the way the test right
+    // above's own real, valid pointer implicitly could not have caught.
+    // Before this Fase, dereferencing this exact pointer would have
+    // triggered a real #PF from INSIDE the syscall handler, hitting the
+    // existing page_fault_handler, which halts the kernel forever - so
+    // this test's own success criterion is as much "the kernel is still
+    // running to print this line at all" as it is the printed value
+    // itself. 0x1000 is a low, canonical, page-aligned address this
+    // kernel never maps (this kernel's own real mappings - the kernel
+    // image, the heap at 0x4444..., Fase 70's user page at 0x5555... -
+    // are all far above it), chosen the same way `run_ring3_test`'s own
+    // `cli` byte was: a deliberately clear-cut case, not a boundary one.
+    kprintln!("[KERNEL SYSCALL] Testing SYS_TENSOR_EVAL rejects an unmapped pointer...");
+    {
+        const DEFINITELY_UNMAPPED: u64 = 0x1000;
+        let result = syscall::dispatch_syscall(syscall::SYS_TENSOR_EVAL, DEFINITELY_UNMAPPED, 0, 0);
+        let rejected_cleanly = result == u64::MAX;
+        kprintln!(
+            "[SYSCALL] tensor_eval_invalid_ptr_test: rejected_cleanly={}",
+            rejected_cleanly
+        );
+        serial_println!(
+            "[SYSCALL] tensor_eval_invalid_ptr_test rejected_cleanly={}",
+            rejected_cleanly
         );
     }
 

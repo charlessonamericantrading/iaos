@@ -32,6 +32,27 @@ pub struct TensorEvalArgs {
     pub out_dim: usize,
 }
 
+/// A zero-length slice's pointer is never actually dereferenced by
+/// `core::slice::from_raw_parts` - skipping the mapped-check in that case
+/// avoids rejecting a legitimate empty slice whose pointer value happens
+/// to be a dangling-but-well-aligned sentinel rather than real, mapped
+/// memory (a normal, sound Rust convention, not a malformed argument).
+fn pointer_is_mapped_checked(name: &str, ptr: u64, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if crate::memory::paging::pointer_is_mapped(ptr) {
+        true
+    } else {
+        kprintln!(
+            "[SYSCALL ERROR] SYS_TENSOR_EVAL: {} pointer {:#x} not mapped",
+            name,
+            ptr
+        );
+        false
+    }
+}
+
 pub fn dispatch_syscall(sys_nr: u64, arg1: u64, arg2: u64, _arg3: u64) -> u64 {
     match sys_nr {
         SYS_SERIAL_PRINT => {
@@ -62,23 +83,42 @@ pub fn dispatch_syscall(sys_nr: u64, arg1: u64, arg2: u64, _arg3: u64) -> u64 {
             }
         }
         SYS_TENSOR_EVAL => {
-            let args_ptr = arg1 as *const TensorEvalArgs;
-            if args_ptr.is_null() {
-                kprintln!("[SYSCALL ERROR] SYS_TENSOR_EVAL: null args pointer");
+            // Fase 74: this kernel's ring-3 arc is no longer hypothetical
+            // (Fase 68-73 built a real GDT/TSS, a DPL=3 syscall gate that
+            // reads genuine ring-3 registers, and a safe ring-3->ring-0
+            // return path) - a syscall argument pointer arriving here can
+            // genuinely have come from ring-3 code now, not just this
+            // kernel's own trusted self-tests. `pointer_is_mapped` checks
+            // every pointer this arm dereferences BEFORE it ever touches
+            // one, so a bad pointer (accidental or deliberate) becomes a
+            // clean `u64::MAX` instead of an unhandled `#PF` that halts
+            // the whole kernel via the existing `page_fault_handler` -
+            // see that function's own doc for the full reasoning.
+            if !pointer_is_mapped_checked("args", arg1, 1) {
                 return u64::MAX;
             }
-            // SAFETY: this kernel has no user/kernel memory separation
-            // yet (see gdt.rs - no user-mode segments, no ring-3
-            // transition exists at all), so a syscall argument pointer
-            // is trusted at exactly the same level every other raw
-            // pointer already used throughout this codebase is (e.g.
-            // e1000's DMA buffers) - not a new category of risk, just
-            // this module's first occurrence of it. The caller (today,
-            // only this kernel's own self-test) is responsible for
-            // `args_ptr` pointing at a real, live `TensorEvalArgs` whose
-            // own slice fields are valid for their stated lengths.
+            let args_ptr = arg1 as *const TensorEvalArgs;
+            // SAFETY: args_ptr's own page was just confirmed present
+            // above - safe to read the struct's fields (though not yet
+            // whatever THEY point to, each checked individually next).
+            let args = unsafe { &*args_ptr };
+            if !pointer_is_mapped_checked("weights", args.weights as u64, args.weights_len)
+                || !pointer_is_mapped_checked("inputs", args.inputs as u64, args.inputs_len)
+                || !pointer_is_mapped_checked("bias", args.bias as u64, args.bias_len)
+                || !pointer_is_mapped_checked("outputs", args.outputs as u64, args.outputs_len)
+            {
+                return u64::MAX;
+            }
+            // SAFETY: every pointer above was just confirmed to point at
+            // real, present memory - trusted at exactly the level every
+            // other raw pointer already used throughout this codebase is
+            // (e.g. e1000's DMA buffers), now with an actual check behind
+            // that trust instead of an unconditional assumption. Still
+            // does NOT verify the stated lengths stay within a single
+            // mapping (a slice starting on a valid page could still run
+            // off the end into unmapped memory) - real, separate
+            // follow-on work, not this Fase's own scope.
             unsafe {
-                let args = &*args_ptr;
                 let weights = core::slice::from_raw_parts(args.weights, args.weights_len);
                 let inputs = core::slice::from_raw_parts(args.inputs, args.inputs_len);
                 let bias = core::slice::from_raw_parts(args.bias, args.bias_len);
