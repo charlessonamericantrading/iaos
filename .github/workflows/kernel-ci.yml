@@ -128,6 +128,18 @@ jobs:
           # silently assuming everything is F32, the real gap this Fase
           # closes.
           grep -q "GGUF\] q8_0_test f16_vectors_ok=true q8_0_decode_ok=true dispatch_f32_ok=true dispatch_q8_0_ok=true dispatch_unimplemented_ok=true" boot.log
+          # Confirms real GGUF Q4_0 quantized tensor decoding (Fase 52) -
+          # 4-bit, nibble-packed. The self-test's block uses a
+          # deliberately asymmetric nibble pattern (low nibble ascending,
+          # high nibble descending) specifically so a low/high-nibble
+          # swap OR an interleaved-vs-split-half packing bug (byte j's
+          # nibbles are value[j]/value[j+16], NOT value[2j]/value[2j+1] -
+          # verified against GGML's actual dequantize_row_q4_0 source)
+          # would produce a completely different, easily-distinguishable
+          # wrong sequence rather than accidentally passing.
+          # dispatch_q4_0_ok confirms decode_tensor (Fase 50) now routes
+          # Q4_0 to this new decoder too.
+          grep -q "GGUF\] q4_0_test q4_0_decode_ok=true dispatch_q4_0_ok=true" boot.log
           # Confirms real GGUF multi-tensor-info support (Fase 51) -
           # GgufTensorInfo::parse_many, generalizing tensor-info parsing
           # to any real number of tensors instead of just one.
