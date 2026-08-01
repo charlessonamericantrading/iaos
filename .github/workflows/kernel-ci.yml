@@ -286,6 +286,20 @@ jobs:
           # the same way. All six checks must be true for this exact line
           # to appear.
           grep -q "ICMP\] ping_selftest checksum_even_case_ok=true checksum_odd_case_ok=true request_fields_ok=true reply_fields_ok=true corrupted_checksum_rejected=true ipv4_checksum_valid=true" boot.log
+          # Confirms generalized ARP resolution (Fase 48, net::e1000::
+          # arp_resolve) - a new, independent function (does not touch
+          # send_test_frame/receive_test_frame, whose exact log output is
+          # asserted above) that resolves an arbitrary target IP's MAC via
+          # a real TX+RX round trip, instead of only ever asking about
+          # SLIRP's hardcoded gateway. Asserts the EXACT expected MAC
+          # (52:55:0a:00:02:02) - safe to pin exactly, since it's SLIRP's
+          # own fixed virtual gateway MAC, already observed as the
+          # replying device's source address in the rx_received check
+          # above (a property of the emulated backend itself, not this
+          # build/environment - the same "safe to pin" class as the e1000
+          # NIC's own hardcoded default MAC, per the Fase 15/19 CI-
+          # portability lesson).
+          grep -q "E1000\] arp_resolve_test target=10.0.2.2 mac=\[52, 55, 0a, 00, 02, 02\] matches_known_gateway_mac=true" boot.log
           # Confirms the new ATA write path (Fase 23) genuinely wrote and
           # read back matching bytes - not just that write_sector()
           # returned without erroring. Deliberately NOT asserting the

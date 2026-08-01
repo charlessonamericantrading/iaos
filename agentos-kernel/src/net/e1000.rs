@@ -4,7 +4,7 @@
 //! vendor:device 8086:100e - confirmed present via `pci.rs`'s real
 //! enumeration (see README/Fase 11).
 //!
-//! Two stages so far:
+//! Four stages so far:
 //! - `probe()` (Fase 19): find the device, reach its registers, read a
 //!   couple back (STATUS, MAC via RAL0/RAH0) - proof this kernel can
 //!   genuinely talk to real device MMIO at all.
@@ -16,10 +16,13 @@
 //!   memory alone, given the cost of getting hardware-register-level
 //!   code wrong. See "TX DD-bit mystery, resolved (Fase 44)" below for
 //!   the two-round investigation and its actual resolution.
-//!
-//! Real RX (receiving a frame back) is deliberately not attempted yet -
-//! separate future work; the bus-mastering fix below is very likely a
-//! prerequisite for it too (see that section's closing note).
+//! - `receive_test_frame()` (Fase 45): a real receive descriptor ring,
+//!   proven by genuinely receiving a real ARP reply from QEMU's SLIRP
+//!   backend on the very first attempt.
+//! - `arp_resolve()` (Fase 48): generalizes that same TX+RX round trip
+//!   to resolve *any* target IP's MAC, not just SLIRP's hardcoded
+//!   gateway - the prerequisite a real `ping` (see `net::icmp`, Fase 47)
+//!   needs before it can address an Ethernet frame at all.
 //!
 //! ## Why no new page-table mapping code was needed
 //! The e1000's BAR0 is a *memory-mapped* register window (not I/O-port
@@ -666,4 +669,219 @@ pub fn receive_test_frame() -> Result<(), &'static str> {
         );
     }
     Err("e1000 RX: timed out waiting for a received frame - either SLIRP didn't reply, or something in this ring's own setup is wrong; see rx timeout diagnostic above")
+}
+
+/// Resolves `target_ip`'s real MAC address via a genuine ARP request/reply
+/// round trip - the same TX+RX mechanics `send_test_frame`/
+/// `receive_test_frame` proved (Fase 44/45), generalized to any target
+/// instead of hardcoded to SLIRP's gateway (10.0.2.2). Deliberately a new,
+/// independent function rather than a refactor of those two: their exact
+/// behavior and log output are CI-asserted across three Fases (44-46), so
+/// this duplicates their proven ring-setup shape (same constants, same
+/// descriptor structs, same bounded `hlt`-based poll pattern) rather than
+/// risk changing anything about them. The natural prerequisite for a real
+/// `ping` (net::icmp, Fase 47) - sending an IP packet needs the
+/// destination's MAC first, unless hardcoded.
+///
+/// Re-arms the RX descriptor on a non-matching frame instead of failing
+/// on the first thing received - other traffic isn't expected on SLIRP's
+/// simple guest/gateway topology, but nothing guarantees the very first
+/// frame this ring sees is necessarily the reply being waited for.
+pub fn arp_resolve(target_ip: [u8; 4]) -> Result<[u8; 6], &'static str> {
+    let (dev, mmio_base) = find_mmio_base()?;
+    dev.enable_bus_mastering();
+    let src_mac = read_mac(mmio_base);
+
+    let rx_ring_frame = crate::memory::frame_allocator::allocate_frame();
+    let rx_buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let tx_ring_frame = crate::memory::frame_allocator::allocate_frame();
+    let tx_buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let phys_offset = PHYS_MEM_OFFSET.load(Ordering::Relaxed);
+    let rx_ring_virt = (phys_offset + rx_ring_frame.start_address().as_u64()) as *mut RxDescriptor;
+    let tx_ring_virt = (phys_offset + tx_ring_frame.start_address().as_u64()) as *mut TxDescriptor;
+    let tx_buf_virt = (phys_offset + tx_buf_frame.start_address().as_u64()) as *mut u8;
+
+    // Arm the RX ring FIRST, same ordering reasoning as receive_test_frame:
+    // a reply could arrive at any point once the request goes out.
+    unsafe {
+        let empty_rx = RxDescriptor {
+            addr: 0,
+            length: 0,
+            checksum: 0,
+            status: 0,
+            errors: 0,
+            special: 0,
+        };
+        for i in 0..NUM_RX_DESCRIPTORS {
+            core::ptr::write_volatile(rx_ring_virt.add(i), empty_rx);
+        }
+        core::ptr::write_volatile(
+            rx_ring_virt,
+            RxDescriptor {
+                addr: rx_buf_frame.start_address().as_u64(),
+                length: 0,
+                checksum: 0,
+                status: 0,
+                errors: 0,
+                special: 0,
+            },
+        );
+        let rx_ring_phys = rx_ring_frame.start_address().as_u64();
+        write_reg(mmio_base, REG_RDBAL, (rx_ring_phys & 0xFFFF_FFFF) as u32);
+        write_reg(mmio_base, REG_RDBAH, (rx_ring_phys >> 32) as u32);
+        write_reg(mmio_base, REG_RDLEN, (NUM_RX_DESCRIPTORS * 16) as u32);
+        write_reg(mmio_base, REG_RDH, 0);
+        write_reg(mmio_base, REG_RDT, 1);
+        write_reg(mmio_base, REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
+    }
+
+    // Build a real ARP request for target_ip - parameterized, unlike
+    // send_test_frame's hardcoded-to-10.0.2.2 version.
+    let frame_len = 42usize;
+    unsafe {
+        let dst = core::slice::from_raw_parts_mut(tx_buf_virt, frame_len);
+        dst[0..6].copy_from_slice(&[0xFF; 6]); // broadcast dest
+        dst[6..12].copy_from_slice(&src_mac);
+        dst[12] = 0x08;
+        dst[13] = 0x06; // EtherType: ARP
+        dst[14] = 0x00;
+        dst[15] = 0x01; // HTYPE: Ethernet
+        dst[16] = 0x08;
+        dst[17] = 0x00; // PTYPE: IPv4
+        dst[18] = 6; // HLEN
+        dst[19] = 4; // PLEN
+        dst[20] = 0x00;
+        dst[21] = 0x01; // OPER: request
+        dst[22..28].copy_from_slice(&src_mac); // SHA
+        dst[28..32].copy_from_slice(&[10, 0, 2, 15]); // SPA (SLIRP guest default)
+        dst[32..38].copy_from_slice(&[0x00; 6]); // THA: unknown
+        dst[38..42].copy_from_slice(&target_ip); // TPA: the address being resolved
+    }
+
+    unsafe {
+        let empty_tx = TxDescriptor {
+            addr: 0,
+            length: 0,
+            cso: 0,
+            cmd: 0,
+            status: 0,
+            css: 0,
+            special: 0,
+        };
+        for i in 0..NUM_TX_DESCRIPTORS {
+            core::ptr::write_volatile(tx_ring_virt.add(i), empty_tx);
+        }
+        core::ptr::write_volatile(
+            tx_ring_virt,
+            TxDescriptor {
+                addr: tx_buf_frame.start_address().as_u64(),
+                length: frame_len as u16,
+                cso: 0,
+                cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
+                status: 0,
+                css: 0,
+                special: 0,
+            },
+        );
+
+        let ctrl = read_reg(mmio_base, REG_CTRL);
+        write_reg(mmio_base, REG_CTRL, ctrl | CTRL_SLU);
+
+        let tx_ring_phys = tx_ring_frame.start_address().as_u64();
+        write_reg(mmio_base, REG_TDBAL, (tx_ring_phys & 0xFFFF_FFFF) as u32);
+        write_reg(mmio_base, REG_TDBAH, (tx_ring_phys >> 32) as u32);
+        write_reg(mmio_base, REG_TDLEN, (NUM_TX_DESCRIPTORS * 16) as u32);
+        write_reg(mmio_base, REG_TDH, 0);
+        write_reg(mmio_base, REG_TDT, 0);
+        write_reg(mmio_base, REG_TIPG, TIPG_DEFAULT);
+        write_reg(
+            mmio_base,
+            REG_TCTL,
+            TCTL_EN | TCTL_PSP | TCTL_CT_DEFAULT | TCTL_COLD_FULL_DUPLEX,
+        );
+        write_reg(mmio_base, REG_TDT, 1);
+    }
+
+    let tx_start_tick = crate::interrupts::timer_ticks();
+    let mut tx_ok = false;
+    unsafe {
+        loop {
+            let status = core::ptr::read_volatile(core::ptr::addr_of!((*tx_ring_virt).status));
+            if status & TXD_STATUS_DD != 0 {
+                tx_ok = true;
+                break;
+            }
+            if crate::interrupts::timer_ticks() - tx_start_tick > 90 {
+                break;
+            }
+            x86_64::instructions::hlt();
+        }
+    }
+    if !tx_ok {
+        return Err("arp_resolve: TX timed out waiting for descriptor DD");
+    }
+
+    let rx_start_tick = crate::interrupts::timer_ticks();
+    unsafe {
+        loop {
+            let status = core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).status));
+            if status & RXD_STAT_DD != 0 {
+                let length =
+                    core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).length)) as usize;
+                let buf_virt = (phys_offset + rx_buf_frame.start_address().as_u64()) as *const u8;
+                let data = core::slice::from_raw_parts(buf_virt, length);
+
+                // Same cross-consistency checks receive_test_frame already
+                // uses (OPER=reply, SHA matches the Ethernet source MAC),
+                // plus the new one this function actually needs: the
+                // reply's SPA must equal the target_ip being resolved -
+                // proof this is really an answer to OUR question, not
+                // some other exchange happening to also be a valid ARP
+                // reply.
+                let is_matching_reply = data.len() >= 32
+                    && data[12] == 0x08
+                    && data[13] == 0x06
+                    && data[20] == 0x00
+                    && data[21] == 0x02
+                    && data[22..28] == data[6..12]
+                    && data[28..32] == target_ip;
+                if is_matching_reply {
+                    let mut mac = [0u8; 6];
+                    mac.copy_from_slice(&data[22..28]);
+                    serial_println!(
+                        "[E1000] arp_resolve target={:?} mac={:02x?}",
+                        target_ip,
+                        mac
+                    );
+                    return Ok(mac);
+                }
+
+                // Not the reply being waited for - rearm this same
+                // descriptor and keep polling instead of giving up.
+                core::ptr::write_volatile(
+                    rx_ring_virt,
+                    RxDescriptor {
+                        addr: rx_buf_frame.start_address().as_u64(),
+                        length: 0,
+                        checksum: 0,
+                        status: 0,
+                        errors: 0,
+                        special: 0,
+                    },
+                );
+                write_reg(mmio_base, REG_RDT, 1);
+            }
+            if crate::interrupts::timer_ticks() - rx_start_tick > 90 {
+                break;
+            }
+            x86_64::instructions::hlt();
+        }
+    }
+    serial_println!(
+        "[E1000] arp_resolve target={:?} timeout RDH={:#x} RDT={:#x}",
+        target_ip,
+        unsafe { read_reg(mmio_base, REG_RDH) },
+        unsafe { read_reg(mmio_base, REG_RDT) }
+    );
+    Err("arp_resolve: timed out waiting for a matching ARP reply")
 }

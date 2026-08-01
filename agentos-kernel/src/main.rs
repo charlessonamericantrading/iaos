@@ -465,6 +465,37 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 7b-7. Test real, generalized ARP resolution (Fase 48) - arp_resolve
+    // sends a real ARP request for an arbitrary target IP and resolves its
+    // MAC via the same TX+RX mechanics send_test_frame/receive_test_frame
+    // already proved, instead of only ever asking about SLIRP's hardcoded
+    // gateway. Resolves that exact same gateway (10.0.2.2) here specifically
+    // because its real MAC is already known from Fase 45's own captured
+    // data (52:55:0a:00:02:02, SLIRP's virtual gateway) - matches_known_
+    // gateway_mac being true is a precise, exact correctness check, not
+    // just "got 6 bytes back from somewhere".
+    kprintln!("[KERNEL INIT] Testing generalized ARP resolution (arp_resolve)...");
+    match net::e1000::arp_resolve([10, 0, 2, 2]) {
+        Ok(mac) => {
+            const KNOWN_GATEWAY_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+            let matches_known_gateway_mac = mac == KNOWN_GATEWAY_MAC;
+            kprintln!(
+                "[E1000] arp_resolve(10.0.2.2) -> {:02x?} (matches known gateway MAC: {})",
+                mac,
+                matches_known_gateway_mac
+            );
+            serial_println!(
+                "[E1000] arp_resolve_test target=10.0.2.2 mac={:02x?} matches_known_gateway_mac={}",
+                mac,
+                matches_known_gateway_mac
+            );
+        }
+        Err(e) => {
+            kprintln!("[E1000] arp_resolve(10.0.2.2): {}", e);
+            serial_println!("[E1000] arp_resolve_test -> FAILED: {}", e);
+        }
+    }
+
     shell::dispatch_command("disk");
     shell::dispatch_command("ls");
     shell::dispatch_command("cat KERNEL~1");
