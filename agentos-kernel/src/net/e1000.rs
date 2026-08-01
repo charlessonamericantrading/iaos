@@ -8,17 +8,18 @@
 //! - `probe()` (Fase 19): find the device, reach its registers, read a
 //!   couple back (STATUS, MAC via RAL0/RAH0) - proof this kernel can
 //!   genuinely talk to real device MMIO at all.
-//! - `send_test_frame()` (Fase 22): build a real transmit descriptor
-//!   ring and hand a frame to the hardware. Register offsets and the
-//!   legacy TX descriptor layout were cross-checked against a real
-//!   shipped driver (MINIX's `e1000_reg.h`) and QEMU's own `e1000.c`/
-//!   `e1000_regs.h` rather than relied on from memory alone, given the
-//!   cost of getting hardware-register-level code wrong. **This stage is
-//!   a real, verified partial result, not a full success - see the
-//!   "known limitation" section below.**
+//! - `send_test_frame()` (Fase 22, **fully confirmed working Fase 44**):
+//!   build a real transmit descriptor ring and hand a frame to the
+//!   hardware. Register offsets and the legacy TX descriptor layout were
+//!   cross-checked against a real shipped driver (MINIX's `e1000_reg.h`)
+//!   and QEMU's own `e1000.c`/`e1000_regs.h` rather than relied on from
+//!   memory alone, given the cost of getting hardware-register-level
+//!   code wrong. See "TX DD-bit mystery, resolved (Fase 44)" below for
+//!   the two-round investigation and its actual resolution.
 //!
 //! Real RX (receiving a frame back) is deliberately not attempted yet -
-//! separate future work.
+//! separate future work; the bus-mastering fix below is very likely a
+//! prerequisite for it too (see that section's closing note).
 //!
 //! ## Why no new page-table mapping code was needed
 //! The e1000's BAR0 is a *memory-mapped* register window (not I/O-port
@@ -38,7 +39,7 @@
 //! already a valid, mapped virtual address to write through - no dedicated
 //! DMA-region mapping code needed.
 //!
-//! ## Known limitation, found and documented honestly (Fase 22, re-investigated Fase 32)
+//! ## TX DD-bit mystery, resolved (Fase 44) - two-round investigation kept below
 //! `send_test_frame` genuinely engages the hardware: the descriptor ring's
 //! physical address, the descriptor's own content (verified correct via a
 //! direct memory read-back before the kick), and the TDT-triggered dequeue
@@ -99,24 +100,56 @@
 //!   unchanged. No change - reconfirms Fase 22's finding rather than
 //!   contradicting it.
 //!
-//! The exact remaining cause is still unresolved as of this note. Every
-//! software-side explanation this investigation could construct and test
-//! has been ruled out with a real experiment, not just argued away - the
-//! reasoning above traces the write-then-writeback path completely and
-//! finds no gap, yet the observed behavior contradicts it. That
-//! contradiction itself is the honest state to report: either something
-//! in QEMU's actual runtime behavior differs subtly from what a source
-//! reading predicts (version-specific behavior not caught by comparing
-//! against current `master`, some interaction this investigation didn't
-//! construct a test for), or there's a flaw in this reasoning that further
-//! scrutiny would catch. Left as a known, real, documented gap rather than
-//! papered over - see `agentos_direction` memory for the full
-//! investigation (both rounds) if picking this up again. A concrete next
-//! avenue not yet tried: attaching QEMU's own monitor/QMP interface to
-//! inspect guest physical memory at `ring_phys` from *outside* the guest
-//! entirely, independent of this kernel's own page tables or polling
-//! code - would definitively show whether QEMU's device model is even
-//! attempting the write, cutting the remaining uncertainty in half.
+//! As of Fase 32's own close, every software-side explanation *within
+//! this driver's own code* had been ruled out with a real experiment,
+//! not just argued away - the reasoning traced the write-then-writeback
+//! path completely and found no gap, yet the observed behavior
+//! contradicted it. That contradiction was itself the honest state to
+//! report at the time, rather than papered over.
+//!
+//! **The actual root cause (Fase 44): PCI Bus Mastering was never
+//! enabled.** Found by reading QEMU's source for an *unrelated* reason -
+//! investigating real RX support, whose own readiness check
+//! (`e1000x_rx_ready` in `hw/net/e1000x_common.c`) explicitly requires
+//! `d->config[PCI_COMMAND] & PCI_COMMAND_MASTER` - which led to tracing
+//! how that same bit affects the *TX* path too, just far less visibly:
+//! `hw/pci/pci.c`'s `pci_default_write_config` calls `pci_set_master`
+//! whenever a config write touches the Command register, which toggles
+//! `memory_region_set_enabled(&d->bus_master_enable_region, enable)` -
+//! and *every* `pci_dma_read`/`pci_dma_write` call (`txdesc_writeback`'s
+//! DD-bit write among them) routes through exactly that region via
+//! `pci_get_address_space(dev)` → `dev->bus_master_as`. A real PCI/PCIe
+//! device starts with bus mastering *disabled* after reset (a genuine
+//! safety property, not a QEMU quirk - an unconfigured device shouldn't
+//! be able to DMA into arbitrary memory), and system software is
+//! expected to enable it explicitly once ready to drive the device. This
+//! driver never had - `pci.rs` was read-only by design until Fase 44
+//! added `PciDevice::enable_bus_mastering`, now called at the top of
+//! `send_test_frame`, right after finding the device.
+//!
+//! This explains the exact symptom both investigation rounds
+//! documented, precisely: `TDH` is an internal register QEMU updates
+//! directly in its own state (`s->mac_reg[TDH]`), never a guest-memory
+//! DMA write, so it was completely unaffected by bus mastering and
+//! always advanced correctly - while the DD status bit is written back
+//! via `pci_dma_write`, which silently had nowhere real to land with
+//! `bus_master_enable_region` disabled. Confirmed, not just plausible:
+//! adding the one `enable_bus_mastering()` call and nothing else made
+//! `send_test_frame` succeed - `DD` sets, identically across 3 repeated
+//! boots, zero other change to the ring/descriptor/register-write logic
+//! extensively verified correct across both prior rounds. Neither
+//! investigation round missed something *wrong* in this driver's own
+//! code - both were correct that the write-then-writeback path, as
+//! written, had no bug; the missing piece was a real device-bring-up
+//! step this driver had simply never performed, one level below
+//! anything either round's tracing had reason to inspect.
+//!
+//! **RX implication**: `e1000x_rx_ready`'s explicit `pci_master` check
+//! (unlike TX's, buried in shared DMA plumbing rather than a named
+//! condition) means bus mastering is very likely a hard prerequisite for
+//! any future real RX work too, not just a TX fix - worth remembering
+//! before assuming a from-scratch RX attempt would need its own,
+//! separate investigation into a similar-looking stall.
 
 use crate::pci::{self, PciDevice};
 use crate::vga_buffer::PHYS_MEM_OFFSET;
@@ -311,17 +344,21 @@ pub fn probe() {
 /// hardware, and polls the descriptor's own DD (Descriptor Done) status
 /// bit.
 ///
-/// **Read the module doc's "known limitation" section before assuming
-/// this fully works**: `TDH` (proven, via direct register read) really
-/// does advance the instant `TDT` is written, confirming the hardware
-/// genuinely dequeues the descriptor - but `DD` has never been observed
-/// to actually get set in local testing, across several independently
-/// tested hypotheses. This function currently always returns `Err`; it's
-/// kept and documented as real, verified partial progress rather than
-/// reverted, since the ring-engagement part *is* newly proven working.
+/// **Fully confirmed working as of Fase 44** - see the module doc's "TX
+/// DD-bit mystery, resolved" section for the two-round investigation and
+/// its actual resolution (`enable_bus_mastering`, called below). `TDH`
+/// (an internal register update) always advanced correctly; `DD` (a real
+/// DMA write to guest memory) had nowhere to land without PCI bus
+/// mastering enabled - the one real device-bring-up step this driver had
+/// never performed.
 pub fn send_test_frame() -> Result<(), &'static str> {
     let (dev, mmio_base) = find_mmio_base()?;
-    let _ = dev; // kept for a future success-path message once DD is resolved
+    // Fase 44: the one real PCI bring-up step this driver had never done.
+    // See `PciDevice::enable_bus_mastering`'s own doc for why tracing
+    // QEMU's source all the way down to `bus_master_enable_region` made
+    // this a genuinely plausible explanation for the DD-bit mystery
+    // below, not just routine completeness.
+    dev.enable_bus_mastering();
     let src_mac = read_mac(mmio_base);
 
     let ring_frame = crate::memory::frame_allocator::allocate_frame();

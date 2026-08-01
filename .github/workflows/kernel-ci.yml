@@ -237,17 +237,17 @@ jobs:
           # genuinely reached hardware rather than garbage.
           grep -q "E1000\] found 00:03.0 bar0=0x" boot.log
           grep -q "mac=52:54:00:12:34:56 valid=true" boot.log
-          # e1000 TX (Fase 22) is a documented, honest partial result (see
-          # net/e1000.rs's module doc): the ring genuinely engages the
-          # hardware (TDH advances) but DD confirmation doesn't happen yet
-          # for a reason that remains unresolved. This checks that the
-          # bounded poll actually completes and control returns to
-          # main.rs (proven by every later self-test below still running)
-          # rather than silently regressing into a true hang - both would
-          # otherwise look identical from the outside (the same
-          # timeout-based exit code the healthy end-of-boot idle loop
-          # already produces).
-          grep -q "E1000\] tx_sent -> not yet confirmed" boot.log
+          # e1000 TX (Fase 22, fully confirmed working Fase 44) - the ring
+          # genuinely engages the hardware (TDH advances) AND the
+          # descriptor's DD status bit now gets written back too, since
+          # PciDevice::enable_bus_mastering finally enables the one real
+          # PCI bring-up step (Bus Master Enable) this driver had never
+          # performed - see net/e1000.rs's module doc for the two-round
+          # investigation and its actual resolution. dd=true is the
+          # strongest possible check here: not just that the bounded poll
+          # completed and control returned to main.rs, but that the
+          # hardware's own completion signal genuinely arrived.
+          grep -q "E1000\] tx_sent 42 bytes dd=true" boot.log
           # Confirms the new ATA write path (Fase 23) genuinely wrote and
           # read back matching bytes - not just that write_sector()
           # returned without erroring. Deliberately NOT asserting the

@@ -361,14 +361,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // 7b-3. Real e1000 TX attempt: build a real transmit descriptor ring
     // (using fresh physical frames from the global allocator - Fase 21)
-    // and hand a real ARP request to the hardware. Genuinely proven: the
-    // ring's physical address and descriptor content are correct, and the
-    // hardware really dequeues the descriptor (TDH advances). NOT yet
-    // resolved: the descriptor's Descriptor-Done status bit never gets
-    // written back in local testing, despite several independently ruled-
-    // out hypotheses - see net/e1000.rs's module doc for the full
-    // investigation. This currently always returns Err; kept and reported
-    // honestly as real partial progress, not reverted.
+    // and hand a real ARP request to the hardware. Fully confirmed
+    // working as of Fase 44: the ring's physical address and descriptor
+    // content are correct, the hardware genuinely dequeues the
+    // descriptor (TDH advances), AND the Descriptor-Done status bit now
+    // gets written back too - see net/e1000.rs's module doc for the
+    // two-round investigation and its actual resolution
+    // (`PciDevice::enable_bus_mastering` - PCI Bus Mastering was never
+    // enabled, so the DMA write had nowhere real to land).
     match net::e1000::send_test_frame() {
         Ok(()) => {}
         Err(e) => {
