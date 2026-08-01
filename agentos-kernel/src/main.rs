@@ -1332,6 +1332,43 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     serial_println!("[VIRTIO] tx_test error={}", e);
                 }
             }
+
+            // 7b-2-5. Sets up the RX virtqueue (index 0) and arms one
+            // real, write-only receive descriptor - the RX equivalent
+            // of 7b-2-3's TX queue setup (Fase 63), following the same
+            // two-step shape TX itself took (ring setup here, then a
+            // real received-frame proof as separate follow-on work).
+            // desc_write_flag_ok confirms the descriptor's flags word
+            // reads back VRING_DESC_F_WRITE, not just that the write
+            // didn't crash - the one genuinely new piece beyond TX's
+            // own descriptor (which uses flags=0, read-only).
+            kprintln!("[VIRTIO INIT] Setting up RX virtqueue...");
+            match net::virtio::init_rx_queue(&info) {
+                Ok(rx) => {
+                    let rx_pfn_ok = rx.pfn_readback == rx.pfn;
+                    let desc_write_flag_ok = rx.desc_flags_readback == 2;
+                    kprintln!(
+                        "[VIRTIO RXQ] queue_num={} frames_needed={} pfn_ok={} desc_write_flag_ok={} avail_idx_after={}",
+                        rx.queue_num,
+                        rx.frames_needed,
+                        rx_pfn_ok,
+                        desc_write_flag_ok,
+                        rx.avail_idx_after
+                    );
+                    serial_println!(
+                        "[VIRTIO] rxq_test queue_num={} frames_needed={} pfn_ok={} desc_write_flag_ok={} avail_idx_after={}",
+                        rx.queue_num,
+                        rx.frames_needed,
+                        rx_pfn_ok,
+                        desc_write_flag_ok,
+                        rx.avail_idx_after
+                    );
+                }
+                Err(e) => {
+                    kprintln!("[VIRTIO RXQ] {}", e);
+                    serial_println!("[VIRTIO] rxq_test error={}", e);
+                }
+            }
         }
         Err(e) => {
             kprintln!("[VIRTIO TXQ] {}", e);

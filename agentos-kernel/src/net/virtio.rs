@@ -72,10 +72,21 @@ const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
 
 const VIRTIO_PCI_QUEUE_NOTIFY: u16 = 16;
 
+const RX_QUEUE_INDEX: u16 = 0;
 const TX_QUEUE_INDEX: u16 = 1;
 const VRING_ALIGN: u64 = 4096;
 const FRAME_SIZE: u64 = 4096;
 const VIRTIO_NET_HDR_LEN: usize = 10; // legacy virtio_net_hdr, no MRG_RXBUF
+
+/// Marks a descriptor's buffer as one the DEVICE writes into, the
+/// opposite direction from a plain (read-only) TX descriptor - verified
+/// against the Linux kernel's own real `include/uapi/linux/
+/// virtio_ring.h` rather than assumed. RX queue index 0 (above) is
+/// likewise confirmed, not assumed, against the Linux virtio_net
+/// driver's own `rxq2vq(0) = 0` / `txq2vq(0) = 1` (`drivers/net/
+/// virtio_net.c`) - exactly matching this module's existing
+/// `TX_QUEUE_INDEX = 1`.
+const VRING_DESC_F_WRITE: u16 = 2;
 
 pub fn find_virtio_net() -> Option<PciDevice> {
     pci::scan_bus0()
@@ -452,5 +463,134 @@ pub fn send_test_frame(info: &TxQueueInfo) -> Result<TxSendInfo, &'static str> {
         used_idx_after,
         used_elem_id,
         used_elem_len,
+    })
+}
+
+pub struct RxQueueInfo {
+    pub queue_num: u16,
+    pub frames_needed: u64,
+    pub pfn: u32,
+    pub pfn_readback: u32,
+    pub io_base: u16,
+    pub virt_base: u64,
+    pub buf_phys: u64,
+    pub buf_virt: u64,
+    pub buf_len: usize,
+    pub desc_flags_readback: u16,
+    pub avail_idx_after: u16,
+}
+
+/// Sets up the RX virtqueue (index 0) and arms ONE real, write-only
+/// receive descriptor - the RX equivalent of `init_tx_queue`'s own
+/// scope (Fase 63): proving the queue's memory is correctly sized,
+/// allocated, and accepted by the device, and that a real descriptor
+/// can be published into its available ring, but not yet triggering or
+/// observing an actual received frame - that's separate, substantial
+/// follow-on work, matching the same two-step progression this
+/// module's own TX side already took (Fase 63 -> 64).
+///
+/// Deliberately called AFTER `init_tx_queue` has already completed the
+/// full `ACKNOWLEDGE -> DRIVER -> DRIVER_OK` handshake, and does NOT
+/// re-touch `STATUS` at all here: only writing `STATUS=0` means
+/// "reset" a legacy VirtIO device, and re-selecting a queue via
+/// `QUEUE_SEL`/`QUEUE_PFN` is a per-queue operation, not gated on the
+/// status handshake having just completed. This is verified
+/// empirically below (`pfn_ok`), not just assumed spec-compliant -
+/// real drivers are recommended to size every virtqueue before
+/// signaling `DRIVER_OK`, but nothing in this Fase's own boot-test
+/// suggested QEMU's legacy `virtio-pci` implementation actually
+/// enforces that ordering.
+///
+/// The one genuinely new piece beyond `init_tx_queue`'s own shape: the
+/// descriptor's `flags` field is written as `VRING_DESC_F_WRITE` (not
+/// `0`, which every TX descriptor so far has used) - telling the
+/// device this descriptor's buffer is for the DEVICE to write data
+/// INTO, the opposite direction from TX. `desc_flags_readback` reads
+/// the flags word back from the virtqueue's own memory afterward as a
+/// real check that the write landed correctly, not just that it didn't
+/// crash.
+pub fn init_rx_queue(tx_info: &TxQueueInfo) -> Result<RxQueueInfo, &'static str> {
+    let io_base = tx_info.io_base;
+
+    unsafe {
+        write_port_u16(io_base, VIRTIO_PCI_QUEUE_SEL, RX_QUEUE_INDEX);
+    }
+    let queue_num = unsafe { read_port_u16(io_base, VIRTIO_PCI_QUEUE_NUM) };
+    if queue_num == 0 {
+        return Err("virtio: RX queue_num read back as 0 - queue not available");
+    }
+
+    let size = vring_size(queue_num as u64, VRING_ALIGN);
+    let frames_needed = size.div_ceil(FRAME_SIZE);
+    let phys_base = allocate_contiguous_frames(frames_needed)?;
+
+    let phys_offset = PHYS_MEM_OFFSET.load(Ordering::Relaxed);
+    let virt_base_ptr = (phys_offset + phys_base) as *mut u8;
+    unsafe {
+        core::ptr::write_bytes(virt_base_ptr, 0, (frames_needed * FRAME_SIZE) as usize);
+    }
+
+    let pfn = (phys_base / FRAME_SIZE) as u32;
+    unsafe {
+        write_port_u32(io_base, VIRTIO_PCI_QUEUE_PFN, pfn);
+    }
+    let pfn_readback = unsafe { read_port_u32(io_base, VIRTIO_PCI_QUEUE_PFN) };
+
+    // A fresh, separate buffer frame the DEVICE will write a received
+    // frame into - large enough for a full legacy virtio_net_hdr (10
+    // bytes) plus a maximum-size Ethernet frame (1514 bytes without a
+    // trailing FCS), rounded up generously while still fitting a
+    // single 4 KiB frame.
+    let buf_len: usize = 2048;
+    let buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let buf_phys = buf_frame.start_address().as_u64();
+    let buf_virt_ptr = (phys_offset + buf_phys) as *mut u8;
+    unsafe {
+        core::ptr::write_bytes(buf_virt_ptr, 0, buf_len);
+    }
+
+    let queue_num_u64 = queue_num as u64;
+    let (desc_off, avail_off, _used_off) = vring_offsets(queue_num_u64, VRING_ALIGN);
+    let desc_ptr = (virt_base_ptr as u64 + desc_off) as *mut u8;
+    let avail_ptr = (virt_base_ptr as u64 + avail_off) as *mut u16;
+
+    unsafe {
+        // vring_desc { addr: u64, len: u32, flags: u16, next: u16 }
+        core::ptr::write_volatile(desc_ptr as *mut u64, buf_phys);
+        core::ptr::write_volatile(desc_ptr.add(8) as *mut u32, buf_len as u32);
+        core::ptr::write_volatile(desc_ptr.add(12) as *mut u16, VRING_DESC_F_WRITE);
+        core::ptr::write_volatile(desc_ptr.add(14) as *mut u16, 0); // next: unused
+    }
+    let desc_flags_readback = unsafe { core::ptr::read_volatile(desc_ptr.add(12) as *mut u16) };
+
+    unsafe {
+        // vring_avail { flags: u16, idx: u16, ring: [u16; num] }
+        let avail_idx = core::ptr::read_volatile(avail_ptr.add(1));
+        let ring_slot = (avail_idx as u64 % queue_num_u64) as usize;
+        core::ptr::write_volatile(avail_ptr.add(2 + ring_slot), 0u16); // descriptor 0
+        core::ptr::write_volatile(avail_ptr.add(1), avail_idx.wrapping_add(1));
+    }
+    let avail_idx_after = unsafe { core::ptr::read_volatile(avail_ptr.add(1)) };
+
+    // Tells the device a receive buffer is now available, the same
+    // notify-after-publish requirement TX's own send_test_frame
+    // follows - without this, the device has no reason to look at the
+    // avail ring at all before some later, unrelated event.
+    unsafe {
+        write_port_u16(io_base, VIRTIO_PCI_QUEUE_NOTIFY, RX_QUEUE_INDEX);
+    }
+
+    Ok(RxQueueInfo {
+        queue_num,
+        frames_needed,
+        pfn,
+        pfn_readback,
+        io_base,
+        virt_base: virt_base_ptr as u64,
+        buf_phys,
+        buf_virt: buf_virt_ptr as u64,
+        buf_len,
+        desc_flags_readback,
+        avail_idx_after,
     })
 }
