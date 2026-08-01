@@ -496,6 +496,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // 7b-8. Test a real, complete `ping` (Fase 49) - converges arp_resolve
+    // (Fase 48, resolves the destination MAC) and net::icmp (Fase 47,
+    // builds/parses the actual IPv4+ICMP bytes) into the first complete,
+    // real, routable IP packet this kernel has ever assembled and sent -
+    // not just a raw Ethernet-level test frame. Pings the same known
+    // gateway (10.0.2.2) arp_resolve just resolved. Honestly uncertain
+    // going in whether SLIRP actually answers ICMP echo (never attempted
+    // before this Fase) - see net::e1000::ping's own doc for why this is
+    // expected to work, not assumed.
+    kprintln!("[KERNEL INIT] Testing a real, complete ping (net::e1000::ping)...");
+    match net::e1000::ping([10, 0, 2, 2]) {
+        Ok(()) => {}
+        Err(e) => {
+            kprintln!("[E1000] ping(10.0.2.2): {}", e);
+            serial_println!("[E1000] ping_test -> FAILED: {}", e);
+        }
+    }
+
+    // 7b-9. Test the new `ping` shell command (Fase 49) - the same "prove
+    // the API, then prove the shell path" pattern this session used for
+    // netcheck (Fase 46).
+    shell::dispatch_command("ping 10.0.2.2");
+
     shell::dispatch_command("disk");
     shell::dispatch_command("ls");
     shell::dispatch_command("cat KERNEL~1");

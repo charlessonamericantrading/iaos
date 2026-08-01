@@ -300,6 +300,27 @@ jobs:
           # NIC's own hardcoded default MAC, per the Fase 15/19 CI-
           # portability lesson).
           grep -q "E1000\] arp_resolve_test target=10.0.2.2 mac=\[52, 55, 0a, 00, 02, 02\] matches_known_gateway_mac=true" boot.log
+          # Confirms a real, complete ping (Fase 49, net::e1000::ping) -
+          # the convergence of arp_resolve (Fase 48) and net::icmp (Fase
+          # 47) into the first full, real, routable IP packet this kernel
+          # has ever sent. reply=true means a genuine ICMP echo reply was
+          # parsed and verified (EtherType IPv4, IPv4 protocol ICMP with a
+          # valid header checksum, source matching the pinged host, and an
+          # ICMP echo reply - not request - whose identifier/sequence
+          # match what was sent) - not just that something arrived.
+          # Deliberately NOT asserting the exact rtt_ticks value: real
+          # timing could plausibly differ on the CI runner's environment,
+          # the same portability lesson Fase 15/19 already established for
+          # other environment-dependent numbers. Expected exactly twice -
+          # the direct self-test call and the `ping` shell command
+          # (Fase 49) reaching the identical underlying function through
+          # the real dispatch_command parsing path, same "prove the API,
+          # then prove the shell path" pattern as netcheck (Fase 46).
+          if [ "$(grep -c 'E1000\] ping target=\[10, 0, 2, 2\] reply=true' boot.log)" -ne 2 ]; then
+            echo "PING REGRESSION: expected exactly 2 successful ping replies (direct + shell), got $(grep -c 'E1000\] ping target=\[10, 0, 2, 2\] reply=true' boot.log)."
+            exit 1
+          fi
+          grep -q "SHELL\] ping 10.0.2.2 -> ok" boot.log
           # Confirms the new ATA write path (Fase 23) genuinely wrote and
           # read back matching bytes - not just that write_sector()
           # returned without erroring. Deliberately NOT asserting the

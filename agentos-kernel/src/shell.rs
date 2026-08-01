@@ -20,10 +20,10 @@ pub fn dispatch_command(line: &str) {
     match cmd {
         "help" => {
             kprintln!(
-                "Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, netcheck, clear"
+                "Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, netcheck, ping, clear"
             );
             serial_println!(
-                "[SHELL] help -> Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, netcheck, clear"
+                "[SHELL] help -> Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, netcheck, ping, clear"
             );
         }
         "ps" => {
@@ -341,6 +341,25 @@ pub fn dispatch_command(line: &str) {
                 }
             }
         }
+        "ping" => {
+            let ip_str = parts.next().unwrap_or("");
+            match parse_ipv4(ip_str) {
+                Some(target_ip) => match crate::net::e1000::ping(target_ip) {
+                    Ok(()) => {
+                        kprintln!("Ping to {}: real ICMP echo reply received.", ip_str);
+                        serial_println!("[SHELL] ping {} -> ok", ip_str);
+                    }
+                    Err(e) => {
+                        kprintln!("ping: {}", e);
+                        serial_println!("[SHELL] ping {} -> FAILED: {}", ip_str, e);
+                    }
+                },
+                None => {
+                    kprintln!("ping: usage: ping A.B.C.D");
+                    serial_println!("[SHELL] ping -> invalid or missing IP: '{}'", ip_str);
+                }
+            }
+        }
         "clear" => {
             crate::vga_buffer::clear_screen();
             serial_println!("[SHELL] clear -> VGA screen cleared");
@@ -457,6 +476,22 @@ fn split_path(path: &str) -> Result<(alloc::vec::Vec<&str>, &str), &'static str>
         .pop()
         .expect("split('/') always yields at least one segment");
     Ok((segments, name))
+}
+
+/// Parses a dotted-decimal IPv4 address ("A.B.C.D") for `ping`.
+/// Deliberately minimal - no IPv6, no hostnames - matching how this
+/// shell's other parsing (e.g. `touch`'s content join) only ever handles
+/// exactly what a real person typing a plain command needs.
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut parts = s.split('.');
+    for octet in octets.iter_mut() {
+        *octet = parts.next()?.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None; // more than 4 dot-separated parts
+    }
+    Some(octets)
 }
 
 /// Resolves a sequence of directory names, walked in order from the

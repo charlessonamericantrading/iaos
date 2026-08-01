@@ -4,7 +4,7 @@
 //! vendor:device 8086:100e - confirmed present via `pci.rs`'s real
 //! enumeration (see README/Fase 11).
 //!
-//! Four stages so far:
+//! Five stages so far:
 //! - `probe()` (Fase 19): find the device, reach its registers, read a
 //!   couple back (STATUS, MAC via RAL0/RAH0) - proof this kernel can
 //!   genuinely talk to real device MMIO at all.
@@ -23,6 +23,9 @@
 //!   to resolve *any* target IP's MAC, not just SLIRP's hardcoded
 //!   gateway - the prerequisite a real `ping` (see `net::icmp`, Fase 47)
 //!   needs before it can address an Ethernet frame at all.
+//! - `ping()` (Fase 49): converges `arp_resolve` and `net::icmp` - the
+//!   first complete, real, routable IP packet this kernel has ever
+//!   assembled and sent, not just a raw Ethernet-level test frame.
 //!
 //! ## Why no new page-table mapping code was needed
 //! The e1000's BAR0 is a *memory-mapped* register window (not I/O-port
@@ -884,4 +887,227 @@ pub fn arp_resolve(target_ip: [u8; 4]) -> Result<[u8; 6], &'static str> {
         unsafe { read_reg(mmio_base, REG_RDT) }
     );
     Err("arp_resolve: timed out waiting for a matching ARP reply")
+}
+
+/// Sends a single real ICMP echo request to `target_ip` and waits for a
+/// genuine echo reply - the natural convergence of `arp_resolve` (Fase 48,
+/// resolves the destination MAC) and `net::icmp` (Fase 47, builds/parses
+/// the actual IPv4+ICMP bytes, pure logic with no hardware dependency of
+/// its own). This is the first time this kernel has assembled and sent a
+/// complete, real, routable IP packet - not just a raw Ethernet-level test
+/// frame like `send_test_frame`'s ARP request. A new, independent
+/// function, same reasoning as `arp_resolve` itself: `send_test_frame`/
+/// `receive_test_frame`'s exact behavior and log output stay untouched.
+///
+/// Honestly uncertain going in, the same way Fase 45's first RX attempt
+/// was: SLIRP is confirmed to answer ARP for its own gateway (Fase 45/48),
+/// but this is the first time this kernel has ever asked it to answer a
+/// *ping* - expected to work (replying to an ICMP echo addressed to its
+/// own IP is about as basic as an IP stack gets), but not proven before
+/// this function's own test exercises it for real.
+pub fn ping(target_ip: [u8; 4]) -> Result<(), &'static str> {
+    use crate::net::icmp;
+
+    let dest_mac = arp_resolve(target_ip)?;
+    let (dev, mmio_base) = find_mmio_base()?;
+    dev.enable_bus_mastering();
+    let src_mac = read_mac(mmio_base);
+    const SRC_IP: [u8; 4] = [10, 0, 2, 15]; // SLIRP guest default
+    const IDENTIFIER: u16 = 0xABCD;
+    const SEQUENCE: u16 = 1;
+
+    let icmp_message = icmp::build_icmp_echo(false, IDENTIFIER, SEQUENCE, b"AgentOS real ping");
+    let ipv4_header = icmp::build_ipv4_header(
+        1,
+        64,
+        icmp::IP_PROTOCOL_ICMP,
+        SRC_IP,
+        target_ip,
+        icmp_message.len(),
+    );
+    let eth_header = icmp::build_ethernet_header(dest_mac, src_mac, icmp::ETHERTYPE_IPV4);
+
+    let mut frame: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(
+        icmp::ETHERNET_HEADER_LEN + icmp::IPV4_HEADER_LEN + icmp_message.len(),
+    );
+    frame.extend_from_slice(&eth_header);
+    frame.extend_from_slice(&ipv4_header);
+    frame.extend_from_slice(&icmp_message);
+
+    let rx_ring_frame = crate::memory::frame_allocator::allocate_frame();
+    let rx_buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let tx_ring_frame = crate::memory::frame_allocator::allocate_frame();
+    let tx_buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let phys_offset = PHYS_MEM_OFFSET.load(Ordering::Relaxed);
+    let rx_ring_virt = (phys_offset + rx_ring_frame.start_address().as_u64()) as *mut RxDescriptor;
+    let tx_ring_virt = (phys_offset + tx_ring_frame.start_address().as_u64()) as *mut TxDescriptor;
+    let tx_buf_virt = (phys_offset + tx_buf_frame.start_address().as_u64()) as *mut u8;
+
+    // Arm RX first, same ordering reasoning as arp_resolve/receive_test_frame.
+    unsafe {
+        let empty_rx = RxDescriptor {
+            addr: 0,
+            length: 0,
+            checksum: 0,
+            status: 0,
+            errors: 0,
+            special: 0,
+        };
+        for i in 0..NUM_RX_DESCRIPTORS {
+            core::ptr::write_volatile(rx_ring_virt.add(i), empty_rx);
+        }
+        core::ptr::write_volatile(
+            rx_ring_virt,
+            RxDescriptor {
+                addr: rx_buf_frame.start_address().as_u64(),
+                length: 0,
+                checksum: 0,
+                status: 0,
+                errors: 0,
+                special: 0,
+            },
+        );
+        let rx_ring_phys = rx_ring_frame.start_address().as_u64();
+        write_reg(mmio_base, REG_RDBAL, (rx_ring_phys & 0xFFFF_FFFF) as u32);
+        write_reg(mmio_base, REG_RDBAH, (rx_ring_phys >> 32) as u32);
+        write_reg(mmio_base, REG_RDLEN, (NUM_RX_DESCRIPTORS * 16) as u32);
+        write_reg(mmio_base, REG_RDH, 0);
+        write_reg(mmio_base, REG_RDT, 1);
+        write_reg(mmio_base, REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(frame.as_ptr(), tx_buf_virt, frame.len());
+
+        let empty_tx = TxDescriptor {
+            addr: 0,
+            length: 0,
+            cso: 0,
+            cmd: 0,
+            status: 0,
+            css: 0,
+            special: 0,
+        };
+        for i in 0..NUM_TX_DESCRIPTORS {
+            core::ptr::write_volatile(tx_ring_virt.add(i), empty_tx);
+        }
+        core::ptr::write_volatile(
+            tx_ring_virt,
+            TxDescriptor {
+                addr: tx_buf_frame.start_address().as_u64(),
+                length: frame.len() as u16,
+                cso: 0,
+                cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
+                status: 0,
+                css: 0,
+                special: 0,
+            },
+        );
+
+        let ctrl = read_reg(mmio_base, REG_CTRL);
+        write_reg(mmio_base, REG_CTRL, ctrl | CTRL_SLU);
+
+        let tx_ring_phys = tx_ring_frame.start_address().as_u64();
+        write_reg(mmio_base, REG_TDBAL, (tx_ring_phys & 0xFFFF_FFFF) as u32);
+        write_reg(mmio_base, REG_TDBAH, (tx_ring_phys >> 32) as u32);
+        write_reg(mmio_base, REG_TDLEN, (NUM_TX_DESCRIPTORS * 16) as u32);
+        write_reg(mmio_base, REG_TDH, 0);
+        write_reg(mmio_base, REG_TDT, 0);
+        write_reg(mmio_base, REG_TIPG, TIPG_DEFAULT);
+        write_reg(
+            mmio_base,
+            REG_TCTL,
+            TCTL_EN | TCTL_PSP | TCTL_CT_DEFAULT | TCTL_COLD_FULL_DUPLEX,
+        );
+        write_reg(mmio_base, REG_TDT, 1);
+    }
+
+    let tx_start_tick = crate::interrupts::timer_ticks();
+    let mut tx_ok = false;
+    unsafe {
+        loop {
+            let status = core::ptr::read_volatile(core::ptr::addr_of!((*tx_ring_virt).status));
+            if status & TXD_STATUS_DD != 0 {
+                tx_ok = true;
+                break;
+            }
+            if crate::interrupts::timer_ticks() - tx_start_tick > 90 {
+                break;
+            }
+            x86_64::instructions::hlt();
+        }
+    }
+    if !tx_ok {
+        return Err("ping: TX timed out waiting for descriptor DD");
+    }
+
+    let rx_start_tick = crate::interrupts::timer_ticks();
+    unsafe {
+        loop {
+            let status = core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).status));
+            if status & RXD_STAT_DD != 0 {
+                let length =
+                    core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).length)) as usize;
+                let buf_virt = (phys_offset + rx_buf_frame.start_address().as_u64()) as *const u8;
+                let data = core::slice::from_raw_parts(buf_virt, length);
+
+                // Ethernet: EtherType IPv4. IPv4: protocol ICMP, header
+                // checksum valid, source address is the host being
+                // pinged (its reply, addressed back to us). Each check
+                // is independent real evidence, not just "something
+                // arrived" - a malformed or unrelated frame would very
+                // likely fail at least one.
+                let ip_start = icmp::ETHERNET_HEADER_LEN;
+                let icmp_start = ip_start + icmp::IPV4_HEADER_LEN;
+                let is_our_reply = data.len() > icmp_start
+                    && data[12] == 0x08
+                    && data[13] == 0x00
+                    && data[ip_start + 9] == icmp::IP_PROTOCOL_ICMP
+                    && icmp::checksum_is_valid(&data[ip_start..icmp_start])
+                    && data[ip_start + 12..ip_start + 16] == target_ip;
+
+                if is_our_reply {
+                    if let Ok(info) = icmp::parse_icmp_echo(&data[icmp_start..]) {
+                        if info.is_reply
+                            && info.identifier == IDENTIFIER
+                            && info.sequence == SEQUENCE
+                        {
+                            let rtt_ticks = crate::interrupts::timer_ticks() - rx_start_tick;
+                            kprintln!(
+                                "[E1000] ping to {:?}: real ICMP echo reply received (rtt~{} ticks)",
+                                target_ip,
+                                rtt_ticks
+                            );
+                            serial_println!(
+                                "[E1000] ping target={:?} reply=true rtt_ticks={}",
+                                target_ip,
+                                rtt_ticks
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+
+                // Not our reply - rearm this same descriptor and keep
+                // polling, same reasoning as arp_resolve.
+                core::ptr::write_volatile(
+                    rx_ring_virt,
+                    RxDescriptor {
+                        addr: rx_buf_frame.start_address().as_u64(),
+                        length: 0,
+                        checksum: 0,
+                        status: 0,
+                        errors: 0,
+                        special: 0,
+                    },
+                );
+                write_reg(mmio_base, REG_RDT, 1);
+            }
+            if crate::interrupts::timer_ticks() - rx_start_tick > 90 {
+                break;
+            }
+            x86_64::instructions::hlt();
+        }
+    }
+    Err("ping: timed out waiting for a genuine ICMP echo reply")
 }
