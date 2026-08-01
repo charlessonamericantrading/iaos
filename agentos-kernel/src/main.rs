@@ -133,20 +133,41 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // DPL bits read back as 3 in isolation). count_delta==1 is genuine
     // proof the handler ran exactly once, not a coincidental read of an
     // already-nonzero counter or a silently-swallowed fault.
-    kprintln!("[KERNEL INIT] Testing DPL=3 syscall gate (int 0x80)...");
+    //
+    // Fase 72 strengthens this same call site: rax/rdi/rsi/rdx are now
+    // pinned to known values (SYS_SERIAL_PRINT, 0, 0, 0) instead of
+    // whatever happened to be left over from earlier code, and the real
+    // return value comes back in rax - proving the new naked
+    // `syscall_entry_asm` genuinely reads real registers and dispatches
+    // to the real `syscall::dispatch_syscall`, not just that the gate
+    // fires. Pinning the inputs explicitly (rather than leaving them as
+    // whatever garbage preceded this point) keeps this test
+    // deterministic across builds, and avoids ever hitting
+    // dispatch_syscall's "Unknown System Call Number" arm by accident.
+    kprintln!("[KERNEL INIT] Testing DPL=3 syscall gate (int 0x80, real args)...");
     let syscall_int_count_before = interrupts::syscall_int_count();
+    let mut syscall_rax: u64 = syscall::SYS_SERIAL_PRINT;
     unsafe {
-        core::arch::asm!("int 0x80", options(nomem, nostack));
+        core::arch::asm!(
+            "int 0x80",
+            inout("rax") syscall_rax,
+            in("rdi") 0u64,
+            in("rsi") 0u64,
+            in("rdx") 0u64,
+            options(nostack)
+        );
     }
     let syscall_int_count_after = interrupts::syscall_int_count();
     let syscall_int_count_delta = syscall_int_count_after - syscall_int_count_before;
     kprintln!(
-        "[KERNEL INIT] Resumed after int 0x80 - count_delta={}",
-        syscall_int_count_delta
+        "[KERNEL INIT] Resumed after int 0x80 - count_delta={} returned={}",
+        syscall_int_count_delta,
+        syscall_rax
     );
     serial_println!(
-        "[IDT] syscall_int_test count_delta={}",
-        syscall_int_count_delta
+        "[IDT] syscall_int_test count_delta={} dispatch_ret={}",
+        syscall_int_count_delta,
+        syscall_rax
     );
 
     // 2c. Remap the 8259 PIC & Enable Hardware Interrupts

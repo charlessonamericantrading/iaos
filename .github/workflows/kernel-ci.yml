@@ -96,13 +96,18 @@ jobs:
           # bits read back as 3 in isolation). count_delta=1 is genuine
           # proof the handler ran exactly once - not a coincidental
           # read of an already-nonzero counter, and not a silently
-          # swallowed fault. Deliberately minimal: no register-reading
-          # or real syscall dispatch wiring yet (extern "x86-interrupt"
-          # handlers don't receive the caller's general-purpose
-          # registers as parameters the way a normal calling convention
-          # would - that needs inline asm or a hand-written naked
-          # wrapper, real, separate follow-on work).
-          grep -q "IDT\] syscall_int_test count_delta=1" boot.log
+          # swallowed fault.
+          # dispatch_ret=0 (Fase 72) strengthens this same check: the
+          # gate is no longer a trivial counter bump - `int 0x80` now
+          # runs through a hand-written `#[unsafe(naked)]` entry stub
+          # (syscall_entry_asm) that reads the real RAX/RDI/RSI/RDX this
+          # ring-0 self-test explicitly pins (SYS_SERIAL_PRINT, 0, 0, 0)
+          # and dispatches to the real syscall::dispatch_syscall, whose
+          # real return value (0) comes back correctly in RAX across the
+          # full round trip - not the old extern "x86-interrupt" handler,
+          # which never had register access at all (see interrupts.rs's
+          # own doc for why that ABI can't provide it).
+          grep -q "IDT\] syscall_int_test count_delta=1 dispatch_ret=0" boot.log
           grep -q "\[PIC\] 8259 remapped to vectors 32-47" boot.log
           # Confirms a real, dedicated user-accessible page mapping
           # (Fase 70, the third step of the ring-3 arc after Fase 68's
@@ -140,6 +145,14 @@ jobs:
           # temporarily invoked, since removed before commit) - see
           # ring3.rs's own module doc and README.md's GDT/IDT row for
           # the full verification story and reasoning.
+          # Fase 72 (a real ring-3-originated syscall, ring3.rs's own
+          # run_ring3_syscall_test / the `ring3syscall` shell command)
+          # is, for the exact same reason, ALSO deliberately NOT
+          # asserted here - it too ends in the same permanent, expected
+          # halt (a real int-0x80 round trip first, then the same
+          # deliberate `cli` fault as ring3test). Verified the same way:
+          # a real, repeatable LOCAL test (3x, byte-for-byte identical
+          # results), temporarily invoked, since removed before commit.
           # Confirms the global frame allocator hands out real, distinct,
           # genuinely writable/readable physical frames (verified=true is
           # only printed if all 3 write/read-back checks passed - a

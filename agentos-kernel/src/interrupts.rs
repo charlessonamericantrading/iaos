@@ -5,7 +5,7 @@ use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
-use x86_64::PrivilegeLevel;
+use x86_64::{PrivilegeLevel, VirtAddr};
 
 /// Monotonic count of real timer ticks since boot. A simple counter, so a
 /// plain `AtomicU64` (unlike the context-switch code's `saved_rsp` fields)
@@ -92,17 +92,18 @@ lazy_static! {
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt[ATA_PRIMARY_IRQ_VECTOR].set_handler_fn(ata_primary_interrupt_handler);
         // DPL=3, unlike every entry above (all default to DPL=0) - the
-        // one deliberate exception, since this is meant to eventually be
-        // a real, controlled entry point FROM ring-3 code, not just
-        // another kernel-internal handler. Verified for real below (Fase
-        // 69's own self-test actually executes `int 0x80`, from ring-0
-        // for now since no ring-3 code exists yet - CPL=0 <= DPL=3 is
-        // always permitted, so this doesn't yet prove ring-3 can reach
-        // it, only that the gate itself is correctly wired and DOES
-        // fire), not just read back as a structural claim.
-        idt[SYSCALL_INT_VECTOR]
-            .set_handler_fn(syscall_interrupt_handler)
-            .set_privilege_level(PrivilegeLevel::Ring3);
+        // one deliberate exception, since this is a real, controlled
+        // entry point FROM ring-3 code (proven for real in Fase 72, via
+        // ring3.rs's own run_ring3_syscall_test), not just another
+        // kernel-internal handler. Wired via `set_handler_addr`, NOT
+        // `set_handler_fn` - see `syscall_entry_asm`'s own doc for why:
+        // this needs raw register access `extern "x86-interrupt"`
+        // handlers can't provide.
+        unsafe {
+            idt[SYSCALL_INT_VECTOR]
+                .set_handler_addr(VirtAddr::new(syscall_entry_asm as *const () as u64))
+                .set_privilege_level(PrivilegeLevel::Ring3);
+        }
         idt
     };
 }
@@ -172,21 +173,103 @@ extern "x86-interrupt" fn ata_primary_interrupt_handler(_stack_frame: InterruptS
     }
 }
 
-/// Deliberately minimal for Fase 69's own scope: proves the DPL=3 gate
-/// itself is real and genuinely reachable via `int 0x80` (incrementing a
-/// counter a self-test can observe), without yet reading the caller's
-/// general-purpose registers (RAX/RDI/RSI/RDX would need to hold a real
-/// syscall number + args, which `extern "x86-interrupt"` handlers don't
-/// receive as parameters the way a normal calling convention would pass
-/// them - reading them correctly needs either inline asm or a hand-
-/// written naked wrapper, real, separate follow-on work, the same
-/// "don't cram two distinct technical challenges into one Fase"
-/// reasoning this project already applies elsewhere). No `notify_end_
-/// of_interrupt` here, unlike the IRQ handlers above - this is a
-/// *software* interrupt (`int 0x80`), never routed through the 8259
-/// PIC at all, so there's nothing to acknowledge.
-extern "x86-interrupt" fn syscall_interrupt_handler(_stack_frame: InterruptStackFrame) {
+/// Real syscall entry point for vector 0x80 (Fase 72) - registered
+/// directly via `Entry::set_handler_addr` above, NOT `set_handler_fn`.
+/// Every OTHER handler in this file uses `extern "x86-interrupt"`, a
+/// compiler-generated wrapper that ONLY ever exposes the pushed
+/// `InterruptStackFrame` - it never exposes the general-purpose
+/// registers (RAX/RDI/RSI/RDX) a real syscall convention uses to carry
+/// the call number and arguments. That was exactly the limitation
+/// Fase 69's own first attempt at this gate left deliberately
+/// unresolved. A `#[unsafe(naked)]` function has NO compiler-generated
+/// prologue/epilogue at all - every register save/restore and the
+/// final `iretq` are hand-written below, the same category of risk as
+/// `context_switch.rs`'s own asm, worked through with the same care.
+///
+/// Preserves ALL 15 general-purpose registers other than the CPU-
+/// managed interrupt frame (deliberately more conservative than the
+/// real Linux/SysV syscall convention, which only guarantees callee-
+/// saved registers survive) - simplest possible contract for a ring-3
+/// caller to rely on, and there's no reason yet to want the extra
+/// scratch registers a laxer contract would free up.
+///
+/// Push order is deliberately rax/rdi/rsi/rdx LAST (closest to the
+/// current stack top once all 15 are pushed), landing them at the
+/// simplest possible offsets (0/8/16/24) - chosen specifically to make
+/// the offset arithmetic below easy to verify by hand rather than
+/// error-prone. After all 15 pushes, RSP is 16-byte aligned (interrupt
+/// frame: 5 pushes = 40 bytes; here: 15 pushes = 120 bytes; 160 bytes
+/// total is an exact multiple of 16) - exactly satisfying the SysV
+/// ABI's "RSP must be 16-aligned immediately before `call`" requirement
+/// for the `call {handler}` below, verified by hand before writing this
+/// rather than assumed.
+#[unsafe(naked)]
+extern "C" fn syscall_entry_asm() {
+    core::arch::naked_asm!(
+        "push rbx",
+        "push rcx",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rax",
+        // SysV call args (rdi, rsi, rdx, rcx) <- saved (rax, rdi, rsi, rdx),
+        // i.e. sys_nr, arg1, arg2, arg3 - matching dispatch_syscall's own
+        // parameter order. Safe to clobber the live rdi/rsi/rdx/rcx here:
+        // their original values are already saved on the stack above.
+        "mov rdi, [rsp]",
+        "mov rsi, [rsp + 8]",
+        "mov rdx, [rsp + 16]",
+        "mov rcx, [rsp + 24]",
+        "call {handler}",
+        // Overwrite the saved-rax slot with the real return value, so the
+        // `pop rax` below hands it back to the ring-3 (or ring-0 self-
+        // test) caller in rax, exactly where a syscall return value belongs.
+        "mov [rsp], rax",
+        "pop rax",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rcx",
+        "pop rbx",
+        "iretq",
+        handler = sym handle_real_syscall,
+    );
+}
+
+/// Called by `syscall_entry_asm` with the caller's real RAX/RDI/RSI/RDX -
+/// the syscall number and first three arguments, in that order, matching
+/// `syscall::dispatch_syscall`'s own parameter order exactly. A normal
+/// (non-naked) `extern "C" fn`, so this is exactly as safe to write as
+/// any other Rust code in this codebase - all the raw-register/stack-
+/// layout risk is confined to `syscall_entry_asm` itself, above.
+extern "C" fn handle_real_syscall(sys_nr: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     SYSCALL_INT_COUNT.fetch_add(1, Ordering::Relaxed);
+    let ret = crate::syscall::dispatch_syscall(sys_nr, arg1, arg2, arg3);
+    serial_println!(
+        "[SYSCALL] real_syscall_from_ring3 sys_nr={} arg1={} returned={}",
+        sys_nr,
+        arg1,
+        ret
+    );
+    ret
 }
 
 /// Non-fatal: a debugger/test breakpoint (int3). Execution continues after this.

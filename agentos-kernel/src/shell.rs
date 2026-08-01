@@ -374,6 +374,14 @@ pub fn dispatch_command(line: &str) {
             serial_println!("[SHELL] ring3test -> entering ring-3");
             crate::ring3::run_ring3_test();
         }
+        "ring3syscall" => {
+            // A real ring-3-originated syscall round trip (Fase 72),
+            // then the same proven `cli`-fault ending as `ring3test` -
+            // see ring3.rs's own doc for why this also never returns.
+            kprintln!("[SHELL] ring3syscall -> entering ring-3 (this will not return)");
+            serial_println!("[SHELL] ring3syscall -> entering ring-3");
+            crate::ring3::run_ring3_syscall_test();
+        }
         "clear" => {
             crate::vga_buffer::clear_screen();
             serial_println!("[SHELL] clear -> VGA screen cleared");

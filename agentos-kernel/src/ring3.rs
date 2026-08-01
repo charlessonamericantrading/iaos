@@ -11,11 +11,15 @@
 //! verification strategy (below) intentionally ends in a permanent
 //! halt, and running that automatically during every boot would mean
 //! this kernel's interactive shell prompt could never be reached for
-//! real, everyday use. CI still exercises this for real, automatically,
-//! by injecting the keystrokes for `ring3test` as the LAST simulated
-//! shell command, after every other self-test has already run and
-//! logged its own result - the same discipline this project already
-//! uses for the interactive Shift-key test (see main.rs).
+//! real, everyday use. **Not exercised by CI at all** - unlike the
+//! interactive Shift-key test (see main.rs), which CI *can* simulate
+//! because it resumes normally afterward, `ring3test` ends in a
+//! permanent halt, so there's no safe point in the shared boot-test job
+//! to invoke it without either breaking real interactive use or
+//! preventing every check after it from ever running. Verified instead
+//! via a real, repeatable LOCAL test (3x, temporarily invoked in
+//! main.rs, removed before commit) - see kernel-ci.yml's own comment
+//! for the full reasoning.
 //!
 //! **Verification strategy, decided before writing any code**: rather
 //! than trying to build a way to safely RETURN from ring-3 back into
@@ -86,6 +90,66 @@ pub fn run_ring3_test() -> ! {
     kprintln!("[RING3] Attempting a real ring-3 entry (iretq) - expect an immediate #GP from `cli` at CPL=3...");
     serial_println!(
         "[RING3] ring3_test entering rip={:#x} cs={:#06x} ss={:#06x} rsp={:#x} rflags={:#x}",
+        code_addr,
+        user_cs,
+        user_ss,
+        stack_top,
+        RING3_TEST_RFLAGS
+    );
+
+    unsafe {
+        core::arch::asm!(
+            "push {ss}",
+            "push {rsp}",
+            "push {rflags}",
+            "push {cs}",
+            "push {rip}",
+            "iretq",
+            ss = in(reg) user_ss,
+            rsp = in(reg) stack_top,
+            rflags = in(reg) RING3_TEST_RFLAGS,
+            cs = in(reg) user_cs,
+            rip = in(reg) code_addr,
+            options(noreturn)
+        );
+    }
+}
+
+/// A real ring-3-originated syscall (Fase 72), followed by the same
+/// proven `cli`-fault ending `run_ring3_test` (Fase 71) already
+/// established. The "program" is three real instructions, hand-encoded
+/// the same way `run_ring3_test`'s single `cli` byte was:
+///   `mov eax, 1`  -> `B8 01 00 00 00` (SYS_SERIAL_PRINT, opcode `B8+rd`
+///                    for EAX plus a 4-byte little-endian immediate)
+///   `int 0x80`    -> `CD 80`
+///   `cli`         -> `FA` (reused from Fase 71 - see its own doc)
+///
+/// Unlike `run_ring3_test`, execution genuinely RESUMES in ring-3 after
+/// the `int 0x80` (the DPL=3 gate's `iretq` returns to right where it
+/// was invoked, exactly as a normal syscall should) - real, direct proof
+/// that `syscall_entry_asm` correctly preserves and restores the ring-3
+/// context across a full round trip, not just that it can be entered.
+/// Only THEN does the same deliberately-illegal `cli` fault as before,
+/// for the same reason: a clean, already-proven, diagnosed halt is a
+/// natural test endpoint, not something to engineer a safe general
+/// ring-3->ring-0 return around (that remains real, separate follow-on
+/// work).
+pub fn run_ring3_syscall_test() -> ! {
+    let info = gdt::ring3_info();
+    let user_cs = info.user_code_selector as u64;
+    let user_ss = info.user_data_selector as u64;
+
+    let code_addr = USER_TEST_PAGE_ADDR;
+    let stack_top = USER_TEST_PAGE_ADDR + 4096;
+
+    const PROGRAM: [u8; 8] = [0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xFA];
+    unsafe {
+        core::ptr::copy_nonoverlapping(PROGRAM.as_ptr(), code_addr as *mut u8, PROGRAM.len());
+    }
+
+    kprintln!("[RING3] Attempting a real ring-3 syscall (int 0x80, sys_nr=SYS_SERIAL_PRINT) - expect it to resume here, then fault on `cli`...");
+    serial_println!(
+        "[RING3] ring3_syscall_test entering rip={:#x} cs={:#06x} ss={:#06x} rsp={:#x} rflags={:#x}",
         code_addr,
         user_cs,
         user_ss,
