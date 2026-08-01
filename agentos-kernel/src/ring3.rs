@@ -168,6 +168,21 @@ pub fn run_ring3_test() -> ! {
 // same fixed top address on every entry) and separate again from the
 // ring-3 program's own stack (Fase 70's user page) - three genuinely
 // distinct stacks, each used for exactly one thing, never overlapping.
+//
+// A real bug lived here on the first attempt, caught by CI rather than
+// local testing: `ring3_exit_entry_asm` exits via `ret`, not `iretq` -
+// meaning it never restores `RFLAGS`, so the `IF` bit the CPU itself
+// force-cleared on entry (same INTERRUPT-gate behavior noted above)
+// stayed cleared FOREVER after the first ring-3 exit, since nothing
+// else in the whole kernel was going to re-enable interrupts on its
+// own. Every OTHER self-test still ran (none of them specifically
+// depend on a NEW interrupt firing to make progress) until the
+// preemptive scheduler demo, which genuinely cannot complete without
+// real timer ticks forcing a switch - it hung forever, timing out the
+// whole CI job. Fixed by saving `RFLAGS` (via `pushfq`) alongside the 6
+// callee-saved registers in `enter_ring3`, and restoring it (via
+// `popfq`) in `ring3_exit_entry_asm` before the matching register pops
+// - see both functions' own doc for the exact mechanics.
 static mut RING3_RETURN_RSP: u64 = 0;
 static mut RING3_EXIT_CODE: u64 = 0;
 
@@ -175,8 +190,12 @@ static mut RING3_EXIT_CODE: u64 = 0;
 /// does not return in the usual sense - `ring3_exit_entry_asm` (fired by
 /// the ring-3 program's own `int 0x81`) is what actually returns to this
 /// function's caller, with the real exit code in `rax`. Mirrors
-/// `context_switch::switch_to`'s own save/restore convention exactly
-/// (same 6 registers, same order) so the two are trivially comparable.
+/// `context_switch::switch_to`'s own save/restore convention (same 6
+/// registers, same order) plus one addition `switch_to` doesn't need:
+/// `pushfq` saves this caller's own `RFLAGS` (in particular `IF`)
+/// alongside them, restored by `ring3_exit_entry_asm`'s own `popfq` -
+/// see that function's own doc for why this one, unlike every other
+/// naked/interrupt-gate handler in this kernel, genuinely needs it.
 ///
 /// # Safety
 /// `entry` must point at real, executable, user-accessible code (e.g.
@@ -199,6 +218,7 @@ unsafe extern "C" fn enter_ring3(
         "push r13",
         "push r14",
         "push r15",
+        "pushfq",
         "mov [rip + {ret_rsp}], rsp",
         "push rdx", // ss     (arg3)
         "push rcx", // rsp    (arg4)
@@ -215,11 +235,28 @@ unsafe extern "C" fn enter_ring3(
 /// exit code in `rax`. Never restores ring-3 state: it switches to the
 /// kernel stack `enter_ring3` saved and resumes THERE instead, handing
 /// the exit code back as if `enter_ring3` itself had returned it.
+///
+/// `popfq` matters more than it looks: every IDT entry in this kernel
+/// (confirmed via the `x86_64` crate's own `EntryOptions::minimal()`)
+/// defaults to a 64-bit INTERRUPT gate, which the CPU itself
+/// unconditionally clears `RFLAGS.IF` on entry to. `syscall_entry_asm`
+/// (Fase 72) never has to think about this because it always exits via
+/// `iretq`, which restores the FULL `RFLAGS` (including `IF`) as part
+/// of its own defined behavior. This function is the one place in the
+/// whole kernel that DOESN'T exit via `iretq` - it `ret`s back into
+/// ordinary kernel code instead - and a plain `ret` does not touch
+/// `RFLAGS` at all. Without this `popfq`, `IF` would stay stuck at 0
+/// forever after the very first ring-3 exit, silently breaking every
+/// `hlt()`-based wait anywhere else in this kernel from that point on
+/// (nothing could ever wake from `hlt` again) - exactly the failure a
+/// real CI run caught (a later self-test hung, timing out the whole
+/// boot-test job) before this fix.
 #[unsafe(naked)]
 pub(crate) extern "C" fn ring3_exit_entry_asm() {
     naked_asm!(
         "mov [rip + {exit_code}], rax",
         "mov rsp, [rip + {ret_rsp}]",
+        "popfq",
         "pop r15",
         "pop r14",
         "pop r13",
