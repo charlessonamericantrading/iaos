@@ -127,7 +127,7 @@ jobs:
           # Q8_0, and an honest Err for an unimplemented one) rather than
           # silently assuming everything is F32, the real gap this Fase
           # closes.
-          grep -q "GGUF\] q8_0_test f16_vectors_ok=true q8_0_decode_ok=true dispatch_f32_ok=true dispatch_q8_0_ok=true dispatch_unimplemented_ok=true" boot.log
+          grep -q "GGUF\] q8_0_test f16_vectors_ok=true q8_0_decode_ok=true dispatch_f32_ok=true dispatch_q8_0_ok=true" boot.log
           # Confirms real GGUF Q4_0 quantized tensor decoding (Fase 52) -
           # 4-bit, nibble-packed. The self-test's block uses a
           # deliberately asymmetric nibble pattern (low nibble ascending,
@@ -151,6 +151,13 @@ jobs:
           # produces visibly wrong output, combined with the same
           # asymmetric nibble pattern Q4_0's own test uses.
           grep -q "GGUF\] q4_1_test q4_1_decode_ok=true dispatch_q4_1_ok=true" boot.log
+          # Confirms real GGUF F16 tensor decoding (Fase 54) - the last
+          # GgufGtype, completing full decode_tensor coverage. Unlike the
+          # quantized formats above, F16 has no block/scale structure at
+          # all - each value is simply its own raw 2 bytes via the
+          # already-verified f16_to_f32, reused directly rather than
+          # duplicated.
+          grep -q "GGUF\] f16_test f16_decode_ok=true dispatch_f16_ok=true" boot.log
           # Confirms real GGUF multi-tensor-info support (Fase 51) -
           # GgufTensorInfo::parse_many, generalizing tensor-info parsing
           # to any real number of tensors instead of just one.

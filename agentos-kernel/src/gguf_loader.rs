@@ -324,22 +324,37 @@ impl GgufModelLoader {
         values
     }
 
+    /// Decodes a byte buffer as raw, unquantized half-precision (`F16`)
+    /// values - unlike every quantized format above, there's no block
+    /// structure or shared scale here at all: each value is simply its
+    /// own 2 raw bytes, decoded via `f16_to_f32` (already built and
+    /// verified for the quantized formats' block scales). Any trailing
+    /// byte that doesn't form a complete pair is silently dropped, same
+    /// convention as every other decoder here.
+    pub fn decode_f16_le(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| f16_to_f32(u16::from_le_bytes(c)))
+            .collect()
+    }
+
     /// Decodes `bytes` according to a tensor's own parsed `gtype` -
     /// dispatches to the right format-specific decoder instead of
     /// silently assuming `F32`, closing a real gap: `GgufTensorInfo`
     /// already parses and stores every tensor's real gtype, but nothing
     /// before this ever branched on it to decide *how* to read the
     /// tensor's data - every existing caller just called `decode_f32_le`
-    /// directly regardless of what gtype it had actually parsed.
+    /// directly regardless of what gtype it had actually parsed. Every
+    /// `GgufGtype` this kernel recognizes has a real decoder now.
     pub fn decode_tensor(bytes: &[u8], gtype: GgufGtype) -> Result<Vec<f32>, &'static str> {
         match gtype {
             GgufGtype::F32 => Ok(Self::decode_f32_le(bytes)),
+            GgufGtype::F16 => Ok(Self::decode_f16_le(bytes)),
             GgufGtype::Q8_0 => Ok(Self::decode_q8_0(bytes)),
             GgufGtype::Q4_0 => Ok(Self::decode_q4_0(bytes)),
             GgufGtype::Q4_1 => Ok(Self::decode_q4_1(bytes)),
-            GgufGtype::F16 => {
-                Err("GGUF: this tensor's gtype doesn't have a decoder implemented yet")
-            }
         }
     }
 

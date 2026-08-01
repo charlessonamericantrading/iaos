@@ -392,16 +392,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             GgufModelLoader::decode_tensor(&f32_bytes, GgufGtype::F32) == Ok(alloc::vec![2.5f32]);
         let dispatch_q8_0_ok =
             GgufModelLoader::decode_tensor(&q8_block, GgufGtype::Q8_0) == Ok(expected);
-        let dispatch_unimplemented_ok =
-            GgufModelLoader::decode_tensor(&[0u8; 2], GgufGtype::F16).is_err();
+        // No "dispatch_unimplemented_ok" check anymore: this test was
+        // written (Fase 50) when F16 was decode_tensor's one remaining
+        // unimplemented gtype, specifically to prove an honest Err came
+        // back for it rather than a silent F32 misread. Fase 54 gave F16
+        // a real decoder too, so every GgufGtype this kernel recognizes
+        // now dispatches successfully - there's no longer a gtype value
+        // left to exercise that Err path with, so the check (and its
+        // premise) is retired rather than left in place testing nothing
+        // real. Confirmed by the CI check for THIS line actually
+        // regressing (dispatch_unimplemented_ok flipping to false) when
+        // this Fase's own new capability landed, before this fix.
 
         kprintln!(
-            "[GGUF Q8_0] f16_vectors_ok={} q8_0_decode_ok={} dispatch_f32_ok={} dispatch_q8_0_ok={} dispatch_unimplemented_ok={}",
-            f16_vectors_ok, q8_0_decode_ok, dispatch_f32_ok, dispatch_q8_0_ok, dispatch_unimplemented_ok
+            "[GGUF Q8_0] f16_vectors_ok={} q8_0_decode_ok={} dispatch_f32_ok={} dispatch_q8_0_ok={}",
+            f16_vectors_ok, q8_0_decode_ok, dispatch_f32_ok, dispatch_q8_0_ok
         );
         serial_println!(
-            "[GGUF] q8_0_test f16_vectors_ok={} q8_0_decode_ok={} dispatch_f32_ok={} dispatch_q8_0_ok={} dispatch_unimplemented_ok={}",
-            f16_vectors_ok, q8_0_decode_ok, dispatch_f32_ok, dispatch_q8_0_ok, dispatch_unimplemented_ok
+            "[GGUF] q8_0_test f16_vectors_ok={} q8_0_decode_ok={} dispatch_f32_ok={} dispatch_q8_0_ok={}",
+            f16_vectors_ok, q8_0_decode_ok, dispatch_f32_ok, dispatch_q8_0_ok
         );
     }
 
@@ -504,6 +513,41 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             "[GGUF] q4_1_test q4_1_decode_ok={} dispatch_q4_1_ok={}",
             q4_1_decode_ok,
             dispatch_q4_1_ok
+        );
+    }
+
+    // 5b-4. Test real GGUF F16 tensor decoding (Fase 54) - the last
+    // remaining GgufGtype, completing full decode_tensor coverage.
+    // Unlike every quantized format above, F16 has no block/scale
+    // structure at all - each value is simply its own raw 2 bytes,
+    // decoded via the already-verified f16_to_f32 (built for the
+    // quantized formats' block scales, reused here directly). Uses the
+    // same hand-verified bit patterns (0x3C00/0xC000/0x3800 -> 1.0/-2.0/
+    // 0.5) already proven correct in Fase 50's own f16_to_f32 vectors.
+    kprintln!("[GGUF INFERENCE] Testing F16 tensor decoding...");
+    {
+        use gguf_loader::GgufModelLoader;
+
+        let mut f16_bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        f16_bytes.extend_from_slice(&0x3C00u16.to_le_bytes()); // 1.0
+        f16_bytes.extend_from_slice(&0xC000u16.to_le_bytes()); // -2.0
+        f16_bytes.extend_from_slice(&0x3800u16.to_le_bytes()); // 0.5
+        let expected_f16: alloc::vec::Vec<f32> = alloc::vec![1.0, -2.0, 0.5];
+
+        let decoded_f16 = GgufModelLoader::decode_f16_le(&f16_bytes);
+        let f16_decode_ok = decoded_f16 == expected_f16;
+        let dispatch_f16_ok =
+            GgufModelLoader::decode_tensor(&f16_bytes, GgufGtype::F16) == Ok(expected_f16);
+
+        kprintln!(
+            "[GGUF F16] f16_decode_ok={} dispatch_f16_ok={}",
+            f16_decode_ok,
+            dispatch_f16_ok
+        );
+        serial_println!(
+            "[GGUF] f16_test f16_decode_ok={} dispatch_f16_ok={}",
+            f16_decode_ok,
+            dispatch_f16_ok
         );
     }
 
