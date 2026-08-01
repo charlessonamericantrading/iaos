@@ -140,58 +140,85 @@ impl Fat12Info {
         Ok(entries)
     }
 
-    /// Overwrites an existing file's content with `data`, which must be
-    /// EXACTLY the same length as the file's current size - this first
-    /// version reuses the file's existing cluster chain as-is and
-    /// touches neither the FAT nor the directory entry (size field
-    /// included). Creating a new file (needs a free directory-entry
-    /// search + cluster allocation) or resizing an existing one (needs
-    /// FAT chain growth/shrink) are both substantially more work,
-    /// deliberately not attempted here.
-    pub fn write_file(&self, name: &str, data: &[u8]) -> Result<(), &'static str> {
-        let entries = self.list_root_directory()?;
-        let entry = entries
-            .iter()
-            .find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(name))
-            .ok_or("FAT12: file not found in root directory")?;
-
-        if data.len() != entry.size as usize {
-            return Err("FAT12: write_file only supports same-size overwrites for now");
-        }
-        if entry.size == 0 {
-            return Ok(());
+    /// Overwrites an existing file's content with `data`, growing or
+    /// shrinking its cluster chain as needed - originally same-size-only
+    /// ("resizing needs FAT chain growth/shrink... substantially more
+    /// work, deliberately not attempted"); `create_file`'s multi-cluster
+    /// support (`find_free_clusters`) turned out to be exactly the
+    /// missing piece for growing too, and shrinking is the same problem
+    /// from the other direction - freeing the excess trailing clusters
+    /// instead of allocating extra ones.
+    pub fn write_file(&mut self, name: &str, data: &[u8]) -> Result<(), &'static str> {
+        let (entry_lba, entry_offset, entry) = self.find_entry_location(name)?;
+        if entry.is_dir {
+            return Err("FAT12: write_file does not support directories");
         }
 
-        let mut cluster = entry.start_cluster;
+        // Walk the file's existing chain - needed either way, to know
+        // exactly which clusters it already owns before deciding
+        // whether any need to be added or freed.
+        let mut clusters = alloc::vec::Vec::new();
+        let mut cluster = Some(entry.start_cluster);
+        while let Some(c) = cluster {
+            clusters.push(c);
+            cluster = self.next_cluster(c)?;
+        }
+
+        let cluster_bytes = self.sectors_per_cluster as usize * 512;
+        let new_clusters_needed = data.len().div_ceil(cluster_bytes).max(1);
+
+        if new_clusters_needed > clusters.len() {
+            let extra = self.find_free_clusters(new_clusters_needed - clusters.len())?;
+            clusters.extend(extra);
+        } else if new_clusters_needed < clusters.len() {
+            // Free every cluster past the new end of the chain - each
+            // one's entry goes back to 0x000 (free), same as
+            // delete_file already does for a whole chain.
+            for &c in &clusters[new_clusters_needed..] {
+                self.write_fat_entry_to_disk(c, 0x0000)?;
+            }
+            clusters.truncate(new_clusters_needed);
+        }
+
+        // Write data across the (possibly resized) chain, chaining each
+        // cluster to the next - identical in shape to create_file's own
+        // write+chain loop, since both are "lay data across exactly
+        // these clusters, in this order" once the chain length is
+        // decided.
         let mut written = 0usize;
-
-        loop {
-            let cluster_lba = self.cluster_to_lba(cluster);
+        for (i, &c) in clusters.iter().enumerate() {
+            let cluster_lba = self.cluster_to_lba(c);
             for s in 0..self.sectors_per_cluster as u32 {
-                let remaining = data.len() - written;
-                if remaining == 0 {
-                    return Ok(());
-                }
-                let take = remaining.min(512);
                 let mut sector_buf = [0u8; 512];
-                sector_buf[..take].copy_from_slice(&data[written..written + take]);
+                if written < data.len() {
+                    let end = (written + 512).min(data.len());
+                    sector_buf[..end - written].copy_from_slice(&data[written..end]);
+                    written = end;
+                }
                 // A cluster's last sector may only be partially covered
                 // by real file data (size isn't always a multiple of
-                // 512) - the trailing bytes beyond `take` are left
-                // zeroed. That's fine: nothing about a FAT file's bytes
-                // past its logical `size` is meaningful, and read_file
-                // only ever reads back exactly `entry.size` bytes.
+                // 512) - the trailing bytes beyond that are left
+                // zeroed, same reasoning as before: nothing about a FAT
+                // file's bytes past its logical size is meaningful.
                 ata::write_sector(cluster_lba + s, &sector_buf)?;
-                written += take;
             }
-            if written >= data.len() {
-                return Ok(());
-            }
-            match self.next_cluster(cluster)? {
-                Some(next) => cluster = next,
-                None => return Err("FAT12: cluster chain ended before all data was written"),
-            }
+            let next_entry = match clusters.get(i + 1) {
+                Some(&next_cluster) => next_cluster as u16,
+                None => 0x0FFF,
+            };
+            self.write_fat_entry_to_disk(c, next_entry)?;
         }
+
+        // The only directory-entry field a resize can change is size -
+        // start_cluster never does, since clusters[0] is always the
+        // same first cluster the file already had.
+        let mut sector_buf = [0u8; 512];
+        ata::read_sector(entry_lba, &mut sector_buf)?;
+        sector_buf[entry_offset + 28..entry_offset + 32]
+            .copy_from_slice(&(data.len() as u32).to_le_bytes());
+        ata::write_sector(entry_lba, &sector_buf)?;
+
+        Ok(())
     }
 
     /// Finds `name` (case-insensitive, short 8.3 form) in the root

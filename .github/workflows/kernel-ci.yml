@@ -311,6 +311,19 @@ jobs:
           # real multi-cluster chain got freed correctly, not just the first.
           grep -q "FAT12\] multi_cluster_test created=true read_back_len=3100 match=true" boot.log
           grep -q "FAT12\] multi_cluster_test deleted=true gone=true" boot.log
+          # Confirms FAT12 file RESIZE (Fase 30) - write_file previously only
+          # supported same-size overwrites; this takes one file through
+          # create (500 bytes) -> grow (2500, needing 2 genuinely NEW
+          # clusters chained on) -> shrink (300, freeing those same 2
+          # clusters back to the FAT), each phase checked against a
+          # DIFFERENT deterministic pattern so stale bytes left over from
+          # an earlier phase would show up as a mismatch, not an
+          # accidental pass. All three sizes are fixed literals in source,
+          # so this exact line is safe to assert - a fresh CI image always
+          # takes this same path (grow/shrink don't depend on anything
+          # machine-specific, unlike e.g. PCI BAR addresses).
+          grep -q "FAT12\] resize_test created_ok=true grow_ok=true shrink_ok=true" boot.log
+          grep -q "FAT12\] resize_test cleanup deleted=true gone=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.

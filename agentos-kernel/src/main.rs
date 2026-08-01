@@ -360,7 +360,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!("[KERNEL INIT] Testing real FAT12 file write (overwrite + read-back)...");
     match shell::find_fat_partition() {
         Ok(partition) => match fat12::read_bpb(&partition) {
-            Ok(fs) => match fs.read_file("BOOT-S~2") {
+            Ok(mut fs) => match fs.read_file("BOOT-S~2") {
                 Ok(original) => {
                     let test_pattern: alloc::vec::Vec<u8> =
                         (0..original.len()).map(|i| (i % 256) as u8).collect();
@@ -616,6 +616,84 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 e
             );
             serial_println!("[FAT12] multi_cluster_test -> no partition: {}", e);
+        }
+    }
+    shell::dispatch_command("ls");
+
+    // 7b-10. Real FAT12 file RESIZE (grow AND shrink) - write_file
+    // previously only supported overwriting a file with exactly the same
+    // amount of data; this proves it can now also grow (append new
+    // clusters to the chain) and shrink (free trailing clusters) an
+    // EXISTING file. Uses its own dedicated file ("RESIZE.TXT"), fully
+    // self-cleaning (deletes it at the end) so this test behaves the
+    // same whether the disk was just regenerated or this is a repeat
+    // boot. Each phase uses a DIFFERENT deterministic pattern (different
+    // modulus, different length) specifically so a bug that left stale
+    // bytes from a previous phase in place would very likely be caught
+    // as a mismatch, not accidentally still look correct.
+    kprintln!("[KERNEL INIT] Testing FAT12 file resize (grow + shrink)...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                let initial: alloc::vec::Vec<u8> = (0..500u32).map(|i| (i % 200) as u8).collect();
+                let grown: alloc::vec::Vec<u8> = (0..2500u32).map(|i| (i % 231) as u8).collect();
+                let shrunk: alloc::vec::Vec<u8> = (0..300u32).map(|i| (i % 199) as u8).collect();
+
+                let _ = fs.create_file("RESIZE.TXT", &initial);
+                let created_ok = fs
+                    .read_file("RESIZE.TXT")
+                    .map(|d| d == initial)
+                    .unwrap_or(false);
+
+                let grow_ok = match fs.write_file("RESIZE.TXT", &grown) {
+                    Ok(()) => fs
+                        .read_file("RESIZE.TXT")
+                        .map(|d| d == grown)
+                        .unwrap_or(false),
+                    Err(_) => false,
+                };
+
+                let shrink_ok = match fs.write_file("RESIZE.TXT", &shrunk) {
+                    Ok(()) => fs
+                        .read_file("RESIZE.TXT")
+                        .map(|d| d == shrunk)
+                        .unwrap_or(false),
+                    Err(_) => false,
+                };
+
+                kprintln!(
+                    "[FAT12] resize test: created_ok={} grow_ok={} shrink_ok={}",
+                    created_ok,
+                    grow_ok,
+                    shrink_ok
+                );
+                serial_println!(
+                    "[FAT12] resize_test created_ok={} grow_ok={} shrink_ok={}",
+                    created_ok,
+                    grow_ok,
+                    shrink_ok
+                );
+
+                match fs.delete_file("RESIZE.TXT") {
+                    Ok(()) => {
+                        let gone = fs.read_file("RESIZE.TXT").is_err();
+                        kprintln!("[FAT12] resize cleanup: deleted, gone={}", gone);
+                        serial_println!("[FAT12] resize_test cleanup deleted=true gone={}", gone);
+                    }
+                    Err(e) => {
+                        kprintln!("[FAT12] resize cleanup delete_file: {}", e);
+                        serial_println!("[FAT12] resize_test cleanup delete_failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                kprintln!("[FAT12] resize test: not FAT12 ({})", e);
+                serial_println!("[FAT12] resize_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!("[FAT12] resize test: couldn't find FAT partition: {}", e);
+            serial_println!("[FAT12] resize_test -> no partition: {}", e);
         }
     }
     shell::dispatch_command("ls");
