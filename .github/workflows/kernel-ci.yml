@@ -108,6 +108,21 @@ jobs:
           # which never had register access at all (see interrupts.rs's
           # own doc for why that ABI can't provide it).
           grep -q "IDT\] syscall_int_test count_delta=1 dispatch_ret=0" boot.log
+          # Confirms the syscall entry stub now reads the CALLER's own
+          # privilege level for real (Fase 75) - the CPU's own interrupt
+          # frame (pushed before syscall_entry_asm's own 15 registers,
+          # so it sits at a fixed, hand-verified offset above them)
+          # always has CS as its 2nd field, regardless of whether this
+          # was a same-privilege or privilege-elevating entry; its low 2
+          # bits are the real Requested Privilege Level at the moment
+          # `int 0x80` fired. caller_rpl=0 here is this exact ring-0
+          # self-test's own call (the line right above), genuinely
+          # distinct from the SEPARATE caller_rpl=3 line below (from
+          # run_ring3_exit_test's own real ring-3 call) - proof this
+          # correctly distinguishes the two, not a hardcoded constant.
+          # Deliberately does not yet change any syscall's behavior
+          # based on this value - see interrupts.rs's own doc for why.
+          grep -q "SYSCALL\] real_syscall_from_ring3 sys_nr=1 arg1=0 caller_rpl=0 returned=0" boot.log
           grep -q "\[PIC\] 8259 remapped to vectors 32-47" boot.log
           # Confirms a real, dedicated user-accessible page mapping
           # (Fase 70, the third step of the ring-3 arc after Fase 68's
@@ -149,6 +164,13 @@ jobs:
           # it is the very next self-test in main()'s own sequence, so
           # its presence here already proves execution didn't stop.
           grep -q "RING3\] ring3_exit_test exit_code=42" boot.log
+          # Confirms this exact ring-3 program's own real int 0x80 (the
+          # `mov eax,1` step, before it goes on to exit via 0x81) reads
+          # back caller_rpl=3 (Fase 75) - the OTHER half of the check
+          # above this same file's own ring-0 self-test line: same
+          # mechanism, genuinely different result, because the CPU's own
+          # CS.RPL genuinely was different at each call site.
+          grep -q "SYSCALL\] real_syscall_from_ring3 sys_nr=1 arg1=.* caller_rpl=3 returned=0" boot.log
           # Fase 71 (the actual ring-0 -> ring-3 transition, `ring3.rs`)
           # is deliberately NOT asserted here, unlike every other Fase -
           # not an oversight. Its own shell command (`ring3test`) ends in

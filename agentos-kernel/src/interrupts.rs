@@ -227,6 +227,20 @@ extern "x86-interrupt" fn ata_primary_interrupt_handler(_stack_frame: InterruptS
 /// ABI's "RSP must be 16-aligned immediately before `call`" requirement
 /// for the `call {handler}` below, verified by hand before writing this
 /// rather than assumed.
+///
+/// Fase 75 reads one more thing before calling into Rust: the CPU's own
+/// interrupt frame - pushed BEFORE any of these 15 registers, so it sits
+/// right above them, starting at offset 120 (15 * 8) from the current
+/// RSP - always has `RIP` as its first field and `CS` as its second,
+/// REGARDLESS of whether this was a same-privilege entry (3 fields:
+/// `RIP`/`CS`/`RFLAGS`, e.g. the ring-0 self-test's own bare `int 0x80`)
+/// or a privilege-elevating one (5 fields, adding `RSP`/`SS` - a real
+/// ring-3 call): either way `CS` is always the 2nd field, at offset
+/// `120 + 8 = 128`. Its low 2 bits are the CPU's own Requested Privilege
+/// Level at the moment `int 0x80` fired - reading them tells
+/// `handle_real_syscall` whether this call genuinely came from ring-3 or
+/// ring-0, real information `dispatch_syscall` never had access to
+/// before this Fase.
 #[unsafe(naked)]
 extern "C" fn syscall_entry_asm() {
     core::arch::naked_asm!(
@@ -253,6 +267,8 @@ extern "C" fn syscall_entry_asm() {
         "mov rsi, [rsp + 8]",
         "mov rdx, [rsp + 16]",
         "mov rcx, [rsp + 24]",
+        "mov r8, [rsp + 128]",
+        "and r8, 3",
         "call {handler}",
         // Overwrite the saved-rax slot with the real return value, so the
         // `pop rax` below hands it back to the ring-3 (or ring-0 self-
@@ -280,17 +296,36 @@ extern "C" fn syscall_entry_asm() {
 
 /// Called by `syscall_entry_asm` with the caller's real RAX/RDI/RSI/RDX -
 /// the syscall number and first three arguments, in that order, matching
-/// `syscall::dispatch_syscall`'s own parameter order exactly. A normal
-/// (non-naked) `extern "C" fn`, so this is exactly as safe to write as
-/// any other Rust code in this codebase - all the raw-register/stack-
-/// layout risk is confined to `syscall_entry_asm` itself, above.
-extern "C" fn handle_real_syscall(sys_nr: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
+/// `syscall::dispatch_syscall`'s own parameter order exactly - plus,
+/// since Fase 75, the caller's own CS.RPL at the moment `int 0x80` fired
+/// (0 or 3), read directly from the CPU's own interrupt frame by
+/// `syscall_entry_asm` itself (see that function's own doc for exactly
+/// where). A normal (non-naked) `extern "C" fn`, so this is exactly as
+/// safe to write as any other Rust code in this codebase - all the
+/// raw-register/stack-layout risk is confined to `syscall_entry_asm`
+/// itself, above.
+///
+/// Deliberately does NOT yet pass `caller_rpl` into `dispatch_syscall`
+/// or use it to change any behavior - this Fase's own scope is proving
+/// the value is read correctly, not yet acting on it. Enforcing that a
+/// ring-3 caller may only pass pointers to memory it could otherwise
+/// access (tightening `memory::paging::pointer_is_mapped`'s own
+/// Fase 74 doc, which named exactly this as real, separate follow-on
+/// work) is real, separate follow-on work, not crammed into this Fase.
+extern "C" fn handle_real_syscall(
+    sys_nr: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    caller_rpl: u64,
+) -> u64 {
     SYSCALL_INT_COUNT.fetch_add(1, Ordering::Relaxed);
     let ret = crate::syscall::dispatch_syscall(sys_nr, arg1, arg2, arg3);
     serial_println!(
-        "[SYSCALL] real_syscall_from_ring3 sys_nr={} arg1={} returned={}",
+        "[SYSCALL] real_syscall_from_ring3 sys_nr={} arg1={} caller_rpl={} returned={}",
         sys_nr,
         arg1,
+        caller_rpl,
         ret
     );
     ret
