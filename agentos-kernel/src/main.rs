@@ -1267,6 +1267,41 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // the full register-offset verification story.
     net::virtio::probe();
 
+    // 7b-2-3. Completes the real VirtIO device-init handshake
+    // (ACKNOWLEDGE -> DRIVER -> DRIVER_OK) and sets up one real
+    // virtqueue (TX, index 1) - Fase 63, the necessary next step
+    // before any actual frame can be sent. queue_num=256 (read back,
+    // not assumed) needs a 10246-byte vring - 3 physical frames, not
+    // 1, the first time this kernel's frame allocator has needed
+    // contiguous multi-frame memory (verified explicitly, not
+    // assumed - see net/virtio.rs's own doc). pfn_readback matching
+    // pfn is the real proof the device accepted the queue's physical
+    // address, not just that the write didn't crash.
+    kprintln!("[VIRTIO INIT] Setting up TX virtqueue...");
+    match net::virtio::init_tx_queue() {
+        Ok(info) => {
+            let pfn_ok = info.pfn_readback == info.pfn;
+            kprintln!(
+                "[VIRTIO TXQ] queue_num={} frames_needed={} pfn_ok={} final_status={:#04x}",
+                info.queue_num,
+                info.frames_needed,
+                pfn_ok,
+                info.final_status
+            );
+            serial_println!(
+                "[VIRTIO] txq_test queue_num={} frames_needed={} pfn_ok={} final_status={:#04x}",
+                info.queue_num,
+                info.frames_needed,
+                pfn_ok,
+                info.final_status
+            );
+        }
+        Err(e) => {
+            kprintln!("[VIRTIO TXQ] {}", e);
+            serial_println!("[VIRTIO] txq_test error={}", e);
+        }
+    }
+
     // 7b-3/7b-4. Real e1000 TX+RX attempt: `receive_test_frame` arms a
     // real receive descriptor ring FIRST, then calls `send_test_frame`
     // internally (building a real transmit descriptor ring using fresh

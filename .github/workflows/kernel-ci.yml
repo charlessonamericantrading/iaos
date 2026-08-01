@@ -395,6 +395,18 @@ jobs:
           # environment-dependent like a BAR0 address or binary size.
           grep -q "VIRTIO\] found 00:04.0 bar0=0x" boot.log
           grep -q "mac_feature=true mac=52:54:00:12:34:57" boot.log
+          # Confirms the real VirtIO device-init handshake (Fase 63) -
+          # ACKNOWLEDGE -> DRIVER -> DRIVER_OK - and setup of one real
+          # virtqueue (TX, index 1). queue_num=256 is read back from
+          # the device, not assumed, and needs a 3-frame (10246-byte)
+          # contiguous physical allocation - the first thing in this
+          # kernel to actually need multi-frame contiguity (checked
+          # explicitly, not assumed, in allocate_contiguous_frames).
+          # pfn_ok=true is the real proof: the device's own QUEUE_PFN
+          # register reads back exactly what was written, not just that
+          # the write didn't crash. final_status=0x07 confirms the full
+          # ACKNOWLEDGE|DRIVER|DRIVER_OK handshake stuck.
+          grep -q "VIRTIO\] txq_test queue_num=256 frames_needed=3 pfn_ok=true final_status=0x07" boot.log
           # e1000 TX (Fase 22, fully confirmed working Fase 44) - the ring
           # genuinely engages the hardware (TDH advances) AND the
           # descriptor's DD status bit now gets written back too, since
