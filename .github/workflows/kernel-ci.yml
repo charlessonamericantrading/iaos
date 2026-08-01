@@ -266,6 +266,26 @@ jobs:
           # above - the same "prove the API, then prove the shell path"
           # pattern this session used for FAT12's own commands.
           grep -q "SHELL\] netcheck -> ok" boot.log
+          # Confirms the new IPv4 + ICMP protocol layer (Fase 47, net::icmp)
+          # is correct in isolation - pure byte-buffer construction/parsing,
+          # deliberately not yet wired to the NIC. checksum_even_case_ok/
+          # checksum_odd_case_ok are hand-computed vectors independent of
+          # any round-trip self-consistency - the real bug this Fase's own
+          # verification caught (comparing a re-summed checksum against the
+          # wrong constant, 0xFFFF instead of 0x0000, since this code's
+          # internet_checksum already returns the one's-complement value)
+          # would NOT have been caught by a round-trip test alone, since
+          # both sides of a round trip agree with each other regardless.
+          # request_fields_ok/reply_fields_ok round-trip a full echo message
+          # through build_icmp_echo -> parse_icmp_echo (odd-length end to
+          # end, exercising the checksum's odd-byte-padding path in the
+          # full integration path too); corrupted_checksum_rejected is the
+          # proof this isn't a rubber stamp (one payload byte XOR-flipped
+          # after building a valid message must now be rejected);
+          # ipv4_checksum_valid confirms the separate IPv4 header checksum
+          # the same way. All six checks must be true for this exact line
+          # to appear.
+          grep -q "ICMP\] ping_selftest checksum_even_case_ok=true checksum_odd_case_ok=true request_fields_ok=true reply_fields_ok=true corrupted_checksum_rejected=true ipv4_checksum_valid=true" boot.log
           # Confirms the new ATA write path (Fase 23) genuinely wrote and
           # read back matching bytes - not just that write_sector()
           # returned without erroring. Deliberately NOT asserting the

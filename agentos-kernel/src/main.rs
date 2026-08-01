@@ -391,6 +391,80 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // prove the shell path separately" pattern.
     shell::dispatch_command("netcheck");
 
+    // 7b-6. Test real IPv4 + ICMP echo (ping) protocol construction and
+    // parsing (net::icmp, Fase 47) - pure byte-buffer logic, deliberately
+    // NOT wired to e1000's TX/RX yet (that needs a real destination MAC,
+    // i.e. ARP resolution, which doesn't exist yet either - separate,
+    // larger scope). Proves the primitive is correct in isolation first,
+    // the same order Fase 21's frame allocator or Fase 37/38's VFAT
+    // entry-building both used before anything downstream depended on
+    // them.
+    //
+    // checksum_even_case_ok/checksum_odd_case_ok are hand-computed
+    // vectors, NOT round-trip checks - a round-trip test (build then
+    // parse with the SAME checksum function) would still pass even if
+    // this code consistently disagreed with the real RFC 1071 standard,
+    // since both sides would agree with each other while disagreeing
+    // with any real peer (e.g. QEMU's SLIRP) computing it independently.
+    // [0x00,0x01,0x00,0x02]: two words 0x0001+0x0002=0x0003, checksum =
+    // !0x0003 = 0xFFFC. [0x00,0x01,0xFF]: word 0x0001 plus an odd
+    // trailing byte padded as a word's high byte (0xFF00) -> sum=0xFF01,
+    // checksum = !0xFF01 = 0x00FE - specifically exercises the odd-byte
+    // padding path, the subtlest part of the algorithm.
+    //
+    // request/reply_fields_ok round-trips a full echo message through
+    // build_icmp_echo -> parse_icmp_echo (a 33-byte odd-length payload,
+    // so the whole 41-byte message is also odd-length end to end - the
+    // same padding path exercised directly above, now in the full
+    // integration path too). corrupted_checksum_rejected is the actual
+    // proof this isn't a rubber stamp: one payload byte is XOR-flipped
+    // after building a valid reply, and parse_icmp_echo must now report a
+    // mismatch instead of silently accepting corrupted data.
+    kprintln!("[KERNEL INIT] Testing real IPv4 + ICMP echo (ping) construction/parsing...");
+    {
+        use net::icmp;
+
+        let checksum_even_case_ok = icmp::internet_checksum(&[0x00, 0x01, 0x00, 0x02]) == 0xFFFC;
+        let checksum_odd_case_ok = icmp::internet_checksum(&[0x00, 0x01, 0xFF]) == 0x00FE;
+
+        const PING_DATA: &[u8] = b"AgentOS ping self-test payload!!!";
+        let request = icmp::build_icmp_echo(false, 0x1234, 1, PING_DATA);
+        let request_fields_ok = icmp::parse_icmp_echo(&request)
+            .map(|info| !info.is_reply && info.identifier == 0x1234 && info.sequence == 1)
+            .unwrap_or(false);
+
+        let reply = icmp::build_icmp_echo(true, 0x1234, 1, PING_DATA);
+        let reply_fields_ok = icmp::parse_icmp_echo(&reply)
+            .map(|info| info.is_reply && info.identifier == 0x1234 && info.sequence == 1)
+            .unwrap_or(false);
+
+        let mut corrupted = reply.clone();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xFF;
+        let corrupted_checksum_rejected = icmp::parse_icmp_echo(&corrupted).is_err();
+
+        let ipv4_header = icmp::build_ipv4_header(
+            1,
+            64,
+            icmp::IP_PROTOCOL_ICMP,
+            [10, 0, 2, 15],
+            [10, 0, 2, 2],
+            request.len(),
+        );
+        let ipv4_checksum_valid = icmp::checksum_is_valid(&ipv4_header);
+
+        kprintln!(
+            "[ICMP] ping self-test: checksum_even_case_ok={} checksum_odd_case_ok={} request_fields_ok={} reply_fields_ok={} corrupted_checksum_rejected={} ipv4_checksum_valid={}",
+            checksum_even_case_ok, checksum_odd_case_ok, request_fields_ok, reply_fields_ok,
+            corrupted_checksum_rejected, ipv4_checksum_valid
+        );
+        serial_println!(
+            "[ICMP] ping_selftest checksum_even_case_ok={} checksum_odd_case_ok={} request_fields_ok={} reply_fields_ok={} corrupted_checksum_rejected={} ipv4_checksum_valid={}",
+            checksum_even_case_ok, checksum_odd_case_ok, request_fields_ok, reply_fields_ok,
+            corrupted_checksum_rejected, ipv4_checksum_valid
+        );
+    }
+
     shell::dispatch_command("disk");
     shell::dispatch_command("ls");
     shell::dispatch_command("cat KERNEL~1");
