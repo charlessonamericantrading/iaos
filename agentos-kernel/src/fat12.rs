@@ -602,14 +602,33 @@ impl Fat12Info {
     /// interpreted as structured entries - stale data past "."/".."
     /// could be misread as bogus additional entries if left in place.
     pub fn create_directory(&mut self, name: &str) -> Result<(), &'static str> {
-        let entries = self.list_root_directory()?;
+        self.create_directory_impl(DirLocation::Root, name)
+    }
+
+    /// Same as `create_directory`, but nested inside the subdirectory
+    /// whose own cluster is `parent_cluster` instead of the root -
+    /// directories more than one level deep.
+    pub fn create_directory_in(
+        &mut self,
+        parent_cluster: u32,
+        name: &str,
+    ) -> Result<(), &'static str> {
+        self.create_directory_impl(DirLocation::Cluster(parent_cluster), name)
+    }
+
+    fn create_directory_impl(
+        &mut self,
+        parent: DirLocation,
+        name: &str,
+    ) -> Result<(), &'static str> {
+        let entries = self.list_entries_in(parent)?;
         if entries.iter().any(|e| e.name.eq_ignore_ascii_case(name)) {
             return Err("FAT12: a file or directory with that name already exists");
         }
 
         let short_name = to_short_name(name)?;
         let cluster = self.find_free_clusters(1)?[0];
-        let (entry_lba, entry_offset) = self.find_free_root_entry()?;
+        let (entry_lba, entry_offset) = self.find_free_entry_in(parent)?;
 
         let time = crate::rtc::read_time();
         let (fat_time, fat_date) = to_fat_datetime(&time);
@@ -619,8 +638,17 @@ impl Fat12Info {
         let mut dotdot_name = [b' '; 11];
         dotdot_name[0] = b'.';
         dotdot_name[1] = b'.';
+        // ".." points to the parent's own cluster - 0 is the real FAT
+        // convention specifically for "the parent is the root
+        // directory" (root has no cluster number of its own); a nested
+        // directory's parent is a genuine cluster instead.
+        let parent_cluster = match parent {
+            DirLocation::Root => 0,
+            DirLocation::Cluster(c) => c,
+        };
         let dot_entry = build_dir_entry(&dot_name, 0x10, cluster, 0, fat_time, fat_date);
-        let dotdot_entry = build_dir_entry(&dotdot_name, 0x10, 0, 0, fat_time, fat_date);
+        let dotdot_entry =
+            build_dir_entry(&dotdot_name, 0x10, parent_cluster, 0, fat_time, fat_date);
 
         let cluster_lba = self.cluster_to_lba(cluster);
         let mut first_sector = [0u8; 512];
@@ -774,15 +802,28 @@ impl Fat12Info {
     /// doesn't care whether the chain held file bytes or directory
     /// entries. Refuses to delete a non-empty directory (anything beyond
     /// the `.`/`..` entries every directory `create_directory` writes) -
-    /// the standard, safe `rmdir` semantic. This can't currently be
-    /// exercised against a genuinely non-empty directory in practice,
-    /// since nothing yet puts a real file *inside* a subdirectory
-    /// (`create_file`/`read_file`/`write_file` are still root-only) - but
-    /// the check is correct and forward-looking regardless, not
-    /// speculative dead code: it's exactly what would matter the moment
-    /// subdirectory-scoped file I/O is added.
+    /// the standard, safe `rmdir` semantic.
     pub fn delete_directory(&mut self, name: &str) -> Result<(), &'static str> {
-        let (entry_lba, entry_offset, entry) = self.find_entry_location(name)?;
+        self.delete_directory_impl(DirLocation::Root, name)
+    }
+
+    /// Same as `delete_directory`, but for a directory nested inside the
+    /// subdirectory whose own cluster is `parent_cluster` instead of the
+    /// root.
+    pub fn delete_directory_in(
+        &mut self,
+        parent_cluster: u32,
+        name: &str,
+    ) -> Result<(), &'static str> {
+        self.delete_directory_impl(DirLocation::Cluster(parent_cluster), name)
+    }
+
+    fn delete_directory_impl(
+        &mut self,
+        parent: DirLocation,
+        name: &str,
+    ) -> Result<(), &'static str> {
+        let (entry_lba, entry_offset, entry) = self.find_entry_location_in(parent, name)?;
         if !entry.is_dir {
             return Err("FAT12: delete_directory does not support files - use rm");
         }

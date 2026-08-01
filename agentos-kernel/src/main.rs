@@ -835,6 +835,90 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("rmdir PATHTEST");
     shell::dispatch_command("ls");
 
+    // 7b-16. Real NESTED FAT12 subdirectories - create_directory/
+    // delete_directory now accept a parent directory location (root OR
+    // another subdirectory's cluster), the exact same DirLocation
+    // pattern Fase 34 used for file I/O. The one thing genuinely
+    // different for a nested directory vs. a root-level one: its ".."
+    // entry must point to the PARENT's real cluster, not always 0 (0 is
+    // specifically the "parent is root" convention) - this test's real
+    // correctness check is confirming that value, not just that
+    // creation "succeeded". Not yet wired to shell path syntax (that
+    // needs multi-segment path parsing, a separate concern) - proven at
+    // the Fat12Info API level first, same order as Fase 34.
+    kprintln!("[KERNEL INIT] Testing nested FAT12 subdirectories...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                let _ = fs.create_directory("NESTTEST");
+                let outer_cluster = fs
+                    .list_root_directory()
+                    .ok()
+                    .and_then(|entries| entries.into_iter().find(|e| e.name == "NESTTEST"))
+                    .map(|e| e.start_cluster);
+
+                match outer_cluster {
+                    Some(outer) => {
+                        let _ = fs.create_directory_in(outer, "INNER");
+                        let outer_entries = fs.list_directory(outer).unwrap_or_default();
+                        let inner_cluster = outer_entries
+                            .iter()
+                            .find(|e| e.name == "INNER")
+                            .map(|e| e.start_cluster);
+                        // "." + ".." + "INNER" - proves creation didn't
+                        // just succeed but also didn't leave stale or
+                        // duplicate entries in the parent.
+                        let outer_count_ok = outer_entries.len() == 3;
+
+                        let dotdot_ok = match inner_cluster {
+                            Some(inner) => fs
+                                .list_directory(inner)
+                                .ok()
+                                .and_then(|entries| entries.into_iter().find(|e| e.name == ".."))
+                                .map(|e| e.start_cluster == outer)
+                                .unwrap_or(false),
+                            None => false,
+                        };
+
+                        let delete_inner_ok = fs.delete_directory_in(outer, "INNER").is_ok();
+                        let cleanup_ok = fs.delete_directory("NESTTEST").is_ok();
+
+                        kprintln!(
+                            "[FAT12] nested dir test: outer_count_ok={} dotdot_ok={} delete_inner_ok={} cleanup_ok={}",
+                            outer_count_ok,
+                            dotdot_ok,
+                            delete_inner_ok,
+                            cleanup_ok
+                        );
+                        serial_println!(
+                            "[FAT12] nested_dir_test outer_count_ok={} dotdot_ok={} delete_inner_ok={} cleanup_ok={}",
+                            outer_count_ok,
+                            dotdot_ok,
+                            delete_inner_ok,
+                            cleanup_ok
+                        );
+                    }
+                    None => {
+                        kprintln!("[FAT12] nested dir test: couldn't find NESTTEST's cluster");
+                        serial_println!("[FAT12] nested_dir_test -> no outer cluster");
+                    }
+                }
+            }
+            Err(e) => {
+                kprintln!("[FAT12] nested dir test: not FAT12 ({})", e);
+                serial_println!("[FAT12] nested_dir_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!(
+                "[FAT12] nested dir test: couldn't find FAT partition: {}",
+                e
+            );
+            serial_println!("[FAT12] nested_dir_test -> no partition: {}", e);
+        }
+    }
+    shell::dispatch_command("ls");
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real

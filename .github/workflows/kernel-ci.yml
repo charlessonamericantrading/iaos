@@ -382,6 +382,19 @@ jobs:
           grep -q "SHELL\] rm PATHTEST/INSIDE.TXT -> deleted" boot.log
           grep -q "SHELL\] cat PATHTEST/INSIDE.TXT -> FAILED: FAT12: file not found in directory" boot.log
           grep -q "SHELL\] rmdir PATHTEST -> deleted" boot.log
+          # Confirms NESTED FAT12 subdirectories (Fase 36) - create_directory/
+          # delete_directory now accept a parent directory location, same
+          # DirLocation pattern as the file-I/O generalization above. The
+          # real correctness check here is dotdot_ok specifically: a nested
+          # directory's ".." entry must point to its PARENT's real cluster,
+          # not always 0 (0 is only valid when the parent is root) - a bug
+          # here would leave dotdot_ok=false while everything else still
+          # reported success, so this is exactly the kind of subtle
+          # regression a less specific check could miss. All four checks
+          # must succeed for this exact line to appear, so it's a strong
+          # single assertion; a fresh CI image always takes this same
+          # fully-self-cleaning path.
+          grep -q "FAT12\] nested_dir_test outer_count_ok=true dotdot_ok=true delete_inner_ok=true cleanup_ok=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.
