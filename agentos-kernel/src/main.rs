@@ -455,6 +455,58 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 5b-3. Test real GGUF Q4_1 quantized tensor decoding (Fase 53) - the
+    // last legacy quantization format after Q8_0 (Fase 50) and Q4_0
+    // (Fase 52), completing that thread. Same 4-bit split-half nibble
+    // packing as Q4_0 (verified to genuinely carry over unchanged, not
+    // just assumed, via GGML's actual dequantize_row_q4_1 source), but a
+    // full affine dequantization (nibble*scale+min) instead of Q4_0's
+    // symmetric (nibble-8)*scale - a second f16 "min" field lets Q4_1
+    // represent asymmetric value ranges Q4_0's fixed symmetric range
+    // can't.
+    //
+    // q4_1_decode_ok builds one real 20-byte block with scale=0.5,
+    // min=1.0 (deliberately nonzero and distinct from each other, so a
+    // bug conflating scale and min, or dropping either one, produces
+    // visibly wrong values) and the SAME asymmetric nibble pattern
+    // (low ascending, high descending) as Q4_0's self-test, for the same
+    // "catch a swap/interleave bug" reasoning. dispatch_q4_1_ok proves
+    // decode_tensor (Fase 50) now routes Q4_1 too - meaning every
+    // GgufGtype except F16 now has a real decoder.
+    kprintln!("[GGUF INFERENCE] Testing Q4_1 quantized tensor decoding...");
+    {
+        use gguf_loader::GgufModelLoader;
+
+        const SCALE_BITS: u16 = 0x3800; // f16 0.5
+        const MIN_BITS: u16 = 0x3C00; // f16 1.0
+        let mut q4_1_block: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(20);
+        q4_1_block.extend_from_slice(&SCALE_BITS.to_le_bytes());
+        q4_1_block.extend_from_slice(&MIN_BITS.to_le_bytes());
+        let mut expected_q4_1: alloc::vec::Vec<f32> = alloc::vec![0.0f32; 32];
+        for j in 0..16usize {
+            let low_nibble = j as u8; // 0..15, ascending
+            let high_nibble = (15 - j) as u8; // 15..0, descending
+            q4_1_block.push(low_nibble | (high_nibble << 4));
+            expected_q4_1[j] = low_nibble as f32 * 0.5 + 1.0;
+            expected_q4_1[j + 16] = high_nibble as f32 * 0.5 + 1.0;
+        }
+        let decoded_q4_1 = GgufModelLoader::decode_q4_1(&q4_1_block);
+        let q4_1_decode_ok = decoded_q4_1 == expected_q4_1;
+        let dispatch_q4_1_ok =
+            GgufModelLoader::decode_tensor(&q4_1_block, GgufGtype::Q4_1) == Ok(expected_q4_1);
+
+        kprintln!(
+            "[GGUF Q4_1] q4_1_decode_ok={} dispatch_q4_1_ok={}",
+            q4_1_decode_ok,
+            dispatch_q4_1_ok
+        );
+        serial_println!(
+            "[GGUF] q4_1_test q4_1_decode_ok={} dispatch_q4_1_ok={}",
+            q4_1_decode_ok,
+            dispatch_q4_1_ok
+        );
+    }
+
     // 5c. Test real GGUF multi-tensor-info support (Fase 51) -
     // GgufTensorInfo::parse has returned "how many bytes this one entry
     // consumed" since Fase 43 specifically so several could be parsed in

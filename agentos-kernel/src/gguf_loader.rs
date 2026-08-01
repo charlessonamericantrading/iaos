@@ -285,6 +285,45 @@ impl GgufModelLoader {
         values
     }
 
+    /// Decodes `bytes` as real GGML/GGUF Q4_1-quantized data - the same
+    /// 4-bit, split-half nibble packing as `Q4_0`, but with a full affine
+    /// (scale AND offset) dequantization instead of `Q4_0`'s symmetric
+    /// `(nibble-8)*scale`. Each 20-byte block is GGML's own `block_q4_1`
+    /// layout (`{ ggml_fp16_t d; ggml_fp16_t m; uint8_t qs[16]; }`) - two
+    /// half-precision fields (a scale `d` and a minimum `m`) followed by
+    /// the same 16-byte split-half nibble packing `Q4_0` uses. Verified
+    /// against GGML's actual `dequantize_row_q4_1` source rather than
+    /// assumed to carry over unchanged from `Q4_0` - it does, but `Q4_0`'s
+    /// own packing order was itself non-obvious enough to have needed
+    /// verification, so this wasn't taken on faith either. Each real
+    /// value is `nibble as f32 * scale + min` - the raw unsigned 0-15
+    /// nibble used directly (no `-8` recentering; `min` supplies whatever
+    /// offset the block actually needs, letting `Q4_1` represent
+    /// asymmetric value distributions `Q4_0`'s fixed symmetric range
+    /// can't). Any trailing bytes that don't form a complete 20-byte
+    /// block are silently dropped, same convention as the other decoders.
+    pub fn decode_q4_1(bytes: &[u8]) -> Vec<f32> {
+        const BLOCK_SIZE: usize = 20; // 2-byte scale + 2-byte min + 16 bytes (32 packed nibbles)
+        const HALF: usize = 16;
+
+        let (blocks, _remainder) = bytes.as_chunks::<BLOCK_SIZE>();
+        let mut values = Vec::with_capacity(blocks.len() * HALF * 2);
+        for block in blocks {
+            let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            let qs = &block[4..BLOCK_SIZE];
+            let mut block_values = [0.0f32; HALF * 2];
+            for j in 0..HALF {
+                let low = qs[j] & 0x0F;
+                let high = qs[j] >> 4;
+                block_values[j] = low as f32 * scale + min;
+                block_values[j + HALF] = high as f32 * scale + min;
+            }
+            values.extend_from_slice(&block_values);
+        }
+        values
+    }
+
     /// Decodes `bytes` according to a tensor's own parsed `gtype` -
     /// dispatches to the right format-specific decoder instead of
     /// silently assuming `F32`, closing a real gap: `GgufTensorInfo`
@@ -297,7 +336,8 @@ impl GgufModelLoader {
             GgufGtype::F32 => Ok(Self::decode_f32_le(bytes)),
             GgufGtype::Q8_0 => Ok(Self::decode_q8_0(bytes)),
             GgufGtype::Q4_0 => Ok(Self::decode_q4_0(bytes)),
-            GgufGtype::F16 | GgufGtype::Q4_1 => {
+            GgufGtype::Q4_1 => Ok(Self::decode_q4_1(bytes)),
+            GgufGtype::F16 => {
                 Err("GGUF: this tensor's gtype doesn't have a decoder implemented yet")
             }
         }

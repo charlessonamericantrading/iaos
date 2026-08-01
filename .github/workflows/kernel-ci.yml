@@ -140,6 +140,17 @@ jobs:
           # dispatch_q4_0_ok confirms decode_tensor (Fase 50) now routes
           # Q4_0 to this new decoder too.
           grep -q "GGUF\] q4_0_test q4_0_decode_ok=true dispatch_q4_0_ok=true" boot.log
+          # Confirms real GGUF Q4_1 quantized tensor decoding (Fase 53) -
+          # closes out the legacy quantization thread (every GgufGtype
+          # except F16 now has a real decoder). Same split-half nibble
+          # packing as Q4_0, verified to genuinely carry over via GGML's
+          # actual dequantize_row_q4_1 source, but a full affine
+          # nibble*scale+min dequantization instead of Q4_0's fixed
+          # symmetric range. scale=0.5/min=1.0 are deliberately distinct
+          # nonzero values so a bug conflating or dropping either field
+          # produces visibly wrong output, combined with the same
+          # asymmetric nibble pattern Q4_0's own test uses.
+          grep -q "GGUF\] q4_1_test q4_1_decode_ok=true dispatch_q4_1_ok=true" boot.log
           # Confirms real GGUF multi-tensor-info support (Fase 51) -
           # GgufTensorInfo::parse_many, generalizing tensor-info parsing
           # to any real number of tensors instead of just one.
