@@ -83,6 +83,48 @@ impl GgufTensorInfo {
     }
 }
 
+/// Converts an IEEE 754 half-precision (binary16) bit pattern to `f32` -
+/// needed because Q8_0's block scale is stored as a real GGML `ggml_fp16_t`
+/// and this `#![no_std]` build has no `f16` type or conversion available
+/// from std/an external crate. Hand-verified against each of binary16's
+/// defined cases (zero, subnormal, normal, infinity) independently, not
+/// just a single from-memory formula: a wrong exponent bias or subnormal-
+/// handling bug would silently produce a plausible-looking but wrong
+/// float, not a crash - the same class of silent-failure risk Fase 47's
+/// checksum work was written to guard against.
+///
+/// Layout: 1 sign bit, 5 exponent bits (bias 15), 10 mantissa bits.
+/// Subnormals (exp16 == 0, mantissa != 0) are normalized by shifting left
+/// until the implicit leading bit appears, tracking the resulting
+/// exponent - binary16's entire subnormal range (down to 2^-24) fits well
+/// within f32's normal exponent range, so the result is always a normal
+/// f32, never itself subnormal.
+pub fn f16_to_f32(bits: u16) -> f32 {
+    let sign = (bits & 0x8000) as u32;
+    let exp16 = (bits >> 10) & 0x1F;
+    let mant16 = (bits & 0x3FF) as u32;
+
+    let (exp32, mant32): (u32, u32) = if exp16 == 0 {
+        if mant16 == 0 {
+            (0, 0) // zero
+        } else {
+            let mut m = mant16;
+            let mut e: i32 = -14;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            ((e + 127) as u32, (m & 0x3FF) << 13)
+        }
+    } else if exp16 == 0x1F {
+        (0xFF, mant16 << 13) // infinity (mant16=0) or NaN (mant16!=0)
+    } else {
+        (exp16 as u32 + (127 - 15), mant16 << 13) // normal
+    };
+
+    f32::from_bits((sign << 16) | (exp32 << 23) | mant32)
+}
+
 pub struct GgufModelLoader {
     pub magic: u32,
     pub version: u32,
@@ -140,12 +182,10 @@ impl GgufModelLoader {
     /// Decodes a byte buffer into little-endian `f32` values - the raw
     /// tensor data a `GgufTensorInfo`'s own `offset` field points to.
     /// Doesn't know or care about quantization: every value here is
-    /// assumed already `F32` (real GGUF's other `GgufGtype` variants
-    /// pack multiple values per few bytes - decoding those is real,
-    /// separate work, not attempted here). Any trailing bytes that
-    /// don't form a complete 4-byte group are silently dropped rather
-    /// than erroring - the caller already knows how many values it
-    /// expects from the tensor's own parsed dimensions.
+    /// assumed already `F32`. Any trailing bytes that don't form a
+    /// complete 4-byte group are silently dropped rather than erroring -
+    /// the caller already knows how many values it expects from the
+    /// tensor's own parsed dimensions.
     pub fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
         bytes
             .as_chunks::<4>()
@@ -153,6 +193,50 @@ impl GgufModelLoader {
             .iter()
             .map(|&c| f32::from_le_bytes(c))
             .collect()
+    }
+
+    /// Decodes `bytes` as real GGML/GGUF Q8_0-quantized data - the
+    /// simplest of GGUF's actual quantized formats (real GGUF's whole
+    /// point as a format), and the first one this kernel decodes for
+    /// real rather than assuming everything is `F32`. Each 34-byte block
+    /// is GGML's own `block_q8_0` layout (`{ ggml_fp16_t d; int8_t
+    /// qs[32]; }`, `QK8_0 = 32`) - a 2-byte half-precision scale `d`
+    /// followed by 32 signed 8-bit quantized values, verified against
+    /// GGML's actual struct definition rather than relied on from memory.
+    /// Each real value is `qs[i] as f32 * d` - one shared scale per
+    /// 32-value block, not a per-value scale. Any trailing bytes that
+    /// don't form a complete 34-byte block are silently dropped, same
+    /// convention as `decode_f32_le`.
+    pub fn decode_q8_0(bytes: &[u8]) -> Vec<f32> {
+        const BLOCK_SIZE: usize = 34; // 2-byte f16 scale + 32 i8 values
+        const VALUES_PER_BLOCK: usize = 32;
+
+        let (blocks, _remainder) = bytes.as_chunks::<BLOCK_SIZE>();
+        let mut values = Vec::with_capacity(blocks.len() * VALUES_PER_BLOCK);
+        for block in blocks {
+            let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            for &byte in &block[2..BLOCK_SIZE] {
+                values.push((byte as i8) as f32 * scale);
+            }
+        }
+        values
+    }
+
+    /// Decodes `bytes` according to a tensor's own parsed `gtype` -
+    /// dispatches to the right format-specific decoder instead of
+    /// silently assuming `F32`, closing a real gap: `GgufTensorInfo`
+    /// already parses and stores every tensor's real gtype, but nothing
+    /// before this ever branched on it to decide *how* to read the
+    /// tensor's data - every existing caller just called `decode_f32_le`
+    /// directly regardless of what gtype it had actually parsed.
+    pub fn decode_tensor(bytes: &[u8], gtype: GgufGtype) -> Result<Vec<f32>, &'static str> {
+        match gtype {
+            GgufGtype::F32 => Ok(Self::decode_f32_le(bytes)),
+            GgufGtype::Q8_0 => Ok(Self::decode_q8_0(bytes)),
+            GgufGtype::F16 | GgufGtype::Q4_0 | GgufGtype::Q4_1 => {
+                Err("GGUF: this tensor's gtype doesn't have a decoder implemented yet")
+            }
+        }
     }
 
     /// Perform forward inference using loaded GGUF tensor weights

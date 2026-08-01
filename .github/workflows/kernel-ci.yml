@@ -116,6 +116,18 @@ jobs:
           # weights produces the same known-correct result the original
           # hardcoded array always did.
           grep -q "GGUF\] disk_load_test write_ok=true round_trip_ok=true tensor_info_ok=true weights_decoded_ok=true tensor_output_ok=true cleanup_ok=true" boot.log
+          # Confirms real GGUF Q8_0 quantized tensor decoding (Fase 50) -
+          # pure byte-transformation logic, deliberately disk-independent.
+          # f16_vectors_ok is hand-computed (bit patterns 0x3C00/0xC000/
+          # 0x0000/0x0001 -> 1.0/-2.0/0.0/the smallest binary16 subnormal),
+          # independent of decode_q8_0's own round trip - a round-trip-
+          # only test would still pass even if f16_to_f32 consistently
+          # disagreed with the real IEEE 754 standard. dispatch_*_ok prove
+          # decode_tensor actually branches on a tensor's gtype (F32,
+          # Q8_0, and an honest Err for an unimplemented one) rather than
+          # silently assuming everything is F32, the real gap this Fase
+          # closes.
+          grep -q "GGUF\] q8_0_test f16_vectors_ok=true q8_0_decode_ok=true dispatch_f32_ok=true dispatch_q8_0_ok=true dispatch_unimplemented_ok=true" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -

@@ -331,6 +331,80 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // 5b. Test real GGUF Q8_0 quantized tensor decoding (Fase 50) - pure
+    // byte-transformation logic, deliberately disk-independent (unlike
+    // the disk-load test above): GgufTensorInfo has parsed a tensor's
+    // real gtype since Fase 43, but until this Fase nothing ever
+    // branched on it to decide *how* to decode - every caller assumed
+    // F32. decode_q8_0/decode_tensor and the f16_to_f32 helper they need
+    // (GGML's block scale is a real half-precision float, and this
+    // no_std build has no f16 type of its own) were verified against
+    // GGML's actual block_q8_0 struct and IEEE 754 binary16's defined
+    // cases respectively, the same discipline Fase 47 used for RFC 1071.
+    //
+    // f16_vectors_ok is hand-computed, independent of decode_q8_0's own
+    // round trip - the same reasoning Fase 47 applied to its checksum
+    // vectors: a round-trip-only test would still pass even if
+    // f16_to_f32 consistently disagreed with the real IEEE 754 standard,
+    // since decode_q8_0 would just consistently agree with itself. Covers
+    // zero, the smallest subnormal (2^-24, the trickiest branch - a
+    // normalizing left-shift loop), and a normal negative value.
+    // q8_0_decode_ok builds a real 34-byte block (scale=0.5, values -16
+    // through 15) and checks the decoded values against directly
+    // computing `value * 0.5` on the original i8s - independent of
+    // decode_q8_0's own byte-parsing, so a block-size or byte-order bug
+    // would still be caught even though both sides agree on what 0.5
+    // means. dispatch_f32_ok/dispatch_q8_0_ok/dispatch_unimplemented_ok
+    // prove decode_tensor actually branches on gtype rather than
+    // silently ignoring it, including the honest Err for a gtype with no
+    // decoder yet (F16 here) rather than silently misreading it as F32.
+    kprintln!("[GGUF INFERENCE] Testing Q8_0 quantized tensor decoding...");
+    {
+        use gguf_loader::{f16_to_f32, GgufModelLoader};
+
+        // Smallest binary16 subnormal (bits=0x0001) is exactly 2^-24 -
+        // built directly from its own bit pattern (biased exponent
+        // 127-24=103, zero mantissa) rather than a runtime `powi` (not
+        // available without libm in this #![no_std] build anyway),
+        // independently of f16_to_f32's own bit-construction logic.
+        let smallest_subnormal_f32 = f32::from_bits(103u32 << 23);
+        let f16_vectors_ok = [
+            (0x0000u16, 0.0f32),
+            (0xC000u16, -2.0f32),
+            (0x3C00u16, 1.0f32),
+            (0x0001u16, smallest_subnormal_f32),
+        ]
+        .iter()
+        .all(|&(bits, expected)| f16_to_f32(bits) == expected);
+
+        let qs: [i8; 32] = core::array::from_fn(|i| (i as i8) - 16);
+        let mut q8_block: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(34);
+        q8_block.extend_from_slice(&0x3800u16.to_le_bytes()); // f16 0.5
+        for &v in &qs {
+            q8_block.push(v as u8);
+        }
+        let decoded = GgufModelLoader::decode_q8_0(&q8_block);
+        let expected: alloc::vec::Vec<f32> = qs.iter().map(|&v| v as f32 * 0.5).collect();
+        let q8_0_decode_ok = decoded == expected;
+
+        let f32_bytes = 2.5f32.to_le_bytes();
+        let dispatch_f32_ok =
+            GgufModelLoader::decode_tensor(&f32_bytes, GgufGtype::F32) == Ok(alloc::vec![2.5f32]);
+        let dispatch_q8_0_ok =
+            GgufModelLoader::decode_tensor(&q8_block, GgufGtype::Q8_0) == Ok(expected);
+        let dispatch_unimplemented_ok =
+            GgufModelLoader::decode_tensor(&[0u8; 2], GgufGtype::F16).is_err();
+
+        kprintln!(
+            "[GGUF Q8_0] f16_vectors_ok={} q8_0_decode_ok={} dispatch_f32_ok={} dispatch_q8_0_ok={} dispatch_unimplemented_ok={}",
+            f16_vectors_ok, q8_0_decode_ok, dispatch_f32_ok, dispatch_q8_0_ok, dispatch_unimplemented_ok
+        );
+        serial_println!(
+            "[GGUF] q8_0_test f16_vectors_ok={} q8_0_decode_ok={} dispatch_f32_ok={} dispatch_q8_0_ok={} dispatch_unimplemented_ok={}",
+            f16_vectors_ok, q8_0_decode_ok, dispatch_f32_ok, dispatch_q8_0_ok, dispatch_unimplemented_ok
+        );
+    }
+
     // 6. Test Native VirtIO-Net & TCP/IPv4 Network Stack
     kprintln!("[NET INIT] Initializing VirtIO-Net Hardware Adapter & TCP/IP Stack...");
     NativeNetworkStack::send_ipv4_packet([192, 168, 1, 1], b"AgentOS Kernel Online");
