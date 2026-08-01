@@ -551,6 +551,84 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 5b-5. Test real GGUF Q4_K super-block quantized tensor decoding
+    // (Fase 57) - GGML's "K-quant" family, structurally different from
+    // (and meaningfully more complex than) the legacy Q8_0/Q4_0/Q4_1
+    // formats above: 256 values per 144-byte block, split into 8 sub-
+    // blocks of 32 with their OWN 6-bit-packed scale and min each, not
+    // one scale for the whole block. Getting this right needed real,
+    // deliberate care beyond the usual "fetch the source, verify a test
+    // vector" pattern: an early research fetch of this exact struct's
+    // field sizes came back wrong (`scales[8]`/`qs[64]` instead of the
+    // real `scales[12]`/`qs[128]`, caught by cross-checking against
+    // GGML's own K_SCALE_SIZE/QK_K constants) - so get_scale_min_k4's
+    // own intricate bit-unpacking (see its own doc) was independently
+    // hand-derived and verified with a complete round trip covering all
+    // 8 sub-blocks before any of this was trusted enough to implement.
+    //
+    // get_scale_min_k4_ok re-runs that exact same hand-verified round
+    // trip as a real, compiled self-test (not just scratch-paper math):
+    // a 12-byte scales array encoding sc=[7,14,21,28,35,42,49,56],
+    // m=[56,49,42,35,28,21,14,7] - chosen to be small, distinct, and
+    // exercise every sub-block index and both branches of get_scale_
+    // min_k4's own `j < 4` split. decode_q4_k_ok builds one full real
+    // 144-byte block (d=dmin=1.0, using that same scales array) with
+    // FOUR distinct 32-byte qs chunks (0x00/0xFF/0x73/0x21 - deliberately
+    // different low/high nibble values per chunk) and checks all 256
+    // decoded values against 8 hand-computed constants (one low/high
+    // pair per chunk) - proving the outer sub-block loop, the q_offset
+    // chunk advancement, and the low/high nibble split are all correct
+    // together, not just get_scale_min_k4 in isolation.
+    kprintln!("[GGUF INFERENCE] Testing Q4_K super-block quantized tensor decoding...");
+    {
+        use gguf_loader::{get_scale_min_k4, GgufModelLoader};
+
+        const SCALES: [u8; 12] = [135, 142, 213, 220, 120, 113, 42, 35, 195, 90, 225, 120];
+        const EXPECTED_SC: [u8; 8] = [7, 14, 21, 28, 35, 42, 49, 56];
+        const EXPECTED_M: [u8; 8] = [56, 49, 42, 35, 28, 21, 14, 7];
+        let get_scale_min_k4_ok = (0..8).all(|j| {
+            let (sc, m) = get_scale_min_k4(j, &SCALES);
+            sc == EXPECTED_SC[j] && m == EXPECTED_M[j]
+        });
+
+        let mut q4k_block: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(144);
+        q4k_block.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+        q4k_block.extend_from_slice(&0x3C00u16.to_le_bytes()); // dmin = 1.0
+        q4k_block.extend_from_slice(&SCALES);
+        q4k_block.extend(core::iter::repeat_n(0x00u8, 32)); // chunk 0
+        q4k_block.extend(core::iter::repeat_n(0xFFu8, 32)); // chunk 1
+        q4k_block.extend(core::iter::repeat_n(0x73u8, 32)); // chunk 2
+        q4k_block.extend(core::iter::repeat_n(0x21u8, 32)); // chunk 3
+
+        let decoded = GgufModelLoader::decode_q4_k(&q4k_block);
+        let mut expected_q4k: alloc::vec::Vec<f32> = alloc::vec::Vec::with_capacity(256);
+        expected_q4k.extend(core::iter::repeat_n(-56.0f32, 32)); // chunk0 low: 7*0-56
+        expected_q4k.extend(core::iter::repeat_n(-49.0f32, 32)); // chunk0 high: 14*0-49
+        expected_q4k.extend(core::iter::repeat_n(273.0f32, 32)); // chunk1 low: 21*15-42
+        expected_q4k.extend(core::iter::repeat_n(385.0f32, 32)); // chunk1 high: 28*15-35
+        expected_q4k.extend(core::iter::repeat_n(77.0f32, 32)); // chunk2 low: 35*3-28
+        expected_q4k.extend(core::iter::repeat_n(273.0f32, 32)); // chunk2 high: 42*7-21
+        expected_q4k.extend(core::iter::repeat_n(35.0f32, 32)); // chunk3 low: 49*1-14
+        expected_q4k.extend(core::iter::repeat_n(105.0f32, 32)); // chunk3 high: 56*2-7
+        let decode_q4_k_ok = decoded == expected_q4k;
+
+        let dispatch_q4_k_ok =
+            GgufModelLoader::decode_tensor(&q4k_block, GgufGtype::Q4_K) == Ok(expected_q4k);
+
+        kprintln!(
+            "[GGUF Q4_K] get_scale_min_k4_ok={} decode_q4_k_ok={} dispatch_q4_k_ok={}",
+            get_scale_min_k4_ok,
+            decode_q4_k_ok,
+            dispatch_q4_k_ok
+        );
+        serial_println!(
+            "[GGUF] q4_k_test get_scale_min_k4_ok={} decode_q4_k_ok={} dispatch_q4_k_ok={}",
+            get_scale_min_k4_ok,
+            decode_q4_k_ok,
+            dispatch_q4_k_ok
+        );
+    }
+
     // 5c. Test real GGUF multi-tensor-info support (Fase 51) -
     // GgufTensorInfo::parse has returned "how many bytes this one entry
     // consumed" since Fase 43 specifically so several could be parsed in

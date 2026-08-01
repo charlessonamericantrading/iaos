@@ -151,6 +151,17 @@ jobs:
           # produces visibly wrong output, combined with the same
           # asymmetric nibble pattern Q4_0's own test uses.
           grep -q "GGUF\] q4_1_test q4_1_decode_ok=true dispatch_q4_1_ok=true" boot.log
+          # Confirms real GGUF Q4_K super-block decoding (Fase 57) - a
+          # 144-byte block holding 256 values across 8 sub-blocks, each
+          # with its own 6-bit-packed scale+min (get_scale_min_k4).
+          # get_scale_min_k4_ok re-runs a hand-derived-and-verified round
+          # trip (an early research fetch of this struct's field sizes
+          # was wrong - scales[8]/qs[64] instead of the real scales[12]/
+          # qs[128] - so this function's own bit-packing was independently
+          # hand-checked, not just re-fetched and trusted). decode_q4_k_ok
+          # checks all 256 decoded values (4 distinct 32-byte qs chunks)
+          # against 8 hand-computed constants covering every sub-block.
+          grep -q "GGUF\] q4_k_test get_scale_min_k4_ok=true decode_q4_k_ok=true dispatch_q4_k_ok=true" boot.log
           # Confirms real GGUF F16 tensor decoding (Fase 54) - the last
           # GgufGtype, completing full decode_tensor coverage. Unlike the
           # quantized formats above, F16 has no block/scale structure at

@@ -6,7 +6,10 @@ use alloc::vec::Vec;
 
 pub const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in Little Endian
 
-#[allow(dead_code)]
+// Q4_K keeps GGML's real name (underscore included, matching Q4_0/Q4_1/
+// Q8_0 already here) rather than the "Q4K" rustc's non_camel_case_types
+// lint would prefer - real GGUF/GGML terminology over cosmetic style.
+#[allow(dead_code, non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgufGtype {
     F32 = 0,
@@ -14,6 +17,7 @@ pub enum GgufGtype {
     Q4_0 = 2,
     Q4_1 = 3,
     Q8_0 = 8,
+    Q4_K = 12,
 }
 
 impl GgufGtype {
@@ -24,6 +28,7 @@ impl GgufGtype {
             2 => Ok(GgufGtype::Q4_0),
             3 => Ok(GgufGtype::Q4_1),
             8 => Ok(GgufGtype::Q8_0),
+            12 => Ok(GgufGtype::Q4_K),
             _ => Err("GGUF: unknown tensor gtype"),
         }
     }
@@ -148,6 +153,41 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     };
 
     f32::from_bits((sign << 16) | (exp32 << 23) | mant32)
+}
+
+/// Extracts sub-block `j`'s (0..8) 6-bit scale and 6-bit min out of Q4_K's
+/// packed `scales[12]` array - GGML's own `get_scale_min_k4`, ported
+/// verbatim (down to the exact index arithmetic) rather than re-derived,
+/// since matching the real function bit-for-bit is the whole point here.
+/// The packing itself: bytes `0..4` hold sub-blocks `0..4`'s scales in
+/// their low 6 bits; bytes `4..8` hold sub-blocks `0..4`'s mins in their
+/// low 6 bits; bytes `8..12` hold sub-blocks `4..8`'s scales (low nibble)
+/// and mins (high nibble) in their low 4 bits each - and sub-blocks
+/// `4..8`'s own missing top 2 bits are smuggled into the otherwise-unused
+/// top 2 bits of bytes `0..4`/`4..8` (which the `& 63` mask above never
+/// touches). Twelve bytes hold exactly sixteen 6-bit values (96 bits)
+/// with zero bits wasted or reused.
+///
+/// Independently hand-verified with a complete round trip (all 8 sub-
+/// blocks, both branches of the `j < 4` split) before being trusted:
+/// encoding `sc = [7,14,21,28,35,42,49,56]`, `m = [56,49,42,35,28,21,14,7]`
+/// into `scales = [135,142,213,220,120,113,42,35,195,90,225,120]` by
+/// inverting this exact formula, then re-decoding those bytes through it,
+/// recovered every original value exactly - not just plausible, but
+/// bit-for-bit confirmed self-consistent, given an earlier fetch of this
+/// struct's own field sizes (`scales[8]`/`qs[64]`) turned out to be wrong
+/// (the real sizes are `scales[12]`/`qs[128]`, confirmed via GGML's own
+/// `K_SCALE_SIZE`/`QK_K` constants) - a demonstrated real error rate that
+/// made trusting this specific function's fetched logic without an
+/// independent check the wrong call.
+pub fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        let d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        let m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+        (d, m)
+    }
 }
 
 pub struct GgufModelLoader {
@@ -324,6 +364,73 @@ impl GgufModelLoader {
         values
     }
 
+    /// Decodes `bytes` as real GGML/GGUF Q4_K-quantized data - a "K-quant"
+    /// super-block format, structurally different from (and meaningfully
+    /// more complex than) `Q8_0`/`Q4_0`/`Q4_1` above: each 144-byte block
+    /// represents 256 values (not 32), split into 8 sub-blocks of 32
+    /// values each, and - the real point of the format - each sub-block
+    /// gets its OWN 6-bit scale and 6-bit min rather than one scale for
+    /// the whole block, letting different regions of a 256-value run be
+    /// quantized more accurately than a single shared scale ever could.
+    ///
+    /// Struct layout (144 bytes, verified against GGML's actual
+    /// `block_q4_K` - `K_SCALE_SIZE=12`, `QK_K=256`): 2-byte `d` (super-
+    /// block scale) + 2-byte `dmin` (super-block min-scale) +
+    /// `scales[12]` (16 packed 6-bit values: 8 sub-block scales and 8
+    /// sub-block mins) + `qs[128]` (256 4-bit values, two per byte,
+    /// split-half within each 32-byte chunk - the same low/high-nibble
+    /// convention `decode_q4_0`/`decode_q4_1` already use, just applied
+    /// per-32-byte-chunk instead of across the whole array).
+    ///
+    /// An earlier fetch of this same struct's field sizes turned out to
+    /// contain wrong numbers (`scales[8]`/`qs[64]` instead of the real
+    /// `scales[12]`/`qs[128]` - caught by cross-checking against GGML's
+    /// own `K_SCALE_SIZE`/`QK_K` constants, which don't agree with those
+    /// smaller sizes). Given that discovery, `get_scale_min_k4`'s own
+    /// intricate 6-bit-packing logic (see its own doc) was independently
+    /// hand-verified with a complete round trip - not just re-fetched a
+    /// second time and trusted - before any of this was implemented.
+    ///
+    /// Each real value is `(d * sub_scale) * nibble - (dmin * sub_min)` -
+    /// an affine dequantization like `Q4_1`'s, but with the scale AND min
+    /// themselves varying per 32-value sub-block rather than fixed for
+    /// the whole 256-value super-block.
+    pub fn decode_q4_k(bytes: &[u8]) -> Vec<f32> {
+        const BLOCK_SIZE: usize = 144; // 4 (d+dmin) + 12 (scales) + 128 (qs)
+        const SCALES_LEN: usize = 12;
+        const QS_LEN: usize = 128;
+        const SUB_BLOCK: usize = 32;
+
+        let (blocks, _remainder) = bytes.as_chunks::<BLOCK_SIZE>();
+        let mut values = Vec::with_capacity(blocks.len() * 256);
+        for block in blocks {
+            let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            let scales = &block[4..4 + SCALES_LEN];
+            let qs = &block[4 + SCALES_LEN..4 + SCALES_LEN + QS_LEN];
+
+            let mut q_offset = 0;
+            for is in (0..8).step_by(2) {
+                let (sc1, m1) = get_scale_min_k4(is, scales);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+                let d1 = d * sc1 as f32;
+                let dm1 = dmin * m1 as f32;
+                let d2 = d * sc2 as f32;
+                let dm2 = dmin * m2 as f32;
+
+                let chunk = &qs[q_offset..q_offset + SUB_BLOCK];
+                for &byte in chunk {
+                    values.push(d1 * (byte & 0x0F) as f32 - dm1);
+                }
+                for &byte in chunk {
+                    values.push(d2 * (byte >> 4) as f32 - dm2);
+                }
+                q_offset += SUB_BLOCK;
+            }
+        }
+        values
+    }
+
     /// Decodes a byte buffer as raw, unquantized half-precision (`F16`)
     /// values - unlike every quantized format above, there's no block
     /// structure or shared scale here at all: each value is simply its
@@ -355,6 +462,7 @@ impl GgufModelLoader {
             GgufGtype::Q8_0 => Ok(Self::decode_q8_0(bytes)),
             GgufGtype::Q4_0 => Ok(Self::decode_q4_0(bytes)),
             GgufGtype::Q4_1 => Ok(Self::decode_q4_1(bytes)),
+            GgufGtype::Q4_K => Ok(Self::decode_q4_k(bytes)),
         }
     }
 
