@@ -1295,6 +1295,43 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 pfn_ok,
                 info.final_status
             );
+
+            // 7b-2-4. Builds a real virtio_net_hdr + minimal broadcast
+            // frame, places it in the TX queue's avail ring, notifies
+            // the device, and polls the used ring for completion - the
+            // VirtIO equivalent of net::e1000::send_test_frame's own
+            // TDH-advancing proof (Fase 22), though a genuinely
+            // different protocol shape (a completion-ring index, not a
+            // single hardware register). First real attempt at
+            // actually sending data through this second NIC - honestly
+            // uncertain going in whether this hits its own version of
+            // e1000's own DD-bit mystery (Fase 22->44).
+            kprintln!("[VIRTIO INIT] Sending a test frame through the TX queue...");
+            match net::virtio::send_test_frame(&info) {
+                Ok(send) => {
+                    let used_advanced = send.used_idx_after != send.used_idx_before;
+                    kprintln!(
+                        "[VIRTIO TX] used_idx_before={} used_idx_after={} advanced={} elem_id={} elem_len={}",
+                        send.used_idx_before,
+                        send.used_idx_after,
+                        used_advanced,
+                        send.used_elem_id,
+                        send.used_elem_len
+                    );
+                    serial_println!(
+                        "[VIRTIO] tx_test used_idx_before={} used_idx_after={} advanced={} elem_id={} elem_len={}",
+                        send.used_idx_before,
+                        send.used_idx_after,
+                        used_advanced,
+                        send.used_elem_id,
+                        send.used_elem_len
+                    );
+                }
+                Err(e) => {
+                    kprintln!("[VIRTIO TX] {}", e);
+                    serial_println!("[VIRTIO] tx_test error={}", e);
+                }
+            }
         }
         Err(e) => {
             kprintln!("[VIRTIO TXQ] {}", e);

@@ -407,6 +407,19 @@ jobs:
           # the write didn't crash. final_status=0x07 confirms the full
           # ACKNOWLEDGE|DRIVER|DRIVER_OK handshake stuck.
           grep -q "VIRTIO\] txq_test queue_num=256 frames_needed=3 pfn_ok=true final_status=0x07" boot.log
+          # Confirms a real, complete VirtIO TX send (Fase 64) - builds
+          # a virtio_net_hdr+frame, places a descriptor in the avail
+          # ring, notifies the device, and the used ring genuinely
+          # advances (advanced=true), proving the device actually
+          # processed it via DMA. Hit and fixed the exact same class of
+          # bug net::e1000 needed until its own Fase 44 to resolve
+          # (PciDevice::enable_bus_mastering was never called) - caught
+          # in one re-test this time, not a multi-Fase investigation,
+          # specifically because this kernel's own prior history named
+          # the hypothesis directly. elem_len=0 is correct and expected
+          # for a TX completion (the device only ever reads a TX
+          # buffer, never writes back into it).
+          grep -q "VIRTIO\] tx_test used_idx_before=0 used_idx_after=1 advanced=true elem_id=0 elem_len=0" boot.log
           # e1000 TX (Fase 22, fully confirmed working Fase 44) - the ring
           # genuinely engages the hardware (TDH advances) AND the
           # descriptor's DD status bit now gets written back too, since

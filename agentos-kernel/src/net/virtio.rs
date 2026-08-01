@@ -70,9 +70,12 @@ const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
 const VIRTIO_STATUS_DRIVER: u8 = 2;
 const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
 
+const VIRTIO_PCI_QUEUE_NOTIFY: u16 = 16;
+
 const TX_QUEUE_INDEX: u16 = 1;
 const VRING_ALIGN: u64 = 4096;
 const FRAME_SIZE: u64 = 4096;
+const VIRTIO_NET_HDR_LEN: usize = 10; // legacy virtio_net_hdr, no MRG_RXBUF
 
 pub fn find_virtio_net() -> Option<PciDevice> {
     pci::scan_bus0()
@@ -254,6 +257,21 @@ pub struct TxQueueInfo {
     pub pfn: u32,
     pub pfn_readback: u32,
     pub final_status: u8,
+    pub io_base: u16,
+    pub virt_base: u64,
+}
+
+/// Offsets of the descriptor table, available ring, and used ring
+/// within a virtqueue's memory, relative to its own base address -
+/// the exact same layout `vring_size` computes the total size for
+/// (see that function's own doc), just returning the individual
+/// pieces `send_test_frame` needs to actually read/write them.
+fn vring_offsets(queue_num: u64, align: u64) -> (u64, u64, u64) {
+    let desc_offset = 0u64;
+    let avail_offset = 16 * queue_num;
+    let avail_end = avail_offset + 2 * (queue_num + 3);
+    let used_offset = avail_end.div_ceil(align) * align;
+    (desc_offset, avail_offset, used_offset)
 }
 
 /// Completes the legacy VirtIO device-initialization handshake
@@ -282,7 +300,14 @@ pub struct TxQueueInfo {
 /// this kernel's frame allocator has needed to hand back *contiguous*
 /// memory across several calls (see `allocate_contiguous_frames`).
 pub fn init_tx_queue() -> Result<TxQueueInfo, &'static str> {
-    let (_dev, io_base) = find_io_base()?;
+    let (dev, io_base) = find_io_base()?;
+    // The same real, standard PCI requirement `net::e1000` needed
+    // (Fase 44) and had never done before that: a freshly enumerated
+    // device starts with DMA (bus mastering) disabled, so without this
+    // the device could complete every register-level handshake step
+    // yet still never actually be able to read the virtqueue memory
+    // itself via DMA.
+    dev.enable_bus_mastering();
 
     unsafe {
         write_port_u8(io_base, VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
@@ -305,9 +330,9 @@ pub fn init_tx_queue() -> Result<TxQueueInfo, &'static str> {
     let phys_base = allocate_contiguous_frames(frames_needed)?;
 
     let phys_offset = PHYS_MEM_OFFSET.load(Ordering::Relaxed);
-    let virt_base = (phys_offset + phys_base) as *mut u8;
+    let virt_base_ptr = (phys_offset + phys_base) as *mut u8;
     unsafe {
-        core::ptr::write_bytes(virt_base, 0, (frames_needed * FRAME_SIZE) as usize);
+        core::ptr::write_bytes(virt_base_ptr, 0, (frames_needed * FRAME_SIZE) as usize);
     }
 
     let pfn = (phys_base / FRAME_SIZE) as u32;
@@ -331,5 +356,101 @@ pub fn init_tx_queue() -> Result<TxQueueInfo, &'static str> {
         pfn,
         pfn_readback,
         final_status,
+        io_base,
+        virt_base: virt_base_ptr as u64,
+    })
+}
+
+pub struct TxSendInfo {
+    pub used_idx_before: u16,
+    pub used_idx_after: u16,
+    pub used_elem_id: u32,
+    pub used_elem_len: u32,
+}
+
+/// Builds a real 10-byte legacy `virtio_net_hdr` (`include/uapi/linux/
+/// virtio_net.h`, all-zero: no offload/segmentation - correct given
+/// `init_tx_queue` declined every optional feature) followed by a
+/// minimal broadcast Ethernet frame, in a freshly allocated buffer
+/// frame (separate from the virtqueue's own memory, the same
+/// descriptor-plus-data-buffer split `net::e1000`'s own rings use).
+/// Writes ONE descriptor (read-only, no chaining), publishes it via
+/// the available ring (`avail->ring[avail->idx % queue_num] =
+/// descriptor index`, THEN `avail->idx += 1` - ring entry before index,
+/// so the device can never observe an advanced index pointing at an
+/// unwritten slot), kicks the device via `QUEUE_NOTIFY`, and polls the
+/// used ring's `idx` for it to advance - the VirtIO equivalent of
+/// `net::e1000::send_test_frame`'s own `TDH`-advancing proof, though
+/// genuinely a different protocol shape (an index into a ring of
+/// completions, not a single hardware head-pointer register).
+pub fn send_test_frame(info: &TxQueueInfo) -> Result<TxSendInfo, &'static str> {
+    let (_dev, io_base) = find_io_base()?;
+    let mac = read_mac_at(io_base, VIRTIO_PCI_CONFIG_OFF_NO_MSIX);
+
+    let payload = b"agentos virtio tx test";
+    let frame_len = 14 + payload.len(); // Ethernet header + payload
+    let buf_len = VIRTIO_NET_HDR_LEN + frame_len;
+
+    let buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let buf_phys = buf_frame.start_address().as_u64();
+    let phys_offset = PHYS_MEM_OFFSET.load(Ordering::Relaxed);
+    let buf_virt = (phys_offset + buf_phys) as *mut u8;
+
+    unsafe {
+        core::ptr::write_bytes(buf_virt, 0, VIRTIO_NET_HDR_LEN); // virtio_net_hdr, all zero
+        let eth = buf_virt.add(VIRTIO_NET_HDR_LEN);
+        core::ptr::write_bytes(eth, 0xFF, 6); // broadcast destination
+        core::ptr::copy_nonoverlapping(mac.as_ptr(), eth.add(6), 6); // real source MAC
+        let ethertype: [u8; 2] = 0x88B5u16.to_be_bytes(); // IEEE 802 local experimental
+        core::ptr::copy_nonoverlapping(ethertype.as_ptr(), eth.add(12), 2);
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), eth.add(14), payload.len());
+    }
+
+    let queue_num = info.queue_num as u64;
+    let (desc_off, avail_off, used_off) = vring_offsets(queue_num, VRING_ALIGN);
+    let desc_ptr = (info.virt_base + desc_off) as *mut u8;
+    let avail_ptr = (info.virt_base + avail_off) as *mut u16;
+    let used_ptr = (info.virt_base + used_off) as *mut u8;
+
+    unsafe {
+        // vring_desc { addr: u64, len: u32, flags: u16, next: u16 }
+        core::ptr::write_volatile(desc_ptr as *mut u64, buf_phys);
+        core::ptr::write_volatile(desc_ptr.add(8) as *mut u32, buf_len as u32);
+        core::ptr::write_volatile(desc_ptr.add(12) as *mut u16, 0); // flags: read-only, no NEXT
+        core::ptr::write_volatile(desc_ptr.add(14) as *mut u16, 0); // next: unused
+
+        // vring_avail { flags: u16, idx: u16, ring: [u16; num] }
+        let avail_idx = core::ptr::read_volatile(avail_ptr.add(1));
+        let ring_slot = (avail_idx as u64 % queue_num) as usize;
+        core::ptr::write_volatile(avail_ptr.add(2 + ring_slot), 0u16); // descriptor 0
+        core::ptr::write_volatile(avail_ptr.add(1), avail_idx.wrapping_add(1));
+    }
+
+    // vring_used { flags: u16, idx: u16, ring: [{id: u32, len: u32}; num] }
+    let used_idx_ptr = unsafe { (used_ptr as *mut u16).add(1) };
+    let used_idx_before = unsafe { core::ptr::read_volatile(used_idx_ptr) };
+
+    unsafe {
+        write_port_u16(io_base, VIRTIO_PCI_QUEUE_NOTIFY, TX_QUEUE_INDEX);
+    }
+
+    let mut used_idx_after = used_idx_before;
+    for _ in 0..1_000_000u32 {
+        used_idx_after = unsafe { core::ptr::read_volatile(used_idx_ptr) };
+        if used_idx_after != used_idx_before {
+            break;
+        }
+    }
+
+    // past flags+idx (4 bytes) to ring[0]'s {id, len}
+    let used_elem_ptr = unsafe { (used_ptr as *mut u32).add(1) };
+    let used_elem_id = unsafe { core::ptr::read_volatile(used_elem_ptr) };
+    let used_elem_len = unsafe { core::ptr::read_volatile(used_elem_ptr.add(1)) };
+
+    Ok(TxSendInfo {
+        used_idx_before,
+        used_idx_after,
+        used_elem_id,
+        used_elem_len,
     })
 }
