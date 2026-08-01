@@ -19,6 +19,7 @@ mod memory;
 mod net;
 mod partition;
 mod pci;
+mod ring3;
 mod rtc;
 mod scheduler;
 mod serial;

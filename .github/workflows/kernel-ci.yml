@@ -127,6 +127,19 @@ jobs:
           # nothing runs in ring-3 yet to prove the bit makes an actual
           # difference, that's separate, substantial follow-on work.
           grep -q "MEMORY\] user_page_test present=true writable=true user_accessible=true write_read_back_ok=true" boot.log
+          # Fase 71 (the actual ring-0 -> ring-3 transition, `ring3.rs`)
+          # is deliberately NOT asserted here, unlike every other Fase -
+          # not an oversight. Its own shell command (`ring3test`) ends in
+          # a permanent, intentional halt (the strongest available proof
+          # ring-3 genuinely cannot execute a privileged instruction like
+          # `cli`), so invoking it unconditionally in this SAME shared
+          # boot-test flow would either break real interactive use (if
+          # invoked before the shell prompt) or prevent this flow's own
+          # remaining checks below from ever running (if invoked after).
+          # Verified instead via a real, repeatable LOCAL test (3x,
+          # temporarily invoked, since removed before commit) - see
+          # ring3.rs's own module doc and README.md's GDT/IDT row for
+          # the full verification story and reasoning.
           # Confirms the global frame allocator hands out real, distinct,
           # genuinely writable/readable physical frames (verified=true is
           # only printed if all 3 write/read-back checks passed - a

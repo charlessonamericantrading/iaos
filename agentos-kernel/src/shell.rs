@@ -360,6 +360,20 @@ pub fn dispatch_command(line: &str) {
                 }
             }
         }
+        "ring3test" => {
+            // A real ring-0 -> ring-3 privilege-lowering transition
+            // (Fase 71) - deliberately NOT run at boot (see ring3.rs's
+            // own module doc for why): it ends in a permanent halt by
+            // design, the strongest available proof that ring-3 code
+            // genuinely cannot execute a privileged instruction like
+            // `cli`. Exposed as its own explicit command so the normal
+            // interactive shell stays fully usable otherwise - typing
+            // this one specific command is an intentional, documented
+            // exception, not a hazard a user could hit by accident.
+            kprintln!("[SHELL] ring3test -> entering ring-3 (this will not return)");
+            serial_println!("[SHELL] ring3test -> entering ring-3");
+            crate::ring3::run_ring3_test();
+        }
         "clear" => {
             crate::vga_buffer::clear_screen();
             serial_println!("[SHELL] clear -> VGA screen cleared");
