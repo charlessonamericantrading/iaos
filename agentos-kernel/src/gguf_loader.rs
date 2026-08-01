@@ -18,6 +18,7 @@ pub enum GgufGtype {
     Q4_1 = 3,
     Q8_0 = 8,
     Q4_K = 12,
+    Q6_K = 14,
 }
 
 impl GgufGtype {
@@ -29,6 +30,7 @@ impl GgufGtype {
             3 => Ok(GgufGtype::Q4_1),
             8 => Ok(GgufGtype::Q8_0),
             12 => Ok(GgufGtype::Q4_K),
+            14 => Ok(GgufGtype::Q6_K),
             _ => Err("GGUF: unknown tensor gtype"),
         }
     }
@@ -431,6 +433,90 @@ impl GgufModelLoader {
         values
     }
 
+    /// Decodes `bytes` as real GGML/GGUF Q6_K-quantized data - another
+    /// "K-quant" super-block format (256 values per block), but
+    /// structurally unlike every format above in three ways, each
+    /// checked rather than assumed to follow the established pattern:
+    ///
+    /// 1. **`d` (the single super-block scale) comes LAST in the struct,
+    ///    not first.** Every prior format here (`Q8_0`, `Q4_0`, `Q4_1`,
+    ///    `Q4_K`) put its scale field(s) at the start of the block - Q6_K
+    ///    breaks that pattern, verified against GGML's actual
+    ///    `block_q6_K` definition rather than carried over by habit.
+    /// 2. **The 6-bit quantized value is split across TWO separate
+    ///    arrays**, `ql` (low 4 bits) and `qh` (high 2 bits), not packed
+    ///    into one nibble-pair array like `Q4_0`/`Q4_1`/`Q4_K`.
+    /// 3. **`scales[16]` are plain signed `i8` bytes**, not 6-bit-packed
+    ///    like `Q4_K`'s `scales[12]` - one full byte per sub-block scale,
+    ///    no bit-extraction needed; purely multiplicative (`d * sc * q`),
+    ///    with no separate "min" term the way `Q4_1`/`Q4_K`'s affine
+    ///    dequantization has.
+    ///
+    /// Struct layout (210 bytes total, `QK_K=256`): `ql[128]` (`QK_K/2`),
+    /// `qh[64]` (`QK_K/4`), `scales[16]` (`QK_K/16`, signed), and `d`
+    /// (2-byte f16, LAST) - summing to 128+64+16+2=210. Cross-checked
+    /// for internal consistency against GGML's actual
+    /// `dequantize_row_q6_K` pointer arithmetic before trusting the
+    /// fetched struct size: that function advances
+    /// `ql += 64`, `qh += 32`, `sc += 8` per 128-value half-block, over
+    /// 2 half-blocks per 256-value block - totalling 128/64/16 bytes
+    /// respectively, exactly matching `ql[128]`/`qh[64]`/`scales[16]`.
+    ///
+    /// Within each 128-value half-block, a 32-iteration inner loop
+    /// produces FOUR values per iteration (`q1..q4`, written to `y[l]`,
+    /// `y[l+32]`, `y[l+64]`, `y[l+96]`): all four share one `qh[l]` byte,
+    /// each taking a different non-overlapping 2-bit field (bits 0-1,
+    /// 2-3, 4-5, 6-7 - four 2-bit slices exactly filling one byte),
+    /// combined with `ql[l]`/`ql[l+32]`'s low and high nibbles, then
+    /// recentered by `-32` (the unsigned 0-63 range becomes signed
+    /// -32..31). Hand-traced with concrete byte values
+    /// (`ql[0]=0xAB, ql[32]=0xCD, qh[0]=0xE4`) before trusting the
+    /// formula: decomposing `0xE4` into its four 2-bit fields (0, 1, 2, 3)
+    /// and combining with `ql`'s nibbles gave `q1=-21, q2=-3, q3=10,
+    /// q4=28`, independently confirmed by re-summing each field's
+    /// weighted contribution back to the original byte.
+    pub fn decode_q6_k(bytes: &[u8]) -> Vec<f32> {
+        const BLOCK_SIZE: usize = 210; // 128 (ql) + 64 (qh) + 16 (scales) + 2 (d, LAST)
+        const QL_LEN: usize = 128;
+        const QH_LEN: usize = 64;
+        const SCALES_LEN: usize = 16;
+
+        let (blocks, _remainder) = bytes.as_chunks::<BLOCK_SIZE>();
+        let mut values = Vec::with_capacity(blocks.len() * 256);
+        for block in blocks {
+            let ql_all = &block[0..QL_LEN];
+            let qh_all = &block[QL_LEN..QL_LEN + QH_LEN];
+            let scales = &block[QL_LEN + QH_LEN..QL_LEN + QH_LEN + SCALES_LEN];
+            let d = f16_to_f32(u16::from_le_bytes([
+                block[QL_LEN + QH_LEN + SCALES_LEN],
+                block[QL_LEN + QH_LEN + SCALES_LEN + 1],
+            ]));
+
+            let mut out = [0.0f32; 256];
+            for half in 0..2 {
+                let ql = &ql_all[half * 64..half * 64 + 64];
+                let qh = &qh_all[half * 32..half * 32 + 32];
+                let sc = &scales[half * 8..half * 8 + 8];
+                let y = &mut out[half * 128..half * 128 + 128];
+
+                for l in 0..32 {
+                    let is = l / 16;
+                    let q1 = ((ql[l] & 0x0F) | ((qh[l] & 3) << 4)) as i8 - 32;
+                    let q2 = ((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32;
+                    let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32;
+                    let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32;
+
+                    y[l] = d * (sc[is] as i8) as f32 * q1 as f32;
+                    y[l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+                    y[l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+                    y[l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
+                }
+            }
+            values.extend_from_slice(&out);
+        }
+        values
+    }
+
     /// Decodes a byte buffer as raw, unquantized half-precision (`F16`)
     /// values - unlike every quantized format above, there's no block
     /// structure or shared scale here at all: each value is simply its
@@ -463,6 +549,7 @@ impl GgufModelLoader {
             GgufGtype::Q4_0 => Ok(Self::decode_q4_0(bytes)),
             GgufGtype::Q4_1 => Ok(Self::decode_q4_1(bytes)),
             GgufGtype::Q4_K => Ok(Self::decode_q4_k(bytes)),
+            GgufGtype::Q6_K => Ok(Self::decode_q6_k(bytes)),
         }
     }
 

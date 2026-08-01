@@ -162,6 +162,17 @@ jobs:
           # checks all 256 decoded values (4 distinct 32-byte qs chunks)
           # against 8 hand-computed constants covering every sub-block.
           grep -q "GGUF\] q4_k_test get_scale_min_k4_ok=true decode_q4_k_ok=true dispatch_q4_k_ok=true" boot.log
+          # Confirms real GGUF Q6_K super-block decoding (Fase 58) - a
+          # 210-byte block (ql[128]+qh[64]+scales[16]+d, d LAST unlike
+          # every format above) holding 256 values whose 6-bit quantized
+          # value is split across TWO arrays (ql low nibble, qh 2-bit
+          # field) rather than one nibble-pair array, with plain signed
+          # i8 sub-block scales (no bit-packing, unlike Q4_K's scales).
+          # decode_q6_k_ok checks all 256 decoded values from a uniform
+          # ql/qh byte pattern against 8 distinct prime-scaled hand-
+          # computed constants, exercising both branches of the sub-
+          # block scale index for all four bit-extracted quadrants.
+          grep -q "GGUF\] q6_k_test decode_q6_k_ok=true dispatch_q6_k_ok=true" boot.log
           # Confirms real GGUF F16 tensor decoding (Fase 54) - the last
           # GgufGtype, completing full decode_tensor coverage. Unlike the
           # quantized formats above, F16 has no block/scale structure at

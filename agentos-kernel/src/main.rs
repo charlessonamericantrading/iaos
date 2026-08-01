@@ -629,6 +629,86 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 5b-6. Test real GGUF Q6_K super-block quantized tensor decoding
+    // (Fase 58) - another K-quant format, but structurally different from
+    // Q4_K in three ways checked rather than assumed: `d` (the single
+    // super-block scale) comes LAST in the struct, not first; the 6-bit
+    // value is split across two separate arrays (`ql` low 4 bits, `qh`
+    // high 2 bits) rather than packed into one nibble-pair array; and
+    // `scales[16]` are plain signed i8 bytes, not 6-bit-packed like
+    // Q4_K's scales[12] - no bit-extraction helper needed here at all.
+    //
+    // The struct's fetched size (ql[128]+qh[64]+scales[16]+d(2)=210
+    // bytes) was cross-checked against GGML's own dequantize_row_q6_K
+    // pointer arithmetic (ql+=64, qh+=32, sc+=8 per 128-value half-block,
+    // over 2 half-blocks) before being trusted - this Fase's version of
+    // the same internal-consistency check that caught Q4_K's wrong
+    // fetched field sizes last time. The four-quadrant bit-extraction
+    // (q1..q4 sharing one qh[l] byte, each taking a different
+    // non-overlapping 2-bit field) was hand-traced with concrete bytes
+    // (ql[0]=0xAB, ql[32]=0xCD, qh[0]=0xE4) before any Rust was written:
+    // decomposing 0xE4's four 2-bit fields (0,1,2,3) and combining with
+    // ql's nibbles gives q1=-21, q2=-3, q3=10, q4=28.
+    //
+    // decode_q6_k_ok builds one full real 210-byte block using a
+    // UNIFORM ql/qh byte pattern (so q1..q4 stay constant across every
+    // `l`) paired with eight DISTINCT prime scales [2,3,5,7,11,13,17,19]
+    // - chosen specifically to exercise both branches of `is=l/16` (0
+    // and 1) for all four quadrants, proving the sc[is]/sc[is+2]/
+    // sc[is+4]/sc[is+6] indexing is correct, not just the bit
+    // extraction in isolation.
+    kprintln!("[GGUF INFERENCE] Testing Q6_K super-block quantized tensor decoding...");
+    {
+        const SCALES8: [i8; 8] = [2, 3, 5, 7, 11, 13, 17, 19];
+
+        let mut q6k_block: Vec<u8> = Vec::with_capacity(210);
+        // ql[128]: half 0 then half 1, each 64 bytes = 32x0xAB + 32x0xCD
+        for _ in 0..2 {
+            q6k_block.extend(core::iter::repeat_n(0xABu8, 32));
+            q6k_block.extend(core::iter::repeat_n(0xCDu8, 32));
+        }
+        // qh[64]: half 0 then half 1, each 32 bytes of 0xE4
+        for _ in 0..2 {
+            q6k_block.extend(core::iter::repeat_n(0xE4u8, 32));
+        }
+        // scales[16]: same 8 distinct primes repeated for both halves
+        for _ in 0..2 {
+            for &s in &SCALES8 {
+                q6k_block.push(s as u8);
+            }
+        }
+        // d = 1.0, LAST
+        q6k_block.extend_from_slice(&0x3C00u16.to_le_bytes());
+
+        let decoded = GgufModelLoader::decode_q6_k(&q6k_block);
+        let mut expected_q6k: Vec<f32> = Vec::with_capacity(256);
+        for _ in 0..2 {
+            expected_q6k.extend(core::iter::repeat_n(-42.0f32, 16)); // is=0, sc[0]=2, q1=-21
+            expected_q6k.extend(core::iter::repeat_n(-63.0f32, 16)); // is=1, sc[1]=3, q1=-21
+            expected_q6k.extend(core::iter::repeat_n(-15.0f32, 16)); // is=0, sc[2]=5, q2=-3
+            expected_q6k.extend(core::iter::repeat_n(-21.0f32, 16)); // is=1, sc[3]=7, q2=-3
+            expected_q6k.extend(core::iter::repeat_n(110.0f32, 16)); // is=0, sc[4]=11, q3=10
+            expected_q6k.extend(core::iter::repeat_n(130.0f32, 16)); // is=1, sc[5]=13, q3=10
+            expected_q6k.extend(core::iter::repeat_n(476.0f32, 16)); // is=0, sc[6]=17, q4=28
+            expected_q6k.extend(core::iter::repeat_n(532.0f32, 16)); // is=1, sc[7]=19, q4=28
+        }
+        let decode_q6_k_ok = decoded == expected_q6k;
+
+        let dispatch_q6_k_ok =
+            GgufModelLoader::decode_tensor(&q6k_block, GgufGtype::Q6_K) == Ok(expected_q6k);
+
+        kprintln!(
+            "[GGUF Q6_K] decode_q6_k_ok={} dispatch_q6_k_ok={}",
+            decode_q6_k_ok,
+            dispatch_q6_k_ok
+        );
+        serial_println!(
+            "[GGUF] q6_k_test decode_q6_k_ok={} dispatch_q6_k_ok={}",
+            decode_q6_k_ok,
+            dispatch_q6_k_ok
+        );
+    }
+
     // 5c. Test real GGUF multi-tensor-info support (Fase 51) -
     // GgufTensorInfo::parse has returned "how many bytes this one entry
     // consumed" since Fase 43 specifically so several could be parsed in
