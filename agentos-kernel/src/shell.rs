@@ -406,13 +406,52 @@ fn list_root_directory() -> Result<(), &'static str> {
     }
 }
 
+/// Splits a "DIR/FILE" path into its directory and file name components,
+/// or `None` for a plain name with no subdirectory - this kernel only
+/// supports one level of subdirectory nesting (see `fat12.rs`'s
+/// `DirLocation`), so a path with more than one `/` is rejected rather
+/// than silently mishandled.
+fn split_path(path: &str) -> Result<Option<(&str, &str)>, &'static str> {
+    match path.split_once('/') {
+        None => Ok(None),
+        Some((dir, file)) => {
+            if dir.is_empty() || file.is_empty() || file.contains('/') {
+                return Err("invalid path - use DIRNAME/FILENAME.EXT, one level deep");
+            }
+            Ok(Some((dir, file)))
+        }
+    }
+}
+
+/// Resolves a subdirectory name (found in the root) to its own cluster
+/// number - the "handle" every `*_in` `Fat12Info` method needs.
+fn resolve_dir_cluster(fs: &crate::fat12::Fat12Info, dir_name: &str) -> Result<u32, &'static str> {
+    let entry = fs
+        .list_root_directory()?
+        .into_iter()
+        .find(|e| e.name.eq_ignore_ascii_case(dir_name))
+        .ok_or("no such directory in root")?;
+    if !entry.is_dir {
+        return Err("that's a file, not a directory");
+    }
+    Ok(entry.start_cluster)
+}
+
 /// The `cat` command's implementation - same FAT32-then-FAT12/16 fallback
-/// as `list_root_directory`.
+/// as `list_root_directory`. A `DIR/FILE` path (see `split_path`) reaches
+/// a file inside a subdirectory via `read_file_in`; a plain name behaves
+/// exactly as before.
 fn read_fat_file(name: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
     let partition = find_fat_partition()?;
     match crate::fat32::read_bpb(&partition) {
         Ok(fs) => fs.read_file(name),
-        Err(_) => crate::fat12::read_bpb(&partition)?.read_file(name),
+        Err(_) => {
+            let fs = crate::fat12::read_bpb(&partition)?;
+            match split_path(name)? {
+                None => fs.read_file(name),
+                Some((dir, file)) => fs.read_file_in(resolve_dir_cluster(&fs, dir)?, file),
+            }
+        }
     }
 }
 
@@ -420,25 +459,39 @@ fn read_fat_file(name: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
 /// above: `fat32.rs` has no write support at all yet, so a real FAT32 disk
 /// would get a clear, honest error here rather than a silent no-op - a
 /// currently-untested path in practice, since our own disk is FAT12 (see
-/// the FAT32/FAT12 README row), not a gap papered over.
+/// the FAT32/FAT12 README row), not a gap papered over. Same `DIR/FILE`
+/// path support as `read_fat_file`, via `create_file_in`.
 fn create_fat_file(name: &str, data: &[u8]) -> Result<(), &'static str> {
     let partition = find_fat_partition()?;
     if crate::fat32::read_bpb(&partition).is_ok() {
         return Err("FAT32 file creation isn't implemented yet (this disk is FAT12 in practice)");
     }
     let mut fs = crate::fat12::read_bpb(&partition)?;
-    fs.create_file(name, data)
+    match split_path(name)? {
+        None => fs.create_file(name, data),
+        Some((dir, file)) => {
+            let cluster = resolve_dir_cluster(&fs, dir)?;
+            fs.create_file_in(cluster, file, data)
+        }
+    }
 }
 
 /// The `rm` command's implementation - same FAT12-only reasoning as
-/// `create_fat_file` above.
+/// `create_fat_file` above, and the same `DIR/FILE` path support via
+/// `delete_file_in`.
 fn delete_fat_file(name: &str) -> Result<(), &'static str> {
     let partition = find_fat_partition()?;
     if crate::fat32::read_bpb(&partition).is_ok() {
         return Err("FAT32 file deletion isn't implemented yet (this disk is FAT12 in practice)");
     }
     let mut fs = crate::fat12::read_bpb(&partition)?;
-    fs.delete_file(name)
+    match split_path(name)? {
+        None => fs.delete_file(name),
+        Some((dir, file)) => {
+            let cluster = resolve_dir_cluster(&fs, dir)?;
+            fs.delete_file_in(cluster, file)
+        }
+    }
 }
 
 /// The `mkdir` command's implementation - same FAT12-only reasoning as

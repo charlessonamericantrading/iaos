@@ -363,6 +363,25 @@ jobs:
           # path (analogous to RMDTEST above), so this is the only outcome
           # CI should ever see.
           grep -q "FAT12\] subdir_file_test created_ok=true write_ok=true delete_ok=true cleanup_ok=true" boot.log
+          # Confirms shell-level DIR/FILE path support (Fase 35) - touch/
+          # cat/rm now understand "DIRNAME/FILENAME.EXT" (one level deep),
+          # reaching a subdirectory's file through the REAL dispatch_command
+          # parsing path (split_path + resolve_dir_cluster), not by calling
+          # Fat12Info's *_in methods directly the way the test above does.
+          # The final cat correctly asserts the SUBDIRECTORY-specific
+          # "not found in directory" message (not "in root directory") -
+          # proof the path genuinely routed to the right place, not a
+          # coincidental pass. Test content is a fixed literal, so the
+          # 21-byte length and first-4-bytes hex are safe to assert exactly,
+          # same reasoning as every other fixed-literal-content check.
+          # Fully self-cleaning, so this is the only outcome a fresh CI
+          # image should ever see.
+          grep -q "SHELL\] mkdir PATHTEST -> created" boot.log
+          grep -q "SHELL\] touch PATHTEST/INSIDE.TXT -> created 21 bytes" boot.log
+          grep -q "SHELL\] cat PATHTEST/INSIDE.TXT -> 21 bytes" boot.log
+          grep -q "SHELL\] rm PATHTEST/INSIDE.TXT -> deleted" boot.log
+          grep -q "SHELL\] cat PATHTEST/INSIDE.TXT -> FAILED: FAT12: file not found in directory" boot.log
+          grep -q "SHELL\] rmdir PATHTEST -> deleted" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.

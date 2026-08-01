@@ -819,6 +819,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
+    // 7b-15. Real shell-level file I/O via a DIR/FILE path - touch/cat/rm
+    // now understand "DIRNAME/FILENAME.EXT" (one level deep), reaching a
+    // subdirectory's file through the REAL dispatch_command parsing path
+    // (split_path + resolve_dir_cluster in shell.rs), not by calling
+    // Fat12Info's *_in methods directly the way the test above does.
+    // Fully self-cleaning: creates its own dedicated directory and
+    // removes it afterward.
+    kprintln!("[KERNEL INIT] Testing shell file I/O via a DIR/FILE path...");
+    shell::dispatch_command("mkdir PATHTEST");
+    shell::dispatch_command("touch PATHTEST/INSIDE.TXT hello via a real path");
+    shell::dispatch_command("cat PATHTEST/INSIDE.TXT");
+    shell::dispatch_command("rm PATHTEST/INSIDE.TXT");
+    shell::dispatch_command("cat PATHTEST/INSIDE.TXT");
+    shell::dispatch_command("rmdir PATHTEST");
+    shell::dispatch_command("ls");
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real
