@@ -38,7 +38,7 @@
 //! already a valid, mapped virtual address to write through - no dedicated
 //! DMA-region mapping code needed.
 //!
-//! ## Known limitation, found and documented honestly (Fase 22)
+//! ## Known limitation, found and documented honestly (Fase 22, re-investigated Fase 32)
 //! `send_test_frame` genuinely engages the hardware: the descriptor ring's
 //! physical address, the descriptor's own content (verified correct via a
 //! direct memory read-back before the kick), and the TDT-triggered dequeue
@@ -48,24 +48,75 @@
 //! descriptor's `status` byte (the DD/Descriptor-Done bit `TXD_STATUS_DD`)
 //! never gets written back - not even a partial write; a full 16-byte raw
 //! dump after timeout shows every byte exactly as this code left it,
-//! `status` included. Ruled out so far, each with its own real test, not
-//! just reasoning: wrong register offsets or descriptor layout (both
-//! cross-checked against multiple independent sources and confirmed
-//! correct via memory read-back); `TCTL`/`TIPG` misconfiguration (QEMU's
-//! own source shows `TCTL.EN` doesn't gate the writeback step, and `TIPG`
-//! writes read back as `0` regardless - QEMU's e1000 model likely doesn't
-//! model wire-timing at all, so this register is probably a no-op there);
-//! a tight-spin-loop starving QEMU's own event loop (tested by halting -
-//! interrupts enabled - between polls for ~11 real seconds; no change);
-//! `CTRL.SLU` not set (it already reads as set by default); packet content
-//! being unrecognized by the SLIRP backend (tested both an experimental-
-//! EtherType frame and a fully valid ARP request - identical result
-//! either way). The exact remaining cause is unresolved as of this note -
-//! likely something in QEMU's own `process_tx_desc`/`start_xmit` logic
-//! this investigation didn't reach (full verbatim source wasn't available
-//! to fetch). Left as a known, real, documented gap rather than papered
-//! over - see `agentos_direction` memory for the full investigation if
-//! picking this up again.
+//! `status` included.
+//!
+//! **Ruled out in Fase 22**, each with its own real test, not just
+//! reasoning: wrong register offsets (cross-checked against multiple
+//! independent sources, confirmed via memory read-back); `TIPG`
+//! misconfiguration (writes read back as `0` regardless - likely a no-op
+//! in QEMU's model); a tight-spin-loop starving QEMU's own event loop
+//! (tested by halting - interrupts enabled - between polls for ~11 real
+//! seconds; no change); `CTRL.SLU` not set (already reads as set by
+//! default); packet content being unrecognized by the SLIRP backend
+//! (tested both an experimental EtherType and a fully valid ARP request -
+//! identical result).
+//!
+//! **Ruled out in Fase 32**, this time by fetching QEMU's *complete*,
+//! current `hw/net/e1000.c`/`e1000x_regs.h` source directly (not the
+//! piecemeal targeted-question approach Fase 22 was limited to) and
+//! reading `process_tx_desc`/`txdesc_writeback`/`start_xmit` in full:
+//! - **Descriptor layout and every `TXD_CMD_*`/`TXD_STAT_DD` bit
+//!   constant were checked byte-for-byte against QEMU's actual struct
+//!   and `#define`s** - all match exactly (this crate's byte-level `cmd`/
+//!   `status` constants and QEMU's `u32`-shifted equivalents describe the
+//!   identical bits). Not the bug.
+//! - **`TXDCTL`/`WTHRESH`** (a real quirk on actual Intel hardware and in
+//!   QEMU's newer `igb` model - writeback can wait for a descriptor
+//!   "batch") - checked directly in `txdesc_writeback`'s source: this
+//!   basic e1000 model's writeback is unconditional once the descriptor's
+//!   own `RS`/`RPS` bit is set, no `TXDCTL` consultation at all. Not
+//!   applicable here.
+//! - **Register-write dispatch, traced completely**: `TDT` and `TCTL`
+//!   share the *same* write handler (`set_tctl`), so writing either one
+//!   triggers `start_xmit()` - confirmed this kernel's write order (TDBAL/
+//!   TDBAH/TDLEN/TDH/TDT=0/TIPG/TCTL, *then* TDT=1) correctly leaves
+//!   `TCTL.EN` set and `TDT=1 != TDH=0` by the time the final write fires,
+//!   which should reach `txdesc_writeback` with `RS` set. Not the bug, as
+//!   far as this reasoning goes.
+//! - **CPU cache coherency** (a genuinely new angle: this kernel identity-
+//!   maps memory as normal cacheable RAM, and if QEMU is running with
+//!   hardware-accelerated virtualization - WHPX on Windows is the default
+//!   accelerator when no `-accel` flag is given - the guest CPU has real
+//!   caching, and a DMA write from the emulated device could land in RAM
+//!   without invalidating a stale value already in the polling CPU's
+//!   cache) - tested directly with `_mm_clflush` before every poll read.
+//!   No change. Not the bug (or at least, `clflush`-based invalidation
+//!   doesn't fix it).
+//! - **Deferred/asynchronous completion needing a real guest yield** -
+//!   re-tested with a `hlt()`-based wait (interrupts enabled, ~5 real
+//!   seconds via the timer tick counter, replacing the old tight busy-
+//!   spin) rather than assuming Fase 22's shorter test still applies
+//!   unchanged. No change - reconfirms Fase 22's finding rather than
+//!   contradicting it.
+//!
+//! The exact remaining cause is still unresolved as of this note. Every
+//! software-side explanation this investigation could construct and test
+//! has been ruled out with a real experiment, not just argued away - the
+//! reasoning above traces the write-then-writeback path completely and
+//! finds no gap, yet the observed behavior contradicts it. That
+//! contradiction itself is the honest state to report: either something
+//! in QEMU's actual runtime behavior differs subtly from what a source
+//! reading predicts (version-specific behavior not caught by comparing
+//! against current `master`, some interaction this investigation didn't
+//! construct a test for), or there's a flaw in this reasoning that further
+//! scrutiny would catch. Left as a known, real, documented gap rather than
+//! papered over - see `agentos_direction` memory for the full
+//! investigation (both rounds) if picking this up again. A concrete next
+//! avenue not yet tried: attaching QEMU's own monitor/QMP interface to
+//! inspect guest physical memory at `ring_phys` from *outside* the guest
+//! entirely, independent of this kernel's own page tables or polling
+//! code - would definitively show whether QEMU's device model is even
+//! attempting the write, cutting the remaining uncertainty in half.
 
 use crate::pci::{self, PciDevice};
 use crate::vga_buffer::PHYS_MEM_OFFSET;
@@ -106,7 +157,6 @@ const TXD_CMD_RS: u8 = 0x08; // Report Status - hardware sets DD in `status` onc
 const TXD_STATUS_DD: u8 = 0x01; // Descriptor Done
 
 const NUM_TX_DESCRIPTORS: usize = 8; // 8 * 16 bytes = 128, satisfies TDLEN's 128-byte-multiple rule
-const MAX_POLL_ITERATIONS: u32 = 1_000_000;
 
 /// Legacy transmit descriptor - 16 bytes, exact field order matters (this
 /// is read by the NIC's own DMA engine, not just other Rust code).
@@ -359,7 +409,16 @@ pub fn send_test_frame() -> Result<(), &'static str> {
         // ready, go send it" - everything above was just setup.
         write_reg(mmio_base, REG_TDT, 1);
 
-        for _ in 0..MAX_POLL_ITERATIONS {
+        // Waits via `hlt` (interrupts enabled, timer ticking) rather than a
+        // tight busy-spin - genuinely yields the CPU back between checks,
+        // in case QEMU's own completion of this send is processed via a
+        // deferred/bottom-half mechanism that only gets a chance to run
+        // when the guest actually traps out, not during an uninterrupted
+        // spin. ~90 timer ticks at this kernel's ~18.2Hz rate is close to
+        // 5 real seconds - comparable to the longer real-time window
+        // already tried once before (see module doc).
+        let start_tick = crate::interrupts::timer_ticks();
+        loop {
             let status = core::ptr::read_volatile(core::ptr::addr_of!((*ring_virt).status));
             if status & TXD_STATUS_DD != 0 {
                 kprintln!(
@@ -369,6 +428,10 @@ pub fn send_test_frame() -> Result<(), &'static str> {
                 serial_println!("[E1000] tx_sent {} bytes dd=true", frame_len);
                 return Ok(());
             }
+            if crate::interrupts::timer_ticks() - start_tick > 90 {
+                break;
+            }
+            x86_64::instructions::hlt();
         }
 
         // Diagnostic left in place for whoever resumes this: shows
@@ -378,7 +441,8 @@ pub fn send_test_frame() -> Result<(), &'static str> {
         let tdt = read_reg(mmio_base, REG_TDT);
         let raw = core::slice::from_raw_parts(ring_virt as *const u8, 16);
         serial_println!(
-            "[E1000] tx timeout: TDH={:#x} TDT={:#x} raw_desc0={:02x?}",
+            "[E1000] tx timeout: ring_phys={:#x} TDH={:#x} TDT={:#x} raw_desc0={:02x?}",
+            ring_frame.start_address().as_u64(),
             tdh,
             tdt,
             raw
