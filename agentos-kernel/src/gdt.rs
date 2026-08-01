@@ -5,10 +5,29 @@ use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
+/// Index into the TSS's `privilege_stack_table` (RSP0/RSP1/RSP2) - only
+/// RSP0 is meaningful for a kernel with no ring-1/ring-2 use: the CPU
+/// loads it into RSP automatically on any privilege-level-raising
+/// control transfer FROM ring 3 (an interrupt, exception, or the
+/// `syscall` instruction while in user mode), the same way `interrupt_
+/// stack_table`'s IST slots supply a stack for specific interrupts
+/// regardless of the interrupted context's own (possibly corrupt or
+/// unmapped) stack. Without this, ring-3 code could never be safely
+/// interrupted at all - the CPU would try to use whatever RSP0 happens
+/// to default to (zero), an immediate triple fault.
+const RING3_RSP0_INDEX: usize = 0;
+
 lazy_static! {
     static ref TSS: TaskStateSegment = {
         let mut tss = TaskStateSegment::new();
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
+            const STACK_SIZE: usize = 4096 * 5;
+            static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+
+            let stack_start = VirtAddr::from_ptr(&raw const STACK);
+            stack_start + STACK_SIZE as u64
+        };
+        tss.privilege_stack_table[RING3_RSP0_INDEX] = {
             const STACK_SIZE: usize = 4096 * 5;
             static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
 
@@ -24,20 +43,62 @@ lazy_static! {
         let mut gdt = GlobalDescriptorTable::new();
         let kernel_code_selector = gdt.append(Descriptor::kernel_code_segment());
         let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
+        // Ring-3 (user-mode) code/data segments - the foundational piece
+        // every real ring-3 transition needs before anything else, laid
+        // down here but not yet USED by any code: no IDT gate has DPL=3
+        // yet, no page is marked USER-accessible yet, and nothing
+        // performs the actual privilege-lowering control transfer
+        // (an `iretq`-to-ring-3, or `sysret`) yet - each is real,
+        // substantial follow-on work of its own. Appended in the
+        // conventional data-then-code order (matches what `sysret`'s
+        // STAR MSR would expect later, computing user SS/CS as fixed
+        // offsets from a single base selector) even though this Fase
+        // doesn't use `syscall`/`sysret` yet - cheap to get right now,
+        // expensive to silently rely on the wrong order later.
+        let user_data_selector = gdt.append(Descriptor::user_data_segment());
+        let user_code_selector = gdt.append(Descriptor::user_code_segment());
         (
             gdt,
             Selectors {
                 kernel_code_selector,
                 tss_selector,
+                user_data_selector,
+                user_code_selector,
             },
         )
     };
 }
 
-#[allow(dead_code)]
 struct Selectors {
     kernel_code_selector: SegmentSelector,
     tss_selector: SegmentSelector,
+    user_data_selector: SegmentSelector,
+    user_code_selector: SegmentSelector,
+}
+
+/// Real ring-3 selectors + the TSS's own RSP0, exposed for the self-test
+/// (Fase 68) to verify this Fase's actual, checkable claims: both
+/// selectors' DPL is genuinely Ring 3 (not just "some nonzero value"),
+/// and RSP0 is a real, non-null kernel stack address - not yet proof
+/// ring-3 code can actually run (that's real, separate follow-on work),
+/// but proof the GDT/TSS infrastructure it will need is genuinely in
+/// place, not merely compiled without erroring.
+pub struct Ring3Info {
+    pub user_code_selector: u16,
+    pub user_data_selector: u16,
+    pub user_code_rpl: u16,
+    pub user_data_rpl: u16,
+    pub rsp0: u64,
+}
+
+pub fn ring3_info() -> Ring3Info {
+    Ring3Info {
+        user_code_selector: GDT.1.user_code_selector.0,
+        user_data_selector: GDT.1.user_data_selector.0,
+        user_code_rpl: GDT.1.user_code_selector.0 & 0b11,
+        user_data_rpl: GDT.1.user_data_selector.0 & 0b11,
+        rsp0: TSS.privilege_stack_table[RING3_RSP0_INDEX].as_u64(),
+    }
 }
 
 pub fn init() {

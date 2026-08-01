@@ -69,6 +69,21 @@ jobs:
           cat boot.log
           echo "--------------------------"
           grep -q "AgentOS Native Bare-Metal Kernel Initialized" boot.log
+          # Confirms the ring-3 GDT/TSS foundation (Fase 68, the first
+          # step of a real usermode transition arc) - real ring-3 code/
+          # data segments now exist in the GDT and the TSS has a real
+          # kernel stack (RSP0) ready for a future ring-3->ring-0
+          # control transfer. user_code_rpl_ok/user_data_rpl_ok=true is
+          # genuine proof these selectors' own Requested Privilege
+          # Level bits are really Ring 3, not just "some selector got
+          # appended" - a wrong descriptor would show rpl=0 instead.
+          # rsp0_nonzero=true confirms a real stack was installed, not
+          # the TSS's own zeroed default (an instant triple fault the
+          # moment it was ever actually used). Does NOT yet mean ring-3
+          # code can run - no IDT gate has DPL=3, no page is user-
+          # accessible, nothing performs the actual iretq/sysret
+          # transition yet - that's real, separate follow-on work.
+          grep -q "GDT\] ring3_test user_code_selector=0x002b user_data_selector=0x0023 user_code_rpl_ok=true user_data_rpl_ok=true rsp0_nonzero=true" boot.log
           grep -q "\[IDT\] Native IDT Loaded" boot.log
           grep -q "\[EXCEPTION\] Breakpoint" boot.log
           grep -q "\[PIC\] 8259 remapped to vectors 32-47" boot.log

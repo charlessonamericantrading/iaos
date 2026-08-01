@@ -71,6 +71,49 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!("[KERNEL INIT] Initializing GDT & Task State Segment...");
     gdt::init();
 
+    // 2a-2. Test the ring-3 GDT/TSS foundation (Fase 68) - the first
+    // step of a real usermode transition arc, deliberately scoped to
+    // just the infrastructure: real ring-3 code/data segments exist in
+    // the GDT now, and the TSS has a real kernel stack (RSP0) ready for
+    // when a ring-3->ring-0 control transfer needs one. Does NOT yet
+    // attempt an actual transition (no IDT gate has DPL=3, no page is
+    // marked user-accessible, nothing executes iretq/sysret to ring 3
+    // yet) - that's real, substantial follow-on work, matching this
+    // project's own established multi-Fase pattern for large features
+    // (e.g. net::e1000/net::virtio's own probe -> setup -> send -> ...
+    // progressions).
+    //
+    // user_code_rpl/user_data_rpl=3 is genuine proof these selectors'
+    // Requested Privilege Level bits are really Ring 3, not just "some
+    // nonzero selector happened to get appended" - a wrong descriptor
+    // (e.g. accidentally appending another kernel segment) would show
+    // rpl=0 here instead. rsp0_nonzero=true is genuine proof a real
+    // stack was allocated and installed, not the TSS's own zeroed
+    // default (which would triple-fault the instant it was ever used).
+    kprintln!("[KERNEL INIT] Testing ring-3 GDT/TSS foundation...");
+    {
+        let info = gdt::ring3_info();
+        let user_code_rpl_ok = info.user_code_rpl == 3;
+        let user_data_rpl_ok = info.user_data_rpl == 3;
+        let rsp0_nonzero = info.rsp0 != 0;
+        kprintln!(
+            "[GDT] user_code_selector={:#06x} user_data_selector={:#06x} user_code_rpl_ok={} user_data_rpl_ok={} rsp0_nonzero={}",
+            info.user_code_selector,
+            info.user_data_selector,
+            user_code_rpl_ok,
+            user_data_rpl_ok,
+            rsp0_nonzero
+        );
+        serial_println!(
+            "[GDT] ring3_test user_code_selector={:#06x} user_data_selector={:#06x} user_code_rpl_ok={} user_data_rpl_ok={} rsp0_nonzero={}",
+            info.user_code_selector,
+            info.user_data_selector,
+            user_code_rpl_ok,
+            user_data_rpl_ok,
+            rsp0_nonzero
+        );
+    }
+
     kprintln!("[KERNEL INIT] Loading IDT Interrupt Handlers...");
     interrupts::init_idt();
 
