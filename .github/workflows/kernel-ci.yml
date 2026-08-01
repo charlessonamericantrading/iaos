@@ -438,6 +438,26 @@ jobs:
           # NOT yet trigger or observe a real received frame - that is
           # separate, substantial follow-on work.
           grep -q "VIRTIO\] rxq_test queue_num=256 frames_needed=3 pfn_ok=true desc_write_flag_ok=true avail_idx_after=1" boot.log
+          # Confirms a genuine SECOND real frame send through the TX
+          # queue (Fase 66) - a fresh real ARP request, via descriptor
+          # index 1 (distinct from the tx_test descriptor above, index
+          # 0), completes correctly (tx_phase=ok). This is the
+          # reliable, honestly-assertable part of Fase 66's own attempt
+          # at a full VirtIO RX proof (net::e1000's own Fase 45
+          # equivalent): the RX side (a genuine received reply actually
+          # landing in the buffer init_rx_queue armed) was investigated
+          # at length - QEMU's own real virtio-net.c source was read to
+          # rule out several plausible gating conditions (promiscuous-
+          # mode default, unicast MAC filtering, multiqueue queue-pair
+          # count, an explicit -netdev wiring question tested
+          # empirically) - but does not yet reliably succeed, so is
+          # deliberately NOT asserted here as a passing check. This
+          # mirrors net::e1000's own DD-bit mystery, which took two
+          # separate investigation rounds (Fase 22, Fase 32) before its
+          # real resolution (Fase 44) - see net/virtio.rs's own module
+          # doc and the persistent project history for the full
+          # investigation trail whenever this gets picked back up.
+          grep -q "VIRTIO\] rx_test tx_phase=ok" boot.log
           # e1000 TX (Fase 22, fully confirmed working Fase 44) - the ring
           # genuinely engages the hardware (TDH advances) AND the
           # descriptor's DD status bit now gets written back too, since

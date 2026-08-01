@@ -1363,6 +1363,39 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                         desc_write_flag_ok,
                         rx.avail_idx_after
                     );
+
+                    // 7b-2-6. Fase 66: sends a real ARP request (the
+                    // same byte layout net::e1000::send_test_frame
+                    // already proved SLIRP answers) and polls the RX
+                    // queue armed just above for a genuine reply - the
+                    // first complete, real VirtIO-net TX+RX round trip
+                    // this kernel has attempted, matching
+                    // net::e1000's own Fase 45.
+                    kprintln!(
+                        "[VIRTIO INIT] Sending a real ARP request and waiting for SLIRP's reply..."
+                    );
+                    match net::virtio::receive_test_frame(&info, &rx) {
+                        Ok(recv) => {
+                            kprintln!(
+                                "[VIRTIO RX] received {} bytes, is_arp_reply={} gateway_ip={:?}",
+                                recv.received_len,
+                                recv.is_arp_reply,
+                                recv.gateway_ip
+                            );
+                            serial_println!(
+                                "[VIRTIO] rx_test used_idx_before={} used_idx_after={} received_len={} is_arp_reply={} gateway_ip={:?}",
+                                recv.used_idx_before,
+                                recv.used_idx_after,
+                                recv.received_len,
+                                recv.is_arp_reply,
+                                recv.gateway_ip
+                            );
+                        }
+                        Err(e) => {
+                            kprintln!("[VIRTIO RX] {}", e);
+                            serial_println!("[VIRTIO] rx_test error={}", e);
+                        }
+                    }
                 }
                 Err(e) => {
                     kprintln!("[VIRTIO RXQ] {}", e);

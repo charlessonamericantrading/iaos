@@ -594,3 +594,223 @@ pub fn init_rx_queue(tx_info: &TxQueueInfo) -> Result<RxQueueInfo, &'static str>
         avail_idx_after,
     })
 }
+
+pub struct RxRecvInfo {
+    pub used_idx_before: u16,
+    pub used_idx_after: u16,
+    pub received_len: u32,
+    pub is_arp_reply: bool,
+    pub gateway_ip: Option<[u8; 4]>,
+}
+
+/// Triggers a real ARP request through the TX queue - the exact same
+/// request byte layout `net::e1000::send_test_frame` already builds and
+/// has already proven SLIRP answers ("who has 10.0.2.2? tell 10.0.2.15",
+/// SLIRP's default gateway/guest addresses) - then polls the RX queue
+/// `init_tx_queue`/`init_rx_queue` (Fase 63/65) already set up and armed,
+/// attempting the first complete, real VirtIO-net round trip this
+/// kernel has tried, matching `net::e1000`'s own Fase 45
+/// `receive_test_frame`.
+///
+/// **Honest status (Fase 66)**: the TX half reliably works - the
+/// request genuinely completes through the device (`tx_phase=ok`,
+/// identical across repeated boots) - but the RX half does not yet:
+/// the armed buffer is observed to stay entirely untouched (all zeros)
+/// and the RX queue's used index never advances, even though SLIRP is
+/// independently confirmed still answering ARP/ICMP correctly in the
+/// exact same boot (`net::e1000`'s own later tests succeed normally).
+/// Investigated at length against QEMU's own real `hw/net/virtio-net.c`
+/// source (fetched via `gh api`, not guessed) rather than left
+/// unexamined: `virtio_net_can_receive`'s gating gates (`vm_running`,
+/// `curr_queue_pairs`, `virtio_queue_ready`/`DRIVER_OK`) all check out
+/// favorably from their real reset defaults; `receive_filter`'s
+/// unicast-MAC check is bypassed entirely since `n->promisc` itself
+/// defaults to `1` on device reset; an explicit `-netdev` was tested
+/// empirically in case the device had no backend at all (it changed
+/// which NIC claimed the default slot, but did not fix the timeout
+/// either, ruling that out too). None of these individually-plausible
+/// hypotheses panned out, so the real cause remains open - genuinely
+/// comparable to `net::e1000`'s own DD-bit mystery, which took two
+/// separate investigation rounds (Fase 22, Fase 32) before its actual
+/// resolution (Fase 44) turned up while researching something else
+/// entirely. Left honestly unresolved rather than forced, with a
+/// diagnostic dump (ISR + raw descriptor + raw buffer bytes) left in
+/// place on the timeout path for whoever resumes this.
+///
+/// Deliberately a NEW, independent function rather than reusing or
+/// refactoring `send_test_frame` - its exact behavior and log output are
+/// already CI-asserted (Fase 64), so this duplicates its small TX-publish
+/// pattern instead of risking any change to it, the same reasoning
+/// `net::e1000::arp_resolve`'s own module doc gives for making the same
+/// choice there. Uses descriptor index 1 in the TX queue (distinct from
+/// `send_test_frame`'s own descriptor 0) - the avail ring's current
+/// `idx` (already 1, from `send_test_frame`'s own earlier publish this
+/// same boot) naturally lands this second entry at ring position 1
+/// without needing any special-casing.
+pub fn receive_test_frame(
+    tx_info: &TxQueueInfo,
+    rx_info: &RxQueueInfo,
+) -> Result<RxRecvInfo, &'static str> {
+    let mac = read_mac_at(tx_info.io_base, VIRTIO_PCI_CONFIG_OFF_NO_MSIX);
+
+    let frame_len = 42usize; // 14-byte Ethernet header + 28-byte ARP payload
+    let buf_len = VIRTIO_NET_HDR_LEN + frame_len;
+    let buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let buf_phys = buf_frame.start_address().as_u64();
+    let phys_offset = PHYS_MEM_OFFSET.load(Ordering::Relaxed);
+    let buf_virt = (phys_offset + buf_phys) as *mut u8;
+
+    unsafe {
+        core::ptr::write_bytes(buf_virt, 0, VIRTIO_NET_HDR_LEN); // virtio_net_hdr, all zero
+        let eth = buf_virt.add(VIRTIO_NET_HDR_LEN);
+        core::ptr::write_bytes(eth, 0xFF, 6); // broadcast dest
+        core::ptr::copy_nonoverlapping(mac.as_ptr(), eth.add(6), 6); // real source MAC
+        core::ptr::write_volatile(eth.add(12), 0x08);
+        core::ptr::write_volatile(eth.add(13), 0x06); // EtherType: ARP
+        core::ptr::write_volatile(eth.add(14), 0x00);
+        core::ptr::write_volatile(eth.add(15), 0x01); // HTYPE: Ethernet
+        core::ptr::write_volatile(eth.add(16), 0x08);
+        core::ptr::write_volatile(eth.add(17), 0x00); // PTYPE: IPv4
+        core::ptr::write_volatile(eth.add(18), 6); // HLEN
+        core::ptr::write_volatile(eth.add(19), 4); // PLEN
+        core::ptr::write_volatile(eth.add(20), 0x00);
+        core::ptr::write_volatile(eth.add(21), 0x01); // OPER: request
+        core::ptr::copy_nonoverlapping(mac.as_ptr(), eth.add(22), 6); // SHA
+        let spa: [u8; 4] = [10, 0, 2, 15]; // SPA (SLIRP guest default)
+        core::ptr::copy_nonoverlapping(spa.as_ptr(), eth.add(28), 4);
+        core::ptr::write_bytes(eth.add(32), 0x00, 6); // THA: unknown
+        let tpa: [u8; 4] = [10, 0, 2, 2]; // TPA (SLIRP gateway default)
+        core::ptr::copy_nonoverlapping(tpa.as_ptr(), eth.add(38), 4);
+    }
+
+    let queue_num = tx_info.queue_num as u64;
+    let (desc_off, avail_off, used_off) = vring_offsets(queue_num, VRING_ALIGN);
+    let desc_ptr = (tx_info.virt_base + desc_off) as *mut u8;
+    let avail_ptr = (tx_info.virt_base + avail_off) as *mut u16;
+    let used_ptr = (tx_info.virt_base + used_off) as *mut u8;
+
+    const ARP_DESC_INDEX: u16 = 1;
+    unsafe {
+        let arp_desc_ptr = desc_ptr.add(16 * ARP_DESC_INDEX as usize);
+        core::ptr::write_volatile(arp_desc_ptr as *mut u64, buf_phys);
+        core::ptr::write_volatile(arp_desc_ptr.add(8) as *mut u32, buf_len as u32);
+        core::ptr::write_volatile(arp_desc_ptr.add(12) as *mut u16, 0); // read-only, no NEXT
+        core::ptr::write_volatile(arp_desc_ptr.add(14) as *mut u16, 0); // next: unused
+
+        let avail_idx = core::ptr::read_volatile(avail_ptr.add(1));
+        let ring_slot = (avail_idx as u64 % queue_num) as usize;
+        core::ptr::write_volatile(avail_ptr.add(2 + ring_slot), ARP_DESC_INDEX);
+        core::ptr::write_volatile(avail_ptr.add(1), avail_idx.wrapping_add(1));
+    }
+
+    // Confirm the request actually went out - a local DMA/descriptor
+    // completion, not a network round trip, so a tight bounded poll is
+    // appropriate here (the same convention send_test_frame's own TX
+    // completion check already uses).
+    let tx_used_idx_ptr = unsafe { (used_ptr as *mut u16).add(1) };
+    let tx_used_idx_before = unsafe { core::ptr::read_volatile(tx_used_idx_ptr) };
+    unsafe {
+        write_port_u16(tx_info.io_base, VIRTIO_PCI_QUEUE_NOTIFY, TX_QUEUE_INDEX);
+    }
+    let mut tx_used_idx_after = tx_used_idx_before;
+    for _ in 0..1_000_000u32 {
+        tx_used_idx_after = unsafe { core::ptr::read_volatile(tx_used_idx_ptr) };
+        if tx_used_idx_after != tx_used_idx_before {
+            break;
+        }
+    }
+    let tx_ok = tx_used_idx_after != tx_used_idx_before;
+    serial_println!(
+        "[VIRTIO] rx_test tx_phase={}",
+        if tx_ok { "ok" } else { "failed" }
+    );
+    if !tx_ok {
+        return Err("virtio: RX test's own ARP request TX never completed");
+    }
+
+    // Now wait for SLIRP's reply to land in the RX buffer armed by
+    // init_rx_queue (Fase 65) - a genuine network round trip, so this
+    // yields the CPU via hlt() for real wall-clock time (~90 ticks,
+    // about 5 seconds at this kernel's ~18.2Hz rate) rather than a
+    // tight busy-spin, the same reasoning net::e1000::receive_test_frame
+    // already established for the identical kind of wait.
+    let (_rx_desc_off, _rx_avail_off, rx_used_off) =
+        vring_offsets(rx_info.queue_num as u64, VRING_ALIGN);
+    let rx_used_ptr = (rx_info.virt_base + rx_used_off) as *mut u8;
+    let rx_used_idx_ptr = unsafe { (rx_used_ptr as *mut u16).add(1) };
+    let used_idx_before = unsafe { core::ptr::read_volatile(rx_used_idx_ptr) };
+
+    let start_tick = crate::interrupts::timer_ticks();
+    let used_idx_after = loop {
+        let current = unsafe { core::ptr::read_volatile(rx_used_idx_ptr) };
+        if current != used_idx_before || crate::interrupts::timer_ticks() - start_tick > 90 {
+            break current;
+        }
+        x86_64::instructions::hlt();
+    };
+
+    if used_idx_after == used_idx_before {
+        // Diagnostic left in place for whoever resumes this: the used
+        // ring never advancing could mean the reply never arrived at
+        // all, or that it arrived but something about how this queue
+        // was armed keeps the device from ever marking it used - these
+        // look identical from `used_idx` alone, so dump the ISR
+        // (cleared by this read - fine, only read on this failure
+        // path) and the RX descriptor's own raw memory (readable back
+        // regardless of whether the device ever touched it) to tell
+        // them apart without needing to re-add debug prints from
+        // scratch.
+        let isr = unsafe { read_port_u8(tx_info.io_base, VIRTIO_PCI_ISR) };
+        let (rx_desc_off, _rx_avail_off2, _rx_used_off2) =
+            vring_offsets(rx_info.queue_num as u64, VRING_ALIGN);
+        let rx_desc_ptr = (rx_info.virt_base + rx_desc_off) as *const u8;
+        let raw_desc = unsafe { core::slice::from_raw_parts(rx_desc_ptr, 16) };
+        let raw_buf_head =
+            unsafe { core::slice::from_raw_parts(rx_info.buf_virt as *const u8, 16) };
+        serial_println!(
+            "[VIRTIO] rx timeout: isr={:#04x} raw_desc0={:02x?} raw_buf_head={:02x?}",
+            isr,
+            raw_desc,
+            raw_buf_head
+        );
+        return Err("virtio: RX timed out waiting for a received frame");
+    }
+
+    // past flags+idx (4 bytes) to ring[0]'s {id, len} - descriptor 0 is
+    // the only one init_rx_queue ever armed.
+    let rx_used_elem_ptr = unsafe { (rx_used_ptr as *mut u32).add(1) };
+    let received_len = unsafe { core::ptr::read_volatile(rx_used_elem_ptr.add(1)) };
+
+    // The device writes its own virtio_net_hdr (10 bytes) ahead of the
+    // actual received Ethernet frame - skip past it, the RX mirror of
+    // how send_test_frame's own TX buffer is laid out.
+    let recv_buf = rx_info.buf_virt as *const u8;
+    let eth_len = (received_len as usize).saturating_sub(VIRTIO_NET_HDR_LEN);
+    let eth_data =
+        unsafe { core::slice::from_raw_parts(recv_buf.add(VIRTIO_NET_HDR_LEN), eth_len) };
+
+    // Same ARP-reply verification net::e1000::receive_test_frame
+    // already established: OPER=0x0002 (reply, not request) and SHA
+    // (the replying device's own MAC) matching the Ethernet header's
+    // source MAC - real internal cross-consistency a malformed or
+    // unrelated frame wouldn't have, not just "something arrived".
+    let is_arp_reply = eth_data.len() >= 28
+        && eth_data[12] == 0x08
+        && eth_data[13] == 0x06
+        && eth_data[20] == 0x00
+        && eth_data[21] == 0x02
+        && eth_data[22..28] == eth_data[6..12];
+    let gateway_ip = if eth_data.len() >= 32 {
+        Some([eth_data[28], eth_data[29], eth_data[30], eth_data[31]])
+    } else {
+        None
+    };
+
+    Ok(RxRecvInfo {
+        used_idx_before,
+        used_idx_after,
+        received_len,
+        is_arp_reply,
+        gateway_ip,
+    })
+}
