@@ -125,6 +125,26 @@ jobs:
             echo "CURSOR REGRESSION: expected exactly 2 'help ->' dispatches (self-test + cursor-movement test), got $(grep -c 'SHELL\] help ->' boot.log)."
             exit 1
           fi
+          # Confirms Shift key support really works: typing "cat KERNEL~1"
+          # via a real scancode sequence (holding Shift across "KERNEL~",
+          # releasing before the unshifted "1") must dispatch the exact
+          # same real command a second time (the first is the direct
+          # self-test earlier) - so "cat KERNEL~1 ->" should appear twice,
+          # both times with the identical byte count. Not asserting the
+          # specific byte count itself (KERNEL~1's size shifts by build
+          # machine, same lesson as Fase 15) - only that whatever it is,
+          # both dispatches agree, proving the Shift-typed filename was
+          # exactly right, not almost right.
+          cat_byte_counts=$(grep -oE "SHELL\] cat KERNEL~1 -> [0-9]+ bytes" boot.log | grep -oE "[0-9]+ bytes" | grep -oE "^[0-9]+")
+          cat_dispatch_count=$(echo "$cat_byte_counts" | grep -c .)
+          if [ "$cat_dispatch_count" -ne 2 ]; then
+            echo "SHIFT KEY REGRESSION: expected 'cat KERNEL~1' dispatched exactly twice (direct self-test + Shift-driven keyboard test), got $cat_dispatch_count."
+            exit 1
+          fi
+          if [ "$(echo "$cat_byte_counts" | head -1)" != "$(echo "$cat_byte_counts" | tail -1)" ]; then
+            echo "SHIFT KEY REGRESSION: the two 'cat KERNEL~1' dispatches read different byte counts - the Shift-driven filename was likely typed wrong."
+            exit 1
+          fi
           grep -q "\[CTXSWITCH\] worker -> main: demo OK" boot.log
           grep -q "\[COOP\] all tasks finished" boot.log
           # Confirms the ps-visible PCB table is really unified with the

@@ -13,12 +13,24 @@ const SCANCODE_UP: u8 = 0x48;
 const SCANCODE_DOWN: u8 = 0x50;
 const SCANCODE_LEFT: u8 = 0x4B;
 const SCANCODE_RIGHT: u8 = 0x4D;
+/// Left/Right Shift make codes. Unlike every other key handled here,
+/// Shift is a held *state*, not a one-shot press - both these and their
+/// break codes below matter.
+const SCANCODE_LSHIFT: u8 = 0x2A;
+const SCANCODE_RSHIFT: u8 = 0x36;
+/// Break (key-up) codes for the two Shift keys - just the make code with
+/// the top bit set, same PS/2 set 1 convention as everything else.
+const SCANCODE_LSHIFT_BREAK: u8 = 0xAA;
+const SCANCODE_RSHIFT_BREAK: u8 = 0xB6;
 
 pub struct KeyboardDriver {
     last_scancode: u8,
     /// Set after seeing `SCANCODE_EXTENDED_PREFIX`, consumed by the very
     /// next scancode - that's the one that actually identifies the key.
     pending_extended: bool,
+    /// True while either Shift key is held down. Doesn't distinguish
+    /// left/right - nothing here needs to.
+    shift_held: bool,
     line_buffer: String,
     /// Byte index into `line_buffer` where the next insert/backspace
     /// applies - always `<= line_buffer.len()`. Byte index and char index
@@ -38,6 +50,7 @@ impl KeyboardDriver {
         KeyboardDriver {
             last_scancode: 0,
             pending_extended: false,
+            shift_held: false,
             line_buffer: String::new(),
             cursor_pos: 0,
             history: Vec::new(),
@@ -45,8 +58,15 @@ impl KeyboardDriver {
         }
     }
 
-    /// Convert PS/2 set 1 scancode to ASCII char
+    /// Convert PS/2 set 1 scancode to ASCII char, honoring the current
+    /// Shift state for letters and the two punctuation keys real
+    /// filenames on this disk actually need (`~`/`-`, for "KERNEL~1"-
+    /// style names). Deliberately NOT covering shifted digit-row symbols
+    /// (`!@#$` etc.) or other punctuation - nothing on this disk or in
+    /// any shell command needs them yet, and this is a shell keyboard
+    /// driver, not a general-purpose one.
     pub fn scancode_to_char(&self, scancode: u8) -> Option<char> {
+        let shift = self.shift_held;
         match scancode {
             0x02 => Some('1'),
             0x03 => Some('2'),
@@ -58,32 +78,34 @@ impl KeyboardDriver {
             0x09 => Some('8'),
             0x0A => Some('9'),
             0x0B => Some('0'),
-            0x10 => Some('q'),
-            0x11 => Some('w'),
-            0x12 => Some('e'),
-            0x13 => Some('r'),
-            0x14 => Some('t'),
-            0x15 => Some('y'),
-            0x16 => Some('u'),
-            0x17 => Some('i'),
-            0x18 => Some('o'),
-            0x19 => Some('p'),
-            0x1E => Some('a'),
-            0x1F => Some('s'),
-            0x20 => Some('d'),
-            0x21 => Some('f'),
-            0x22 => Some('g'),
-            0x23 => Some('h'),
-            0x24 => Some('j'),
-            0x25 => Some('k'),
-            0x26 => Some('l'),
-            0x2C => Some('z'),
-            0x2D => Some('x'),
-            0x2E => Some('c'),
-            0x2F => Some('v'),
-            0x30 => Some('b'),
-            0x31 => Some('n'),
-            0x32 => Some('m'),
+            0x0C => Some(if shift { '_' } else { '-' }),
+            0x10 => Some(if shift { 'Q' } else { 'q' }),
+            0x11 => Some(if shift { 'W' } else { 'w' }),
+            0x12 => Some(if shift { 'E' } else { 'e' }),
+            0x13 => Some(if shift { 'R' } else { 'r' }),
+            0x14 => Some(if shift { 'T' } else { 't' }),
+            0x15 => Some(if shift { 'Y' } else { 'y' }),
+            0x16 => Some(if shift { 'U' } else { 'u' }),
+            0x17 => Some(if shift { 'I' } else { 'i' }),
+            0x18 => Some(if shift { 'O' } else { 'o' }),
+            0x19 => Some(if shift { 'P' } else { 'p' }),
+            0x1E => Some(if shift { 'A' } else { 'a' }),
+            0x1F => Some(if shift { 'S' } else { 's' }),
+            0x20 => Some(if shift { 'D' } else { 'd' }),
+            0x21 => Some(if shift { 'F' } else { 'f' }),
+            0x22 => Some(if shift { 'G' } else { 'g' }),
+            0x23 => Some(if shift { 'H' } else { 'h' }),
+            0x24 => Some(if shift { 'J' } else { 'j' }),
+            0x25 => Some(if shift { 'K' } else { 'k' }),
+            0x26 => Some(if shift { 'L' } else { 'l' }),
+            0x29 => Some(if shift { '~' } else { '`' }),
+            0x2C => Some(if shift { 'Z' } else { 'z' }),
+            0x2D => Some(if shift { 'X' } else { 'x' }),
+            0x2E => Some(if shift { 'C' } else { 'c' }),
+            0x2F => Some(if shift { 'V' } else { 'v' }),
+            0x30 => Some(if shift { 'B' } else { 'b' }),
+            0x31 => Some(if shift { 'N' } else { 'n' }),
+            0x32 => Some(if shift { 'M' } else { 'm' }),
             0x39 => Some(' '),
             0x1C => Some('\n'),
             _ => None,
@@ -204,6 +226,26 @@ pub fn handle_scancode(scancode: u8) {
         return;
     }
     let is_extended = core::mem::take(&mut kb.pending_extended);
+
+    // Shift's release (break code) has to update state too, unlike every
+    // other key here where only the press does anything - so this is
+    // handled before the repeat-suppression logic below, which would
+    // otherwise just discard it (it only ever recognizes make codes as
+    // meaningful, tracking break codes solely so the *next* press of the
+    // same key isn't mistaken for a held-key repeat).
+    match scancode {
+        SCANCODE_LSHIFT | SCANCODE_RSHIFT => {
+            kb.shift_held = true;
+            kb.last_scancode = scancode;
+            return;
+        }
+        SCANCODE_LSHIFT_BREAK | SCANCODE_RSHIFT_BREAK => {
+            kb.shift_held = false;
+            kb.last_scancode = scancode;
+            return;
+        }
+        _ => {}
+    }
 
     let is_new_press = scancode != kb.last_scancode && (scancode & 0x80) == 0;
     kb.last_scancode = scancode;

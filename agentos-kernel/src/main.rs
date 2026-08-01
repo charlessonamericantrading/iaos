@@ -477,6 +477,39 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         keyboard::handle_scancode(code);
     }
 
+    // 7c-4. Test Shift key support (uppercase letters + `~`/`-`) - a real
+    // practical gap this closes: before this, a real user at the keyboard
+    // could never actually type `cat KERNEL~1` themselves (no way to
+    // produce an uppercase letter or `~` at all), even though the
+    // self-test above dispatches it directly. Feeds a realistic sequence
+    // holding Left Shift across "KERNEL~" (six letters plus the backtick
+    // key, which shifts to `~`), releasing it before the unshifted "1",
+    // spelling the exact real filename found on disk. If Shift genuinely
+    // works, this dispatches the real `cat` command a *second* time (the
+    // first was the direct self-test above) - "cat KERNEL~1 -> ... bytes"
+    // should appear twice in the log, not once plus an "Unknown command".
+    kprintln!("[KERNEL INIT] Testing Shift key (typing 'cat KERNEL~1' via keyboard)...");
+    const SHIFT_TEST_SEQUENCE: &[u8] = &[
+        0x2E, 0xAE, // c
+        0x1E, 0x9E, // a
+        0x14, 0x94, // t
+        0x39, 0xB9, // space
+        0x2A, // Left Shift down (held through "KERNEL~")
+        0x25, 0xA5, // K
+        0x12, 0x92, // E
+        0x13, 0x93, // R
+        0x31, 0xB1, // N
+        0x12, 0x92, // E
+        0x26, 0xA6, // L
+        0x29, 0xA9, // ~ (backtick key, shifted)
+        0xAA, // Left Shift up
+        0x02, 0x82, // 1 (unshifted)
+        0x1C, 0x9C, // enter -> dispatch "cat KERNEL~1"
+    ];
+    for &code in SHIFT_TEST_SEQUENCE {
+        keyboard::handle_scancode(code);
+    }
+
     // 7d. Test a Real Cooperative Context Switch (stack + register swap)
     // Cooperative only - the worker yields back voluntarily. Not wired to
     // the timer interrupt yet (that's real preemption, separate work).
