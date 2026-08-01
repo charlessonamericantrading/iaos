@@ -1116,6 +1116,73 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("rmdir MULTIOUT");
     shell::dispatch_command("ls");
 
+    // 7b-4. Test Multi-Chunk VFAT Long File Names (>13 characters, needing
+    // several chained long-name entries instead of the one Fase 38 could
+    // build). "a very long descriptive name.txt" is 32 characters - past
+    // the old 13-character cap, needing ceil(32/13)=3 long entries
+    // (13+13+6 characters). Exercises the actual new logic this Fase adds
+    // (build_lfn_entries building N entries in correct reverse-sequence
+    // order, find_free_entry_run_in reserving N+1 consecutive slots)
+    // while relying on machinery already proven in Fase 38: the read
+    // side's LfnState was always general over chunk count, so reading
+    // this 3-chunk name back correctly is also the first real proof that
+    // generality was ever exercised, not just designed for.
+    // multi_chunk_long_read_ok proves reading by the real long name
+    // reconstructs all 3 chunks in the right order (a scrambled order
+    // would produce a readable-but-wrong string, not an error - so this
+    // compares full content, not just success/failure).
+    // multi_chunk_alias_read_ok proves the generated short alias
+    // ("AVERY~1.TXT") is independently valid too, same as the single-
+    // chunk case. Deleted by the long name specifically (Fase 38's file
+    // sub-test used the alias) to exercise find_entry_location_in's own
+    // multi-chunk reconstruction, not just parse_dir_sector's.
+    kprintln!("[KERNEL INIT] Testing multi-chunk VFAT long file names (>13 chars)...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                const LONG_NAME: &str = "a very long descriptive name.txt";
+                const MULTI_LFN_DATA: &[u8] = b"multi-chunk VFAT works!";
+                let multi_chunk_created = fs.create_file(LONG_NAME, MULTI_LFN_DATA).is_ok();
+                let entries = fs.list_root_directory().unwrap_or_default();
+                let multi_chunk_shown = entries.iter().any(|e| e.name == LONG_NAME);
+                let multi_chunk_long_read_ok = fs
+                    .read_file(LONG_NAME)
+                    .map(|d| d == MULTI_LFN_DATA)
+                    .unwrap_or(false);
+                let multi_chunk_alias_read_ok = fs
+                    .read_file("AVERY~1.TXT")
+                    .map(|d| d == MULTI_LFN_DATA)
+                    .unwrap_or(false);
+                let multi_chunk_delete_ok = fs.delete_file(LONG_NAME).is_ok();
+                let multi_chunk_gone_ok =
+                    fs.read_file(LONG_NAME).is_err() && fs.read_file("AVERY~1.TXT").is_err();
+
+                kprintln!(
+                    "[FAT12] multi-chunk vfat test: created={} shown={} long_read_ok={} alias_read_ok={} delete_ok={} gone_ok={}",
+                    multi_chunk_created, multi_chunk_shown, multi_chunk_long_read_ok,
+                    multi_chunk_alias_read_ok, multi_chunk_delete_ok, multi_chunk_gone_ok
+                );
+                serial_println!(
+                    "[FAT12] multi_chunk_vfat_test created={} shown={} long_read_ok={} alias_read_ok={} delete_ok={} gone_ok={}",
+                    multi_chunk_created, multi_chunk_shown, multi_chunk_long_read_ok,
+                    multi_chunk_alias_read_ok, multi_chunk_delete_ok, multi_chunk_gone_ok
+                );
+            }
+            Err(e) => {
+                kprintln!("[FAT12] multi-chunk vfat test: not FAT12 ({})", e);
+                serial_println!("[FAT12] multi_chunk_vfat_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!(
+                "[FAT12] multi-chunk vfat test: couldn't find FAT partition: {}",
+                e
+            );
+            serial_println!("[FAT12] multi_chunk_vfat_test -> no partition: {}", e);
+        }
+    }
+    shell::dispatch_command("ls");
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real

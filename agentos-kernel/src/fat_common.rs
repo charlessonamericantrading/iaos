@@ -7,11 +7,11 @@
 //! immediately preceding the short entry they describe, which every non-
 //! VFAT-aware FAT reader already skips harmlessly (see `parse_dir_sector`
 //! below - it always has, even before this kernel could write one
-//! itself). This kernel only ever *writes* a single-chunk long name (see
-//! `fat12.rs`'s `build_lfn_entry` - names up to 13 characters), but the
-//! read side reconstructs a long name of any chunk count, so a name
-//! written by a real, more complete VFAT implementation displays
-//! correctly here too.
+//! itself). `fat12.rs`'s `build_lfn_entries` writes up to 15 chained long
+//! entries (195 characters - its own single-sector slot-run limit), and
+//! this read side reconstructs a long name of *any* chunk count, so a
+//! name written by a real, more complete VFAT implementation (no such
+//! cap) still displays correctly here too.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -116,7 +116,7 @@ impl LfnState {
 /// which per spec omits the terminator entirely in its final chunk).
 /// ASCII-only: this kernel only ever *writes* long names built from
 /// plain ASCII widened 1:1 into UTF-16 (see `fat12.rs`'s
-/// `build_lfn_entry`), so narrowing back down with `as u8` is exact and
+/// `build_lfn_entries`), so narrowing back down with `as u8` is exact and
 /// lossless for every long name this kernel can itself produce; a
 /// genuinely non-ASCII long name (impossible for this kernel to have
 /// written, but a real VFAT tool could produce one) would come back

@@ -460,6 +460,21 @@ jobs:
           grep -q "SHELL\] cat MULTIOUT/MULTIIN/DEEP.TXT -> FAILED: FAT12: file not found in directory" boot.log
           grep -q "SHELL\] rmdir MULTIOUT/MULTIIN -> deleted" boot.log
           grep -q "SHELL\] rmdir MULTIOUT -> deleted" boot.log
+          # Confirms MULTI-CHUNK VFAT LONG FILE NAMES (Fase 40) - a name
+          # past Fase 38's original 13-character single-entry cap now
+          # chains multiple long-name entries instead of being rejected.
+          # "a very long descriptive name.txt" is 32 characters, needing
+          # ceil(32/13)=3 long entries (13+13+6) - past the boundary, not
+          # merely one character over it. long_read_ok AND alias_read_ok
+          # both true proves the read side's multi-chunk reconstruction
+          # (LfnState, general from the start but never exercised past
+          # one chunk until now) actually works, not just that it compiles;
+          # deleted by the long name specifically exercises find_entry_
+          # location_in's own multi-chunk accumulation the same way.
+          # All six checks must succeed for this exact line to appear;
+          # a fresh CI image always takes this same fully-self-cleaning
+          # path.
+          grep -q "FAT12\] multi_chunk_vfat_test created=true shown=true long_read_ok=true alias_read_ok=true delete_ok=true gone_ok=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.

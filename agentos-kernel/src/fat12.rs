@@ -404,17 +404,24 @@ impl Fat12Info {
     /// meaning everything from here to the end of the directory is
     /// unused too, per the FAT spec) or previously-deleted ones (`0xE5`,
     /// safe to reuse). Returns each slot's absolute sector LBA and byte
-    /// offset within that sector, in order. `count` is always 1 (a plain
-    /// short-name entry) or 2 (a VFAT long entry plus the short entry it
-    /// describes - see `build_name_entries`) in this kernel.
+    /// offset within that sector, in order. `count` is 1 (a plain
+    /// short-name entry) or `N + 1` for an `N`-chunk VFAT name (`N` long
+    /// entries plus the short entry they describe - see
+    /// `build_name_entries`).
     ///
     /// Restricting a run to a single sector (never straddling into the
-    /// next one) is a deliberate simplification: a sector holds 16
-    /// entries, so this only matters for a 2-slot VFAT run landing
-    /// exactly on a sector's last slot, in which case the search simply
-    /// continues into the next sector instead of splitting the run
-    /// across both - avoiding the extra complexity of a multi-sector
-    /// write for a case this small a `count` makes rare in practice.
+    /// next one) is a deliberate simplification: a sector holds
+    /// `ENTRIES_PER_SECTOR` (16) entries, so a run bumping into a
+    /// sector's last slot simply continues the search into the next
+    /// sector instead of splitting across both - avoiding the extra
+    /// complexity of a multi-sector write. `count` can therefore never
+    /// exceed 16 here; `build_name_entries` caps a VFAT name at 15
+    /// chunks (195 characters) specifically so `count` (chunks + 1)
+    /// never does either - checked explicitly below rather than left as
+    /// an implicit assumption, since silently exceeding it would compute
+    /// a byte offset past a single 512-byte `sector_buf` in the
+    /// `grow_directory` fallback below (a real, found-by-reasoning-
+    /// through-this-function's-own-limits gap, not a hypothetical one).
     ///
     /// The root can never grow - it's a fixed-size range dictated by
     /// the BPB itself, not a cluster chain - so a full root is a real,
@@ -430,6 +437,10 @@ impl Fat12Info {
         dir: DirLocation,
         count: usize,
     ) -> Result<Vec<(u32, usize)>, &'static str> {
+        const ENTRIES_PER_SECTOR: usize = 512 / 32;
+        if count > ENTRIES_PER_SECTOR {
+            return Err("FAT12: cannot reserve that many consecutive directory-entry slots within one sector");
+        }
         let mut sector_buf = [0u8; 512];
         for lba in self.directory_sectors(dir)? {
             ata::read_sector(lba, &mut sector_buf)?;
@@ -596,7 +607,7 @@ impl Fat12Info {
             return Err("FAT12: a file with that name already exists");
         }
 
-        let (short_name, long_entry) = self.build_name_entries(dir, name)?;
+        let (short_name, long_entries) = self.build_name_entries(dir, name)?;
         let cluster_bytes = self.sectors_per_cluster as usize * 512;
         // find_free_entry_run_in MUST run before find_free_clusters
         // below, not after - found the hard way via the directory-growth
@@ -610,7 +621,7 @@ impl Fat12Info {
         // find_free_clusters call could still see that "candidate"
         // cluster as free and hand out the exact same one, corrupting
         // whichever write happened second.
-        let slots = self.find_free_entry_run_in(dir, if long_entry.is_some() { 2 } else { 1 })?;
+        let slots = self.find_free_entry_run_in(dir, long_entries.len() + 1)?;
 
         // At least one cluster even for an empty (0-byte) file, matching
         // this method's existing convention from before multi-cluster
@@ -659,29 +670,31 @@ impl Fat12Info {
             fat_time,
             fat_date,
         );
-        self.write_name_entries(&slots, long_entry, entry)?;
+        self.write_name_entries(&slots, &long_entries, entry)?;
 
         Ok(())
     }
 
-    /// Writes a short entry (and, if present, the single VFAT long entry
+    /// Writes a short entry (and, if any, the VFAT long entries
     /// describing it) into the slots `find_free_entry_run_in` reserved -
-    /// the long entry, when there is one, always occupies `slots[0]`
-    /// (the standard on-disk order: long entries immediately before the
-    /// short entry they describe), the short entry always the last slot.
-    /// Reads and rewrites each slot's own sector independently rather
-    /// than assuming both slots share one sector (true today, since
-    /// `find_free_entry_run_in` never returns a run spanning two - but
-    /// this way stays correct even if that restriction is ever lifted).
+    /// `long_entries` (already in correct on-disk order - highest
+    /// sequence number, holding the end of the name, first) fill
+    /// `slots[0..long_entries.len()]` in order, the short entry always
+    /// the last slot (`slots.len() == long_entries.len() + 1` always, by
+    /// construction from every caller). Reads and rewrites each slot's
+    /// own sector independently rather than assuming they all share one
+    /// (true today, since `find_free_entry_run_in` never returns a run
+    /// spanning two sectors - but this way stays correct even if that
+    /// restriction is ever lifted).
     fn write_name_entries(
         &mut self,
         slots: &[(u32, usize)],
-        long_entry: Option<[u8; 32]>,
+        long_entries: &[[u8; 32]],
         short_entry: [u8; 32],
     ) -> Result<(), &'static str> {
         let mut writes = Vec::new();
-        if let Some(long) = long_entry {
-            writes.push((slots[0].0, slots[0].1, long));
+        for (&(lba, offset), &entry) in slots.iter().zip(long_entries) {
+            writes.push((lba, offset, entry));
         }
         let &(short_lba, short_offset) = slots.last().unwrap();
         writes.push((short_lba, short_offset, short_entry));
@@ -738,7 +751,7 @@ impl Fat12Info {
             return Err("FAT12: a file or directory with that name already exists");
         }
 
-        let (short_name, long_entry) = self.build_name_entries(parent, name)?;
+        let (short_name, long_entries) = self.build_name_entries(parent, name)?;
         // find_free_entry_run_in before find_free_clusters - see the
         // matching comment in create_file_impl for why the order
         // matters (found via the same directory-growth self-test):
@@ -747,8 +760,7 @@ impl Fat12Info {
         // directory's own cluster were chosen first instead, that
         // choice wouldn't be committed yet, and find_free_entry_run_in's
         // own growth could still see it as free and collide with it.
-        let slots =
-            self.find_free_entry_run_in(parent, if long_entry.is_some() { 2 } else { 1 })?;
+        let slots = self.find_free_entry_run_in(parent, long_entries.len() + 1)?;
         let cluster = self.find_free_clusters(1)?[0];
 
         let time = crate::rtc::read_time();
@@ -783,7 +795,7 @@ impl Fat12Info {
         self.write_fat_entry_to_disk(cluster, 0x0FFF)?;
 
         let dir_entry = build_dir_entry(&short_name, 0x10, cluster, 0, fat_time, fat_date);
-        self.write_name_entries(&slots, long_entry, dir_entry)?;
+        self.write_name_entries(&slots, &long_entries, dir_entry)?;
 
         Ok(())
     }
@@ -979,51 +991,51 @@ impl Fat12Info {
 
     /// Decides how to represent `name` on disk. If it already fits the
     /// plain 8.3 short-name format, no VFAT entries are needed at all -
-    /// the same simpler path every name used before this Fase, returned
-    /// here as `None` for the long-entry half - *except* that path now
-    /// also has to guard against a real collision `to_short_name` alone
-    /// can't see: a plain 8.3 name typed directly might be byte-for-byte
-    /// identical to some *other* entry's already-generated VFAT alias
-    /// (`generate_short_alias` only ever checks collisions when *it*
-    /// picks one, not when a caller bypasses it entirely with a name
-    /// that already fits). Found by reasoning through what this Fase's
-    /// own self-test would do with an alias as a plain input, not by a
-    /// failing test - left unfixed, two directory entries could end up
-    /// sharing one short name, corrupting whichever lookup finds the
-    /// wrong one first.
+    /// the same simpler path every name used before VFAT support existed,
+    /// returned here as an empty `Vec` for the long-entries half -
+    /// *except* that path also has to guard against a real collision
+    /// `to_short_name` alone can't see: a plain 8.3 name typed directly
+    /// might be byte-for-byte identical to some *other* entry's
+    /// already-generated VFAT alias (`generate_short_alias` only ever
+    /// checks collisions when *it* picks one, not when a caller bypasses
+    /// it entirely with a name that already fits). Found by reasoning
+    /// through what an earlier Fase's self-test would do with an alias
+    /// as a plain input, not by a failing test - left unfixed, two
+    /// directory entries could end up sharing one short name, corrupting
+    /// whichever lookup finds the wrong one first.
     ///
-    /// Otherwise, if `name` is short enough for a *single* VFAT
-    /// long-name entry (this Fase's deliberate scope limit - see the
-    /// module doc) and every character is valid, generates a short alias
-    /// plus that one long entry instead (already collision-checked
-    /// internally, see `generate_short_alias`). A name longer than 13
-    /// characters still gets the older, honest "doesn't fit" error:
-    /// proper multi-entry VFAT sequencing is real, additional complexity
-    /// (a run of N consecutive free slots instead of 2, N chained
-    /// entries built in reverse sequence order) deliberately not
-    /// attempted yet - see `fat_common`'s module doc, whose *read* side
-    /// already handles that general case so a name written by a more
-    /// complete VFAT implementation still displays correctly here, even
-    /// though this kernel can't yet create one itself.
+    /// Otherwise, if `name` is short enough (see the cap below) and
+    /// every character is valid, generates a short alias plus as many
+    /// long entries as the name needs (already collision-checked
+    /// internally, see `generate_short_alias`). Capped at 195 characters
+    /// (15 long entries of 13 characters each) - not an arbitrary
+    /// number, but the largest that still keeps a new entry's required
+    /// slots (long entries plus the one short entry, see
+    /// `find_free_entry_run_in`) within its own single-sector limit (16
+    /// entries). A name over that cap gets an honest "doesn't fit"
+    /// error rather than a silently truncated one; lifting it would mean
+    /// lifting the one-sector restriction too, letting a slot run span
+    /// sectors - real, additional complexity not attempted yet.
     fn build_name_entries(
         &self,
         dir: DirLocation,
         name: &str,
-    ) -> Result<([u8; 11], Option<[u8; 32]>), &'static str> {
+    ) -> Result<([u8; 11], alloc::vec::Vec<[u8; 32]>), &'static str> {
         if let Ok(short_name) = to_short_name(name) {
             if self.existing_short_names_in(dir)?.contains(&short_name) {
                 return Err("FAT12: that short name is already in use");
             }
-            return Ok((short_name, None));
+            return Ok((short_name, alloc::vec::Vec::new()));
         }
-        if name.is_empty() || name.len() > 13 || !name.bytes().all(is_valid_lfn_char) {
+        const MAX_LFN_CHARS: usize = 15 * 13;
+        if name.is_empty() || name.len() > MAX_LFN_CHARS || !name.bytes().all(is_valid_lfn_char) {
             return Err(
-                "FAT12: name must fit the 8.3 short-name format, or be a valid name of 13 characters or fewer",
+                "FAT12: name must fit the 8.3 short-name format, or be a valid name of 195 characters or fewer",
             );
         }
         let short_name = self.generate_short_alias(dir, name)?;
-        let long_entry = build_lfn_entry(name, &short_name);
-        Ok((short_name, Some(long_entry)))
+        let long_entries = build_lfn_entries(name, &short_name);
+        Ok((short_name, long_entries))
     }
 
     /// Generates a short 8.3 "alias" for a long name that doesn't fit
@@ -1135,7 +1147,7 @@ fn to_short_name(name: &str) -> Result<[u8; 11], &'static str> {
 /// long-name rules (path separators and other shell/OS-meaningful
 /// punctuation). Non-ASCII is out of scope here, not because the format
 /// forbids it (real VFAT is UTF-16 and supports it fully) but because
-/// this kernel's own keyboard driver can't produce it - `build_lfn_entry`
+/// this kernel's own keyboard driver can't produce it - `build_lfn_entries`
 /// widens each accepted byte 1:1 into a UTF-16 code unit, which is exact
 /// for everything this check lets through.
 fn is_valid_lfn_char(b: u8) -> bool {
@@ -1146,38 +1158,63 @@ fn is_valid_lfn_char(b: u8) -> bool {
         )
 }
 
-/// Builds the single 32-byte VFAT long-name entry for `name` (must fit
-/// in 13 UTF-16 code units - the one-chunk restriction this Fase keeps,
-/// see `build_name_entries`'s doc). Shorter names are padded per spec: a
-/// `0x0000` terminator right after the real characters, then `0xFFFF`
-/// for every slot after that.
-fn build_lfn_entry(name: &str, short_name: &[u8; 11]) -> [u8; 32] {
-    let mut chars = [0xFFFFu16; 13];
-    for (i, b) in name.bytes().enumerate() {
-        chars[i] = b as u16;
-    }
-    if name.len() < 13 {
-        chars[name.len()] = 0x0000;
-    }
+/// Builds the sequence of 32-byte VFAT long-name entries for `name` (up
+/// to `build_name_entries`'s 195-character cap - 15 chunks of 13 UTF-16
+/// code units each), in on-disk order: the entry holding the *end* of
+/// the name first (sequence number ORed with `0x40`), counting down to
+/// sequence `1` last, immediately preceding the short entry all of them
+/// describe. A `name` of 13 characters or fewer reduces to exactly one
+/// entry with sequence `0x41` - the same single-entry case this function
+/// originally handled alone, verified unchanged by construction rather
+/// than by special-casing it. Only the *last* chunk in string order
+/// (first on disk) can be shorter than 13 characters - every other chunk
+/// is always a full 13, since only the final piece of a fixed-13-wide
+/// split can be partial - padded per spec: a `0x0000` terminator right
+/// after its real characters, then `0xFFFF` for every slot after that.
+fn build_lfn_entries(name: &str, short_name: &[u8; 11]) -> alloc::vec::Vec<[u8; 32]> {
+    let bytes: alloc::vec::Vec<u8> = name.bytes().collect();
+    let num_chunks = bytes.len().div_ceil(13).max(1);
+    let checksum = fat_common::lfn_checksum(short_name);
 
-    let mut entry = [0u8; 32];
-    entry[0] = 0x41; // sequence number 1, ORed with 0x40 (last/only entry)
-    for (i, c) in chars[0..5].iter().enumerate() {
-        entry[1 + i * 2..3 + i * 2].copy_from_slice(&c.to_le_bytes());
+    let mut entries = alloc::vec::Vec::with_capacity(num_chunks);
+    for chunk_index in (0..num_chunks).rev() {
+        let start = chunk_index * 13;
+        let end = (start + 13).min(bytes.len());
+        let chunk_bytes = &bytes[start..end];
+
+        let mut chars = [0xFFFFu16; 13];
+        for (i, &b) in chunk_bytes.iter().enumerate() {
+            chars[i] = b as u16;
+        }
+        if chunk_bytes.len() < 13 {
+            chars[chunk_bytes.len()] = 0x0000;
+        }
+
+        let mut sequence = (chunk_index + 1) as u8;
+        if chunk_index == num_chunks - 1 {
+            sequence |= 0x40; // last chunk in string order = first on disk
+        }
+
+        let mut entry = [0u8; 32];
+        entry[0] = sequence;
+        for (i, c) in chars[0..5].iter().enumerate() {
+            entry[1 + i * 2..3 + i * 2].copy_from_slice(&c.to_le_bytes());
+        }
+        entry[11] = 0x0F; // ATTR_LONG_NAME
+        entry[12] = 0x00;
+        entry[13] = checksum;
+        for (i, c) in chars[5..11].iter().enumerate() {
+            entry[14 + i * 2..16 + i * 2].copy_from_slice(&c.to_le_bytes());
+        }
+        // Bytes 26-27 (the "first cluster" field on a real short entry)
+        // are always 0 on a long entry - already the case, `entry`
+        // starts zeroed and nothing above ever touches this range.
+        for (i, c) in chars[11..13].iter().enumerate() {
+            entry[28 + i * 2..30 + i * 2].copy_from_slice(&c.to_le_bytes());
+        }
+        entries.push(entry);
     }
-    entry[11] = 0x0F; // ATTR_LONG_NAME
-    entry[12] = 0x00;
-    entry[13] = fat_common::lfn_checksum(short_name);
-    for (i, c) in chars[5..11].iter().enumerate() {
-        entry[14 + i * 2..16 + i * 2].copy_from_slice(&c.to_le_bytes());
-    }
-    // Bytes 26-27 (the "first cluster" field on a real short entry) are
-    // always 0 on a long entry - already the case, `entry` starts zeroed
-    // and nothing above ever touches this range.
-    for (i, c) in chars[11..13].iter().enumerate() {
-        entry[28 + i * 2..30 + i * 2].copy_from_slice(&c.to_le_bytes());
-    }
-    entry
+    entries
 }
 
 /// Packs a `RtcTime` into FAT's on-disk time/date u16 formats: time is
