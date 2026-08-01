@@ -29,7 +29,7 @@ mod vga_buffer;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use gguf_loader::GgufModelLoader;
+use gguf_loader::{GgufGtype, GgufModelLoader, GgufTensorInfo};
 use memory::kv_allocator::KV_MANAGER;
 use net::tcpip::NativeNetworkStack;
 use scheduler::agent_scheduler::SCHEDULER;
@@ -207,36 +207,52 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     // 5. Test GGUF Quantized Model Parser & Tensor Matrix Execution - the
-    // header bytes have genuinely round-tripped through the FAT12 disk
-    // since the prior Fase (create -> read back -> parse) instead of
-    // living only as a compile-time array `parse_header` happened to be
-    // handed directly. This Fase extends that same round trip to cover
-    // the actual tensor *weight values* too: the model file on disk is
-    // now the 24-byte header immediately followed by 64 bytes of raw
-    // little-endian f32 data (16 values), and the weights fed to the
-    // matmul come from decoding *those* disk-read bytes
-    // (`GgufModelLoader::decode_f32_le`), not a hardcoded Rust array.
-    // `MODEL.BIN` deliberately fits plain 8.3 (avoids incidentally
-    // exercising VFAT again here - that's already its own dedicated
-    // self-test). Still a deliberately simplified, honest slice of real
-    // GGUF: no separate tensor-info section (variable-length names,
-    // dimensions, per-tensor offsets - `GgufTensorInfo` models that
-    // shape but nothing constructs one yet) - just the raw weight
-    // values, in the fixed order this toy engine already expected them
-    // in. Loading real *quantized* tensor formats is separate, larger
-    // scope, not attempted here.
+    // header and tensor weight values have genuinely round-tripped
+    // through the FAT12 disk since the prior two Fases (create -> read
+    // back -> parse) instead of living only as compile-time arrays. This
+    // Fase adds the piece both of those deliberately left out: a real
+    // tensor-info entry (length-prefixed name, dimensions, quantization
+    // type, and a byte OFFSET to that tensor's own data elsewhere in the
+    // file - `GgufTensorInfo::parse`) sits between the header and the
+    // weight bytes, and the weight bytes are now located by *following
+    // that offset* rather than assumed to start immediately after a
+    // fixed-size header. `MODEL.BIN` deliberately fits plain 8.3 (avoids
+    // incidentally exercising VFAT again here - that's already its own
+    // dedicated self-test). Still a deliberately simplified, honest
+    // slice of real GGUF, not a compliance claim: `u32` fields instead
+    // of GGUF's `u64` (more range than this kernel's own toy tensors
+    // will ever need), exactly one tensor-info entry (not `tensor_count`
+    // of them - `tensor_count` is set to 1 here specifically so the
+    // header's own declared count matches what's actually present, no
+    // longer just a cosmetic unused number), and no KV-metadata section
+    // (`kv_count` set to 0, honestly reflecting that none is written or
+    // parsed). Loading real *quantized* tensor formats is separate,
+    // larger scope, not attempted here.
     kprintln!("[GGUF INFERENCE] Testing Native GGUF Header Parser & Tensor Weights...");
     const GGUF_HEADER: [u8; 24] = [
         0x47, 0x47, 0x55, 0x46, // "GGUF"
         0x03, 0x00, 0x00, 0x00, // Version 3
-        0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 16 Tensors
-        0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 8 KV Pairs
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 1 Tensor (the real entry below)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 0 KV Pairs (none written/parsed)
     ];
+    const TENSOR_NAME: &str = "weights";
     const GGUF_WEIGHTS: [f32; 16] = [
         0.5, -0.2, 0.8, 0.1, 0.3, 0.9, -0.4, 0.6, -0.1, 0.4, 0.7, 0.2, 0.6, -0.5, 0.2, 0.8,
     ];
-    let mut model_file_bytes = alloc::vec::Vec::with_capacity(24 + 64);
+
+    let mut model_file_bytes = alloc::vec::Vec::new();
     model_file_bytes.extend_from_slice(&GGUF_HEADER);
+    model_file_bytes.extend_from_slice(&(TENSOR_NAME.len() as u32).to_le_bytes());
+    model_file_bytes.extend_from_slice(TENSOR_NAME.as_bytes());
+    model_file_bytes.extend_from_slice(&4u32.to_le_bytes()); // dim0
+    model_file_bytes.extend_from_slice(&4u32.to_le_bytes()); // dim1
+    model_file_bytes.extend_from_slice(&(GgufGtype::F32 as u32).to_le_bytes());
+    // Where the tensor data will actually land, once the offset field
+    // itself (4 more bytes) is appended right after this comment - NOT
+    // assumed by the reader, computed here only to construct a valid
+    // file and to check the *parsed* offset matches it later.
+    let tensor_data_offset = model_file_bytes.len() + 4;
+    model_file_bytes.extend_from_slice(&(tensor_data_offset as u32).to_le_bytes());
     for w in GGUF_WEIGHTS {
         model_file_bytes.extend_from_slice(&w.to_le_bytes());
     }
@@ -249,47 +265,56 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let round_trip_ok = read_back.as_deref() == Ok(model_file_bytes.as_slice());
                 let cleanup_ok = fs.delete_file("MODEL.BIN").is_ok();
 
-                // Decoding the disk-read weight bytes back into f32
-                // exactly reproduces GGUF_WEIGHTS - the round trip
-                // (to_le_bytes -> disk -> from_le_bytes) is lossless, no
-                // arithmetic involved, so bit-for-bit equality is the
-                // correct check here, not a tolerance comparison.
-                let weights_decoded_ok = read_back
-                    .as_deref()
-                    .map(|b| GgufModelLoader::decode_f32_le(&b[24..]) == GGUF_WEIGHTS)
-                    .unwrap_or(false);
-
+                let mut tensor_info_ok = false;
+                let mut weights_decoded_ok = false;
                 let mut tensor_output_ok = false;
                 if let Ok(full_bytes) = &read_back {
                     if let Ok(loader) = GgufModelLoader::parse_header(&full_bytes[0..24]) {
-                        let weights = GgufModelLoader::decode_f32_le(&full_bytes[24..]);
-                        let inputs: [f32; 4] = [1.0, 2.0, 0.5, 3.0];
-                        let mut outputs: [f32; 4] = [0.0; 4];
+                        if let Ok((info, _consumed)) = GgufTensorInfo::parse(&full_bytes[24..]) {
+                            tensor_info_ok = info.name == TENSOR_NAME
+                                && info.dimensions == [4, 4]
+                                && info.gtype == GgufGtype::F32
+                                && info.offset == tensor_data_offset;
 
-                        loader.execute_gguf_layer_pass(&weights, &inputs, &mut outputs, 4, 4);
+                            // Located by following the parsed offset, not
+                            // by assuming it sits right after the header -
+                            // the real proof this Fase's offset-based
+                            // indirection actually works, not just parses.
+                            let tensor_bytes = &full_bytes[info.offset..info.offset + 64];
+                            let weights = GgufModelLoader::decode_f32_le(tensor_bytes);
+                            // Lossless byte round trip (to_le_bytes ->
+                            // disk -> from_le_bytes), no arithmetic
+                            // involved, so bit-for-bit equality is the
+                            // correct check here, not a tolerance one.
+                            weights_decoded_ok = weights == GGUF_WEIGHTS;
 
-                        kprintln!(
-                            "[GGUF RESULT] Y = ReLU(W * X + B) -> [{:.2}, {:.2}, {:.2}, {:.2}]",
-                            outputs[0],
-                            outputs[1],
-                            outputs[2],
-                            outputs[3]
-                        );
-                        const EXPECTED_OUTPUTS: [f32; 4] = [0.8, 3.7, 1.65, 2.1];
-                        tensor_output_ok = outputs
-                            .iter()
-                            .zip(EXPECTED_OUTPUTS.iter())
-                            .all(|(a, b)| (a - b).abs() < 0.001);
+                            let inputs: [f32; 4] = [1.0, 2.0, 0.5, 3.0];
+                            let mut outputs: [f32; 4] = [0.0; 4];
+                            loader.execute_gguf_layer_pass(&weights, &inputs, &mut outputs, 4, 4);
+
+                            kprintln!(
+                                "[GGUF RESULT] Y = ReLU(W * X + B) -> [{:.2}, {:.2}, {:.2}, {:.2}]",
+                                outputs[0],
+                                outputs[1],
+                                outputs[2],
+                                outputs[3]
+                            );
+                            const EXPECTED_OUTPUTS: [f32; 4] = [0.8, 3.7, 1.65, 2.1];
+                            tensor_output_ok = outputs
+                                .iter()
+                                .zip(EXPECTED_OUTPUTS.iter())
+                                .all(|(a, b)| (a - b).abs() < 0.001);
+                        }
                     }
                 }
 
                 kprintln!(
-                    "[GGUF LOADER] disk round-trip: write_ok={} round_trip_ok={} weights_decoded_ok={} tensor_output_ok={} cleanup_ok={}",
-                    write_ok, round_trip_ok, weights_decoded_ok, tensor_output_ok, cleanup_ok
+                    "[GGUF LOADER] disk round-trip: write_ok={} round_trip_ok={} tensor_info_ok={} weights_decoded_ok={} tensor_output_ok={} cleanup_ok={}",
+                    write_ok, round_trip_ok, tensor_info_ok, weights_decoded_ok, tensor_output_ok, cleanup_ok
                 );
                 serial_println!(
-                    "[GGUF] disk_load_test write_ok={} round_trip_ok={} weights_decoded_ok={} tensor_output_ok={} cleanup_ok={}",
-                    write_ok, round_trip_ok, weights_decoded_ok, tensor_output_ok, cleanup_ok
+                    "[GGUF] disk_load_test write_ok={} round_trip_ok={} tensor_info_ok={} weights_decoded_ok={} tensor_output_ok={} cleanup_ok={}",
+                    write_ok, round_trip_ok, tensor_info_ok, weights_decoded_ok, tensor_output_ok, cleanup_ok
                 );
             }
             Err(e) => {

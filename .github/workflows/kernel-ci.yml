@@ -101,16 +101,21 @@ jobs:
           # and round_trip_ok=true means those bytes matched byte-for-byte -
           # not just that parse_header ran, which it always could on a
           # hardcoded array regardless of whether disk I/O worked at all.
-          # Extended (Fase 42) to cover the tensor *weight values* too: the
-          # same file now also carries 64 bytes of raw little-endian f32
-          # data right after the header. weights_decoded_ok=true means
-          # decode_f32_le reproduced the exact original values from those
-          # disk-read bytes (a lossless byte round trip - safe to assert
-          # bit-for-bit, not a hypothetical arithmetic-precision concern).
-          # tensor_output_ok=true means running the matmul on those disk-
-          # decoded weights (not a hardcoded array anymore) produces the
-          # same known-correct result the hardcoded version always did.
-          grep -q "GGUF\] disk_load_test write_ok=true round_trip_ok=true weights_decoded_ok=true tensor_output_ok=true cleanup_ok=true" boot.log
+          # Extended (Fase 42) to cover the tensor *weight values* too, and
+          # again (Fase 43) to insert a real tensor-info entry (length-
+          # prefixed name, dimensions, quantization type, and a byte OFFSET
+          # to that tensor's own data) between the header and the weight
+          # bytes. tensor_info_ok=true means the parsed name/dimensions/
+          # gtype/offset all match what was actually written - not just
+          # that GgufTensorInfo::parse ran without erroring. weights_
+          # decoded_ok=true means decode_f32_le, given the bytes at that
+          # PARSED offset (not an assumed fixed position), reproduced the
+          # exact original values - the real proof the offset-based
+          # indirection works, not just parses. tensor_output_ok=true means
+          # running the matmul on those offset-located, disk-decoded
+          # weights produces the same known-correct result the original
+          # hardcoded array always did.
+          grep -q "GGUF\] disk_load_test write_ok=true round_trip_ok=true tensor_info_ok=true weights_decoded_ok=true tensor_output_ok=true cleanup_ok=true" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -

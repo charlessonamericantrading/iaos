@@ -1,6 +1,7 @@
 use crate::kprintln;
 use crate::serial_println;
 use crate::tensor_engine::TensorEngine;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 pub const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in Little Endian
@@ -15,11 +16,71 @@ pub enum GgufGtype {
     Q8_0 = 8,
 }
 
+impl GgufGtype {
+    fn from_u32(raw: u32) -> Result<Self, &'static str> {
+        match raw {
+            0 => Ok(GgufGtype::F32),
+            1 => Ok(GgufGtype::F16),
+            2 => Ok(GgufGtype::Q4_0),
+            3 => Ok(GgufGtype::Q4_1),
+            8 => Ok(GgufGtype::Q8_0),
+            _ => Err("GGUF: unknown tensor gtype"),
+        }
+    }
+}
+
 pub struct GgufTensorInfo {
-    pub name: &'static str,
+    pub name: String,
     pub dimensions: [usize; 2],
     pub gtype: GgufGtype,
     pub offset: usize,
+}
+
+impl GgufTensorInfo {
+    /// Parses one tensor-info entry from `bytes` (starting at its own
+    /// first byte, not the file start) - a real GGUF tensor-info
+    /// entry's actual shape (length-prefixed name, dimensions,
+    /// quantization type, a byte offset to that tensor's own data
+    /// elsewhere in the file), simplified in two ways for this kernel:
+    /// `u32` fields throughout (real GGUF uses `u64` - more range than
+    /// anything this kernel's own toy tensors will ever need) and fixed
+    /// at exactly 2 dimensions (matching this struct's own `[usize; 2]`
+    /// shape). Returns the entry AND how many bytes it consumed, so a
+    /// caller parsing several entries in sequence knows where the next
+    /// one starts - not exercised yet (this kernel only ever constructs
+    /// one), but free to support given the entry's own length is
+    /// already known once parsed.
+    pub fn parse(bytes: &[u8]) -> Result<(Self, usize), &'static str> {
+        if bytes.len() < 4 {
+            return Err("GGUF: tensor-info buffer too small for name length");
+        }
+        let name_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let fields_start = 4 + name_len;
+        if bytes.len() < fields_start + 16 {
+            return Err("GGUF: tensor-info buffer too small for name + fields");
+        }
+
+        let name = core::str::from_utf8(&bytes[4..fields_start])
+            .map_err(|_| "GGUF: tensor name is not valid UTF-8")?;
+
+        let read_u32 = |at: usize| {
+            u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+        };
+        let dim0 = read_u32(fields_start) as usize;
+        let dim1 = read_u32(fields_start + 4) as usize;
+        let gtype = GgufGtype::from_u32(read_u32(fields_start + 8))?;
+        let offset = read_u32(fields_start + 12) as usize;
+
+        Ok((
+            GgufTensorInfo {
+                name: String::from(name),
+                dimensions: [dim0, dim1],
+                gtype,
+                offset,
+            },
+            fields_start + 16,
+        ))
+    }
 }
 
 pub struct GgufModelLoader {
@@ -76,17 +137,15 @@ impl GgufModelLoader {
         })
     }
 
-    /// Decodes a byte buffer into little-endian `f32` values - the
-    /// simplest possible "tensor data" format this kernel understands.
-    /// Real GGUF tensor data sits behind a whole separate tensor-info
-    /// section (variable-length names, dimensions, quantization type,
-    /// per-tensor byte offsets - `GgufTensorInfo` above models that
-    /// shape but nothing constructs one yet); this is deliberately just
-    /// the raw weight values themselves; a real next step, not this
-    /// one. Any trailing bytes that don't form a complete 4-byte group
-    /// are silently dropped rather than erroring - the caller already
-    /// knows how many values it expects from context (`in_dim *
-    /// out_dim`), same as the rest of this toy engine.
+    /// Decodes a byte buffer into little-endian `f32` values - the raw
+    /// tensor data a `GgufTensorInfo`'s own `offset` field points to.
+    /// Doesn't know or care about quantization: every value here is
+    /// assumed already `F32` (real GGUF's other `GgufGtype` variants
+    /// pack multiple values per few bytes - decoding those is real,
+    /// separate work, not attempted here). Any trailing bytes that
+    /// don't form a complete 4-byte group are silently dropped rather
+    /// than erroring - the caller already knows how many values it
+    /// expects from the tensor's own parsed dimensions.
     pub fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
         bytes
             .as_chunks::<4>()
