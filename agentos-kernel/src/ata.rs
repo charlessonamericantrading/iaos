@@ -28,10 +28,22 @@ const STATUS_ERR: u8 = 0x01;
 const STATUS_DRQ: u8 = 0x08;
 const STATUS_BSY: u8 = 0x80;
 
-/// Generous but bounded - a real drive answers in microseconds, this is
-/// purely a "never hang forever on hardware that isn't there or isn't
-/// responding" backstop, not a realistic expected wait.
-const MAX_POLL_ITERATIONS: u32 = 1_000_000;
+/// Generous but bounded - purely a "never hang forever on hardware that
+/// isn't there or isn't responding" backstop, not a realistic expected
+/// wait (a real or emulated drive answers within a handful of iterations
+/// in the healthy path, so this bound is never actually walked in normal
+/// operation). Sized for QEMU's software (TCG) port-I/O emulation, not
+/// bare metal: each `in`/`out` on an emulated port costs a full VM-exit
+/// and device-model dispatch, which under a loaded/shared CI runner can
+/// cost far more wall-clock time per iteration than the same instruction
+/// would on real hardware - so the same iteration count buys much less
+/// real headroom there than the number alone suggests. Bumped from the
+/// original 1,000,000 after a genuine (if rare) CI timeout hit exactly
+/// this margin: restoring BOOT-S~2 (152136 bytes, ~297 sectors) in the
+/// FAT12 write-test is the single most poll-intensive operation in the
+/// whole boot sequence, and was the first to reveal the old bound wasn't
+/// as generous under CI timing as its healthy-path behavior implied.
+const MAX_POLL_ITERATIONS: u32 = 50_000_000;
 
 /// Reads one 512-byte sector at 28-bit LBA `lba` from the primary ATA
 /// bus's master drive into `buf`.
@@ -81,12 +93,12 @@ fn read_sector_inner(lba: u32, buf: &mut [u8; 512]) -> Result<(), &'static str> 
         lba_high.write(((lba >> 16) & 0xFF) as u8);
         command_status.write(CMD_READ_SECTORS);
 
-        let mut status = poll_until(&mut command_status, |s| s & STATUS_BSY == 0)?;
+        let mut status = poll_until(&mut command_status, "read", |s| s & STATUS_BSY == 0)?;
         if status & STATUS_ERR != 0 {
             return Err("ATA read: drive reported an error (ERR bit set)");
         }
 
-        status = poll_until(&mut command_status, |s| s & STATUS_DRQ != 0)?;
+        status = poll_until(&mut command_status, "read", |s| s & STATUS_DRQ != 0)?;
         if status & STATUS_ERR != 0 {
             return Err("ATA read: drive reported an error (ERR bit set)");
         }
@@ -141,7 +153,7 @@ fn write_sector_inner(lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
         lba_high.write(((lba >> 16) & 0xFF) as u8);
         command_status.write(CMD_WRITE_SECTORS);
 
-        let mut status = poll_until(&mut command_status, |s| s & STATUS_BSY == 0)?;
+        let mut status = poll_until(&mut command_status, "write", |s| s & STATUS_BSY == 0)?;
         if status & STATUS_ERR != 0 {
             return Err("ATA write: drive reported an error (ERR bit set)");
         }
@@ -149,7 +161,7 @@ fn write_sector_inner(lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
         // DRQ here means "ready for you to hand over the data" - the
         // write-side mirror of read_sector's DRQ check meaning "data is
         // ready for you to take".
-        status = poll_until(&mut command_status, |s| s & STATUS_DRQ != 0)?;
+        status = poll_until(&mut command_status, "write", |s| s & STATUS_DRQ != 0)?;
         if status & STATUS_ERR != 0 {
             return Err("ATA write: drive reported an error (ERR bit set)");
         }
@@ -158,26 +170,36 @@ fn write_sector_inner(lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
             data.write((chunk[0] as u16) | ((chunk[1] as u16) << 8));
         }
 
-        status = poll_until(&mut command_status, |s| s & STATUS_BSY == 0)?;
+        status = poll_until(&mut command_status, "write", |s| s & STATUS_BSY == 0)?;
         if status & STATUS_ERR != 0 {
             return Err("ATA write: drive reported an error after transfer (ERR bit set)");
         }
 
         command_status.write(CMD_CACHE_FLUSH);
-        poll_until(&mut command_status, |s| s & STATUS_BSY == 0)?;
+        poll_until(&mut command_status, "write", |s| s & STATUS_BSY == 0)?;
     }
     Ok(())
 }
 
 /// Polls `port` until `done(status)` is true, returning the status that
 /// satisfied it - bounded by `MAX_POLL_ITERATIONS` so a non-responding
-/// drive is a clean `Err`, not a hang.
-unsafe fn poll_until(port: &mut Port<u8>, done: impl Fn(u8) -> bool) -> Result<u8, &'static str> {
+/// drive is a clean `Err`, not a hang. `op` labels the error message with
+/// the real calling operation ("ATA read"/"ATA write") instead of a
+/// hardcoded one - this helper is shared by both directions, and a
+/// write-side timeout previously misreported itself as a read.
+unsafe fn poll_until(
+    port: &mut Port<u8>,
+    op: &'static str,
+    done: impl Fn(u8) -> bool,
+) -> Result<u8, &'static str> {
     for _ in 0..MAX_POLL_ITERATIONS {
         let status = port.read();
         if done(status) {
             return Ok(status);
         }
     }
-    Err("ATA read: timed out waiting for the drive to respond")
+    match op {
+        "read" => Err("ATA read: timed out waiting for the drive to respond"),
+        _ => Err("ATA write: timed out waiting for the drive to respond"),
+    }
 }
