@@ -919,6 +919,100 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
+    // 7b-17. Real FAT12 subdirectory GROWTH - create_file_in/
+    // create_directory_in previously failed once a subdirectory's single
+    // cluster ran out of free entry slots; find_free_entry_in now
+    // allocates and chains a fresh cluster onto the directory
+    // automatically when that happens, reusing the exact same
+    // allocate-then-chain primitives create_file/write_file already use
+    // for a file's own chain. This disk's clusters hold 32 entries each
+    // (1024 bytes / 32), 2 of which are always "."/"..", so the 31st
+    // file created inside a fresh subdirectory is genuinely the first
+    // one that requires a second cluster to exist at all.
+    kprintln!("[KERNEL INIT] Testing FAT12 subdirectory growth (multi-cluster directories)...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                let _ = fs.create_directory("GROWTEST");
+                let dir_cluster = fs
+                    .list_root_directory()
+                    .ok()
+                    .and_then(|entries| entries.into_iter().find(|e| e.name == "GROWTEST"))
+                    .map(|e| e.start_cluster);
+
+                match dir_cluster {
+                    Some(dir) => {
+                        let mut all_created = true;
+                        for i in 0..31u32 {
+                            let name = alloc::format!("F{}.TXT", i);
+                            if fs.create_file_in(dir, &name, &[i as u8]).is_err() {
+                                all_created = false;
+                            }
+                        }
+
+                        let entries = fs.list_directory(dir).unwrap_or_default();
+                        // "." + ".." + 31 files = 33 - proves every
+                        // create genuinely landed, none silently lost
+                        // when the chain grew mid-loop.
+                        let count_ok = entries.len() == 33;
+
+                        // The 31st file (index 30) is the one that could
+                        // only exist if a second cluster was genuinely
+                        // allocated - verified by actually reading its
+                        // content back, not just checking it "exists".
+                        let last_name = alloc::format!("F{}.TXT", 30u32);
+                        let last_ok = fs
+                            .read_file_in(dir, &last_name)
+                            .map(|d| d == [30u8])
+                            .unwrap_or(false);
+
+                        let mut all_deleted = true;
+                        for i in 0..31u32 {
+                            let name = alloc::format!("F{}.TXT", i);
+                            if fs.delete_file_in(dir, &name).is_err() {
+                                all_deleted = false;
+                            }
+                        }
+                        let cleanup_ok = fs.delete_directory("GROWTEST").is_ok();
+
+                        kprintln!(
+                            "[FAT12] dir growth test: all_created={} count_ok={} last_ok={} all_deleted={} cleanup_ok={}",
+                            all_created,
+                            count_ok,
+                            last_ok,
+                            all_deleted,
+                            cleanup_ok
+                        );
+                        serial_println!(
+                            "[FAT12] dir_growth_test all_created={} count_ok={} last_ok={} all_deleted={} cleanup_ok={}",
+                            all_created,
+                            count_ok,
+                            last_ok,
+                            all_deleted,
+                            cleanup_ok
+                        );
+                    }
+                    None => {
+                        kprintln!("[FAT12] dir growth test: couldn't find GROWTEST's cluster");
+                        serial_println!("[FAT12] dir_growth_test -> no dir cluster");
+                    }
+                }
+            }
+            Err(e) => {
+                kprintln!("[FAT12] dir growth test: not FAT12 ({})", e);
+                serial_println!("[FAT12] dir_growth_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!(
+                "[FAT12] dir growth test: couldn't find FAT partition: {}",
+                e
+            );
+            serial_println!("[FAT12] dir_growth_test -> no partition: {}", e);
+        }
+    }
+    shell::dispatch_command("ls");
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real

@@ -382,22 +382,20 @@ impl Fat12Info {
         Ok(found)
     }
 
-    /// Finds a free slot in the fixed-location root directory - either a
-    /// truly never-used entry (first byte `0x00`, meaning everything
-    /// from here to the end of the directory is unused too, per the FAT
-    /// spec) or a previously-deleted one (`0xE5`, safe to reuse). Returns
-    /// the slot's absolute sector LBA and byte offset within that
-    /// sector.
-    fn find_free_root_entry(&self) -> Result<(u32, usize), &'static str> {
-        self.find_free_entry_in(DirLocation::Root)
-    }
-
-    /// Same as `find_free_root_entry`, generalized to a subdirectory's
-    /// cluster chain too. Deliberately does NOT grow the chain with a
-    /// fresh cluster if every existing slot is taken - same single-
-    /// cluster-only limitation `create_directory` already has, honestly
-    /// surfaced as an error rather than silently attempted.
-    fn find_free_entry_in(&self, dir: DirLocation) -> Result<(u32, usize), &'static str> {
+    /// Finds a free slot in a directory - either a truly never-used
+    /// entry (first byte `0x00`, meaning everything from here to the
+    /// end of the directory is unused too, per the FAT spec) or a
+    /// previously-deleted one (`0xE5`, safe to reuse). Returns the
+    /// slot's absolute sector LBA and byte offset within that sector.
+    ///
+    /// The root can never grow - it's a fixed-size range dictated by
+    /// the BPB itself, not a cluster chain - so a full root is a real,
+    /// permanent error. A subdirectory's chain, though, is exactly as
+    /// extensible as a file's: `grow_directory` below appends a fresh
+    /// cluster the same way `create_file`/`write_file` already do,
+    /// rather than surfacing an avoidable "directory is full" error the
+    /// moment its one starting cluster's entries run out.
+    fn find_free_entry_in(&mut self, dir: DirLocation) -> Result<(u32, usize), &'static str> {
         let mut sector_buf = [0u8; 512];
         for lba in self.directory_sectors(dir)? {
             ata::read_sector(lba, &mut sector_buf)?;
@@ -407,7 +405,37 @@ impl Fat12Info {
                 }
             }
         }
-        Err("FAT12: directory is full, no free entry slot")
+        match dir {
+            DirLocation::Root => Err("FAT12: root directory is full, no free entry slot"),
+            DirLocation::Cluster(start_cluster) => self.grow_directory(start_cluster),
+        }
+    }
+
+    /// Appends one freshly-allocated, zeroed cluster to the end of a
+    /// directory's existing chain and returns a free slot in it - the
+    /// first entry of a brand-new, all-zero cluster is always free by
+    /// construction (byte `0x00`, "no more entries used from here on",
+    /// same convention `create_directory`'s own zeroing already relies
+    /// on). Reuses the exact same allocate-then-chain primitives
+    /// `create_file`/`write_file` already use for a *file's* chain -
+    /// growing a directory's chain isn't a fundamentally different
+    /// operation, just applied to entries instead of file bytes.
+    fn grow_directory(&mut self, start_cluster: u32) -> Result<(u32, usize), &'static str> {
+        let mut tail = start_cluster;
+        while let Some(next) = self.next_cluster(tail)? {
+            tail = next;
+        }
+
+        let new_cluster = self.find_free_clusters(1)?[0];
+        let new_lba = self.cluster_to_lba(new_cluster);
+        for s in 0..self.sectors_per_cluster as u32 {
+            ata::write_sector(new_lba + s, &[0u8; 512])?;
+        }
+
+        self.write_fat_entry_to_disk(tail, new_cluster as u16)?;
+        self.write_fat_entry_to_disk(new_cluster, 0x0FFF)?;
+
+        Ok((new_lba, 0))
     }
 
     /// Packs `value` (12 bits used) into `cluster`'s entry and writes the
@@ -526,13 +554,26 @@ impl Fat12Info {
 
         let short_name = to_short_name(name)?;
         let cluster_bytes = self.sectors_per_cluster as usize * 512;
+        // find_free_entry_in MUST run before find_free_clusters below,
+        // not after - found the hard way via the directory-growth self-
+        // test. find_free_entry_in can grow the directory itself
+        // (allocating and immediately committing a fresh cluster to the
+        // FAT, via grow_directory -> write_fat_entry_to_disk). If the
+        // file's own data cluster(s) were chosen first instead, that
+        // choice would only be a candidate in the in-memory FAT cache -
+        // find_free_clusters never commits anything itself, only
+        // write_fat_entry_to_disk does - so grow_directory's own
+        // find_free_clusters call could still see that "candidate"
+        // cluster as free and hand out the exact same one, corrupting
+        // whichever write happened second.
+        let (entry_lba, entry_offset) = self.find_free_entry_in(dir)?;
+
         // At least one cluster even for an empty (0-byte) file, matching
         // this method's existing convention from before multi-cluster
         // support: every created file gets a real cluster to anchor its
         // directory entry's start_cluster field to.
         let clusters_needed = data.len().div_ceil(cluster_bytes).max(1);
         let clusters = self.find_free_clusters(clusters_needed)?;
-        let (entry_lba, entry_offset) = self.find_free_entry_in(dir)?;
 
         // Write the file's data across its clusters in order, chaining
         // each to the next as we go - a partially-used final sector is
@@ -627,8 +668,16 @@ impl Fat12Info {
         }
 
         let short_name = to_short_name(name)?;
-        let cluster = self.find_free_clusters(1)?[0];
+        // find_free_entry_in before find_free_clusters - see the
+        // matching comment in create_file_impl for why the order
+        // matters (found via the same directory-growth self-test):
+        // find_free_entry_in can grow `parent` itself, immediately
+        // committing a fresh cluster to the FAT - if this new
+        // directory's own cluster were chosen first instead, that
+        // choice wouldn't be committed yet, and find_free_entry_in's
+        // own growth could still see it as free and collide with it.
         let (entry_lba, entry_offset) = self.find_free_entry_in(parent)?;
+        let cluster = self.find_free_clusters(1)?[0];
 
         let time = crate::rtc::read_time();
         let (fat_time, fat_date) = to_fat_datetime(&time);

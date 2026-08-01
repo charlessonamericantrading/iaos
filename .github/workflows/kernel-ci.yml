@@ -395,6 +395,23 @@ jobs:
           # single assertion; a fresh CI image always takes this same
           # fully-self-cleaning path.
           grep -q "FAT12\] nested_dir_test outer_count_ok=true dotdot_ok=true delete_inner_ok=true cleanup_ok=true" boot.log
+          # Confirms FAT12 SUBDIRECTORY GROWTH (Fase 37) - a subdirectory can
+          # now allocate a second cluster once its first one's 32 entry slots
+          # (2 always "."/"..") run out, instead of failing outright. This
+          # test creates 31 one-byte files inside a fresh subdirectory - the
+          # exact count that forces the 31st to land in a genuinely new
+          # cluster - and found a real bug on its first run (a cluster-
+          # allocation collision between a new file/directory's own content
+          # and a directory's own growth, both calling find_free_clusters
+          # before either had committed its choice to the FAT), fixed by
+          # reordering find_free_entry_in before find_free_clusters in both
+          # create_file_impl and create_directory_impl. last_ok=true is the
+          # single strongest proof: it means the 31st file's content
+          # genuinely round-tripped through the new cluster, not just that
+          # its directory entry happened to exist. All five checks must
+          # succeed for this exact line to appear; a fresh CI image always
+          # takes this same fully-self-cleaning path.
+          grep -q "FAT12\] dir_growth_test all_created=true count_ok=true last_ok=true all_deleted=true cleanup_ok=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.
