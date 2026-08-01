@@ -97,9 +97,34 @@ fn is_enabled() -> bool {
 
 /// Called from `timer_interrupt_handler` on every real timer tick, after
 /// EOI. A no-op unless `run_preemptive_demo` has enabled preemption.
-pub fn tick() {
+///
+/// **Fase 80: `interrupted_ring3` must be checked BEFORE anything else
+/// below.** Every switch this function performs relies on `switch_to`'s
+/// own trick of unwinding back up through the interrupted call stack to
+/// `timer_interrupt_handler`'s own compiler-generated epilogue, which
+/// then `iretq`s using THAT SPECIFIC invocation's own captured interrupt
+/// frame - correct only because every ring-0 task here is always
+/// resumed from the exact same nested position. A tick that instead
+/// interrupted RING-3 code has an entirely different, arbitrary register
+/// state and privilege level at an arbitrary point - `switch_to` cannot
+/// safely swap that stack out for a different ring-0 task's, since
+/// nothing would ever correctly resume it afterward (its own `iretq`
+/// frame would never get unwound to). This was a real, previously
+/// untested gap: ring-3 execution and ring-0 preemption had never
+/// actually been exercised concurrently before Fase 80's own test -
+/// exposed only by reasoning through what Fase 79's new ring-3-
+/// detection capability made newly possible to check. The fix is to
+/// treat a tick that interrupts ring-3 as entirely invisible to this
+/// scheduler: it doesn't decrement the remaining tick budget, doesn't
+/// alternate tasks, doesn't touch the `ps`-visible PCB table - as if,
+/// from THIS scheduler's own perspective, no time passed at all while
+/// ring-3 code was running. `TIMER_TICKS` (the raw, unconditional
+/// counter) and the ring-3 program's own execution are both entirely
+/// unaffected either way; only the ring-0-only alternation logic below
+/// is what needs to stay out of a ring-3-interrupted tick's way.
+pub fn tick(interrupted_ring3: bool) {
     unsafe {
-        if !is_enabled() {
+        if !is_enabled() || interrupted_ring3 {
             return;
         }
 
@@ -200,22 +225,22 @@ fn preempt_task_body(id: usize) -> ! {
     }
 }
 
-/// Proof of *real* preemption: two tasks that never call `yield_now` at
-/// all - an infinite loop apiece. Under pure cooperative scheduling
-/// neither would ever run past the first one picked. Here, the timer
-/// forces them to alternate for `DEMO_TICKS` real ticks with zero
-/// cooperation from either task, then hands control back to the kernel.
-/// Both counters ending up nonzero is the whole proof.
-pub fn run_preemptive_demo() {
-    kprintln!("[PREEMPT] Testing real timer-driven preemption (2 tasks, neither ever yields)...");
-    serial_println!("[PREEMPT] starting: timer will force-switch 2 non-yielding tasks");
-
-    // Real PCB entries, same as spawn_cooperative - normal (non-interrupt)
-    // context, so the ordinary blocking `.lock()` is fine here even though
-    // `tick()` itself must only ever use `try_lock()`. Neither task has a
-    // real priority relationship (the scheduler just alternates strictly
-    // 0/1/0/1, ignoring priority entirely), so Normal for both is the
-    // honest choice, not a placeholder.
+/// Starts the 2 non-yielding tasks and enables preemption for `ticks`
+/// real timer ticks, WITHOUT blocking until it finishes - unlike
+/// `run_preemptive_demo`, which calls this and then immediately waits.
+/// Split out (Fase 80) so a caller can start this running in the
+/// background, then do something else (e.g. enter ring-3) while it's
+/// active, driven entirely by the timer interrupt from here on -
+/// exactly what `ring3::run_ring3_concurrent_preemption_test` needs to
+/// prove ring-0 preemption and a running ring-3 program coexist safely.
+///
+/// Real PCB entries, same as `spawn_cooperative` - normal (non-interrupt)
+/// context, so the ordinary blocking `.lock()` is fine here even though
+/// `tick()` itself must only ever use `try_lock()`. Neither task has a
+/// real priority relationship (the scheduler just alternates strictly
+/// 0/1/0/1, ignoring priority entirely), so Normal for both is the
+/// honest choice, not a placeholder.
+fn start_demo(ticks: u64) {
     let pid0 = SCHEDULER
         .lock()
         .spawn("preempt-task-0", Priority::Normal, 0)
@@ -246,33 +271,58 @@ pub fn run_preemptive_demo() {
             _stack: stack1,
         });
 
-        *core::ptr::addr_of_mut!(PREEMPT_TICKS_REMAINING) = DEMO_TICKS;
+        *core::ptr::addr_of_mut!(PREEMPT_TICKS_REMAINING) = ticks;
     }
     PREEMPT_ENABLED.store(true, Ordering::Relaxed);
+}
 
-    // Parks here (via hlt, woken by each interrupt) until `tick()` above
-    // has forced its way through DEMO_TICKS ticks and switched back.
+/// Real remaining tick budget for whichever demo `start_demo` began (0
+/// once it's finished or if none is running). Used internally by
+/// `run_concurrent_ring3_preemption_test` (Fase 80) to directly observe
+/// whether entering ring-3 in between "paused" the countdown - see
+/// `tick()`'s own doc for why a tick that interrupts ring-3 code must
+/// NOT decrement this.
+fn ticks_remaining() -> u64 {
+    unsafe { *core::ptr::addr_of!(PREEMPT_TICKS_REMAINING) }
+}
+
+/// Each task's own real, monotonic tick counter (Fase 80). Used
+/// internally to compare a BEFORE/AFTER snapshot around a test window
+/// and check the DELTA increased, since these never reset between
+/// separate calls to `start_demo` within the same boot (e.g.
+/// `run_preemptive_demo`'s own run already leaves both above 0 by the
+/// time a later caller's own window begins).
+fn task_counters() -> (u64, u64) {
+    (
+        PREEMPT_COUNTERS[0].load(Ordering::Relaxed),
+        PREEMPT_COUNTERS[1].load(Ordering::Relaxed),
+    )
+}
+
+/// Blocks (via `hlt`, woken by each interrupt) until whatever
+/// `start_demo` began has run its course - `tick()` forced its way
+/// through the whole tick budget and switched back to this context -
+/// then cleans up both tasks' PCB entries and returns their final,
+/// absolute counters. The second half of `run_preemptive_demo`'s own
+/// logic, split out (Fase 80) so a caller can do other work (enter
+/// ring-3) in between calling `start_demo` and this.
+///
+/// Both tasks are permanently abandoned mid-loop by the time this
+/// returns (forced off by the demo's own last tick, never to be
+/// switched to again) - safe to reclaim their stacks here rather than
+/// leak them. Unlike the cooperative demo's tasks, these never call
+/// anything like `finish_current_task` (they're infinite loops with
+/// zero self-awareness of the demo ending) - so marking their PCB
+/// entries Terminated has to happen here, from normal context, or `ps`
+/// would keep showing two long-abandoned tasks as perpetually
+/// READY/RUNNING.
+fn wait_for_demo_and_cleanup() -> (u64, u64) {
     while is_enabled() {
         x86_64::instructions::hlt();
     }
 
-    let c0 = PREEMPT_COUNTERS[0].load(Ordering::Relaxed);
-    let c1 = PREEMPT_COUNTERS[1].load(Ordering::Relaxed);
-    kprintln!(
-        "[PREEMPT] task0={} task1={} - both > 0 with neither ever yielding proves real preemption.",
-        c0,
-        c1
-    );
-    serial_println!("[PREEMPT] task0={} task1={}", c0, c1);
+    let (c0, c1) = task_counters();
 
-    // Both tasks are permanently abandoned mid-loop at this point (forced
-    // off by the last tick, never to be switched to again) - safe to
-    // reclaim their stacks now rather than leak them. Unlike the
-    // cooperative demo's tasks, these never call anything like
-    // `finish_current_task` (they're infinite loops with zero self-
-    // awareness of the demo ending) - so marking their PCB entries
-    // Terminated has to happen here, from normal context, or `ps` would
-    // keep showing two long-abandoned tasks as perpetually READY/RUNNING.
     unsafe {
         let tasks: *mut [Option<PreemptTask>; 2] = core::ptr::addr_of_mut!(PREEMPT_TASKS);
         for slot in (*tasks).iter_mut() {
@@ -285,4 +335,72 @@ pub fn run_preemptive_demo() {
             }
         }
     }
+
+    (c0, c1)
+}
+
+/// Proof of *real* preemption: two tasks that never call `yield_now` at
+/// all - an infinite loop apiece. Under pure cooperative scheduling
+/// neither would ever run past the first one picked. Here, the timer
+/// forces them to alternate for `DEMO_TICKS` real ticks with zero
+/// cooperation from either task, then hands control back to the kernel.
+/// Both counters ending up nonzero is the whole proof.
+pub fn run_preemptive_demo() {
+    kprintln!("[PREEMPT] Testing real timer-driven preemption (2 tasks, neither ever yields)...");
+    serial_println!("[PREEMPT] starting: timer will force-switch 2 non-yielding tasks");
+
+    start_demo(DEMO_TICKS);
+    let (c0, c1) = wait_for_demo_and_cleanup();
+
+    kprintln!(
+        "[PREEMPT] task0={} task1={} - both > 0 with neither ever yielding proves real preemption.",
+        c0,
+        c1
+    );
+    serial_println!("[PREEMPT] task0={} task1={}", c0, c1);
+}
+
+/// Runs a preemptive ring-0 demo AND a real ring-3 program CONCURRENTLY
+/// for the first time (Fase 80) - proving they coexist safely, not just
+/// that each works in isolation (every prior test of either ran
+/// sequentially, never overlapping). Starts a shorter demo (fewer ticks
+/// than the standalone one above - this test's own real-time footprint
+/// already includes the ring-3 program's own spin window on top of it),
+/// captures the tick budget and both tasks' own counters, enters a real
+/// ring-3 program that spins long enough for real timer ticks to land
+/// mid-execution (the exact same hand-encoded loop shape
+/// `ring3::run_ring3_timer_tick_test` already established, Fase 79),
+/// then checks the tick budget again before finally waiting for the
+/// demo to finish naturally and checking both counters advanced.
+///
+/// Returns `(ring3_exit_code, budget_untouched_during_ring3,
+/// tasks_advanced_after)` - `budget_untouched_during_ring3` is the
+/// direct proof `tick()`'s own ring-3 guard (this Fase's actual fix)
+/// works: without it, ticks landing during the ring-3 window would
+/// decrement the budget same as any other tick, and `switch_to` would
+/// have been invoked against an interrupted ring-3 stack frame it
+/// cannot safely swap out - `tasks_advanced_after` confirms ring-0
+/// preemption still genuinely works once ring-3 exits, not just that
+/// nothing crashed.
+pub fn run_concurrent_ring3_preemption_test(
+    enter_ring3_spin_loop: impl FnOnce() -> u64,
+) -> (u64, bool, bool) {
+    const CONCURRENT_DEMO_TICKS: u64 = 30;
+
+    let (c0_before, c1_before) = task_counters();
+    start_demo(CONCURRENT_DEMO_TICKS);
+
+    let ticks_before_ring3 = ticks_remaining();
+    let exit_code = enter_ring3_spin_loop();
+    let ticks_after_ring3 = ticks_remaining();
+    let budget_untouched_during_ring3 = ticks_before_ring3 == ticks_after_ring3;
+
+    let (c0_after, c1_after) = wait_for_demo_and_cleanup();
+    let tasks_advanced_after = c0_after > c0_before && c1_after > c1_before;
+
+    (
+        exit_code,
+        budget_untouched_during_ring3,
+        tasks_advanced_after,
+    )
 }

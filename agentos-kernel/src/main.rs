@@ -300,6 +300,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ring3_timer_tick_code
     );
 
+    // Fase 80: closes a real gap Fase 79 exposed - runs ring-0 preemption
+    // and a real ring-3 program CONCURRENTLY for the first time, proving
+    // they coexist safely now that scheduler::preemptive::tick() skips
+    // task-switching entirely for any tick that interrupts ring-3 code.
+    // Same safe-return mechanism, same "runs unconditionally" reasoning
+    // as the tests above.
+    kprintln!(
+        "[KERNEL INIT] Testing ring-0 preemption and a real ring-3 program running concurrently..."
+    );
+    let ring3_concurrent_code = ring3::run_ring3_concurrent_preemption_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - concurrent preemption test returned exit_code={}",
+        ring3_concurrent_code
+    );
+
     // Hands the SAME allocator instance (cursor already advanced past
     // whatever heap init just claimed) to a global slot so later code -
     // e.g. a future real NIC driver's TX/RX descriptor rings - can keep

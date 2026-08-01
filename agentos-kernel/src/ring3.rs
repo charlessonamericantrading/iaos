@@ -525,19 +525,31 @@ pub fn run_ring3_slice_overrun_test() -> u64 {
 /// timer handler, that ring-3 code was running when the tick fired?
 ///
 /// The ring-3 "program" spins in a tight hand-encoded decrement loop
-/// (20,000,000 iterations - generous headroom over the ~55ms a single
-/// tick takes at this kernel's ~18.2Hz PIT rate, chosen the same
-/// empirically-verified-not-just-assumed way `ata.rs`'s own
-/// `MAX_POLL_ITERATIONS` was) before exiting voluntarily via `int 0x81`,
-/// reusing `enter_ring3`/`ring3_exit_entry_asm` (Fase 73) exactly as
+/// before exiting voluntarily via `int 0x81`, reusing
+/// `enter_ring3`/`ring3_exit_entry_asm` (Fase 73) exactly as
 /// `run_ring3_exit_test` does: this also genuinely returns rather than
 /// halting, and runs unconditionally like that one does.
 ///
-///   `mov ecx, 20000000` -> `B9` + 4-byte imm (loop counter)
-///   `dec ecx`           -> `FF C9`
-///   `jnz <dec ecx>`     -> `75 FC` (rel8 = -4, back to the `dec`)
-///   `mov eax, 77`       -> `B8` + 4-byte imm (distinct exit code)
-///   `int 0x81`          -> `CD 81`
+/// **`LOOP_COUNT` found the hard way, not assumed correct on the first
+/// guess**: an initial 20,000,000 (chosen as "generous headroom over
+/// the ~55ms a single tick takes at this kernel's ~18.2Hz PIT rate",
+/// the same empirically-verified-not-just-assumed spirit as `ata.rs`'s
+/// own `MAX_POLL_ITERATIONS`) passed CI once, but a later LOCAL rerun
+/// showed `ticked_during_ring3=false` - zero ticks landed during that
+/// specific run's own loop. QEMU's TCG JIT evidently doesn't execute
+/// this tiny loop at a fixed, predictable speed run-to-run (translation
+/// caching/warm-up effects, most likely) - meaning 20,000,000 was
+/// marginal, not safely above one tick period, and the test could have
+/// been silently flaky in CI too. Raised to 150,000,000 (7.5x) for real
+/// margin, re-verified across multiple repeated local boots to
+/// confirm `ticked_during_ring3=true` every single time before trusting
+/// it again.
+///
+///   `mov ecx, 150000000` -> `B9` + 4-byte imm (loop counter)
+///   `dec ecx`            -> `FF C9`
+///   `jnz <dec ecx>`      -> `75 FC` (rel8 = -4, back to the `dec`)
+///   `mov eax, 77`        -> `B8` + 4-byte imm (distinct exit code)
+///   `int 0x81`           -> `CD 81`
 pub fn run_ring3_timer_tick_test() -> u64 {
     let info = gdt::ring3_info();
     let user_cs = info.user_code_selector as u64;
@@ -546,7 +558,7 @@ pub fn run_ring3_timer_tick_test() -> u64 {
     let code_addr = USER_TEST_PAGE_ADDR;
     let stack_top = USER_TEST_PAGE_ADDR + 4096;
 
-    const LOOP_COUNT: u32 = 20_000_000;
+    const LOOP_COUNT: u32 = 150_000_000;
     const EXIT_CODE: u32 = 77;
 
     let mut program = [0u8; 16];
@@ -596,6 +608,87 @@ pub fn run_ring3_timer_tick_test() -> u64 {
         exit_code,
         ticks_after,
         ticked_during_ring3
+    );
+
+    exit_code
+}
+
+/// Runs a ring-0 preemptive demo and a real ring-3 program CONCURRENTLY
+/// for the first time (Fase 80) - every prior test of either ran
+/// sequentially, never overlapping. Closes a real, previously-untested
+/// gap `scheduler::preemptive::tick`'s own doc explains in full:
+/// `switch_to` cannot safely swap out a ring-3-interrupted stack the way
+/// it does between two ring-0 tasks (an arbitrary register state and
+/// privilege level at an arbitrary point, not a nested call frame it
+/// can safely resume later), so a tick landing on ring-3 code must be
+/// entirely invisible to that scheduler - this Fase's own actual fix.
+///
+/// Reuses `run_ring3_timer_tick_test`'s exact spin-loop shape (Fase 79,
+/// including its own `LOOP_COUNT` fix - see that function's own doc for
+/// why 150,000,000, not the smaller value first tried, is what actually
+/// guarantees a real tick lands during the loop), with its own distinct
+/// exit code (88) so log lines are unambiguous about
+/// which test produced them. The orchestration - starting a shorter
+/// concurrent demo, capturing the tick budget before/after entering
+/// ring-3, waiting for the demo to finish, comparing task counters -
+/// lives in `scheduler::preemptive::run_concurrent_ring3_preemption_test`,
+/// which takes this function's own ring-3 entry as a closure precisely
+/// because `enter_ring3` is private to this module: `preemptive.rs`
+/// never needs to know how to build a ring-3 program, only when to run
+/// one.
+pub fn run_ring3_concurrent_preemption_test() -> u64 {
+    let info = gdt::ring3_info();
+    let user_cs = info.user_code_selector as u64;
+    let user_ss = info.user_data_selector as u64;
+
+    let code_addr = USER_TEST_PAGE_ADDR;
+    let stack_top = USER_TEST_PAGE_ADDR + 4096;
+
+    const LOOP_COUNT: u32 = 150_000_000;
+    const EXIT_CODE: u32 = 88;
+
+    let mut program = [0u8; 16];
+    program[0] = 0xB9; // mov ecx, imm32
+    program[1..5].copy_from_slice(&LOOP_COUNT.to_le_bytes());
+    program[5] = 0xFF; // dec ecx
+    program[6] = 0xC9;
+    program[7] = 0x75; // jnz rel8
+    program[8] = 0xFC; // -4: back to `dec ecx` at offset 5
+    program[9] = 0xB8; // mov eax, imm32
+    program[10..14].copy_from_slice(&EXIT_CODE.to_le_bytes());
+    program[14] = 0xCD; // int
+    program[15] = 0x81;
+    unsafe {
+        core::ptr::copy_nonoverlapping(program.as_ptr(), code_addr as *mut u8, program.len());
+    }
+
+    kprintln!("[RING3] Attempting a real ring-3 spin loop CONCURRENTLY with ring-0 preemption, for the first time...");
+    serial_println!(
+        "[RING3] ring3_concurrent_preemption_test entering rip={:#x} cs={:#06x} ss={:#06x} rsp={:#x} rflags={:#x} loop_count={}",
+        code_addr,
+        user_cs,
+        user_ss,
+        stack_top,
+        RING3_TEST_RFLAGS,
+        LOOP_COUNT
+    );
+
+    let (exit_code, budget_untouched_during_ring3, tasks_advanced_after) =
+        crate::scheduler::preemptive::run_concurrent_ring3_preemption_test(|| unsafe {
+            enter_ring3(code_addr, user_cs, user_ss, stack_top, RING3_TEST_RFLAGS)
+        });
+
+    kprintln!(
+        "[RING3] Back in ring-0 - exit_code={} (ring-0 preemption tick budget untouched during ring-3: {}, ring-0 tasks advanced afterward: {})",
+        exit_code,
+        budget_untouched_during_ring3,
+        tasks_advanced_after
+    );
+    serial_println!(
+        "[RING3] ring3_concurrent_preemption_test exit_code={} budget_untouched_during_ring3={} tasks_advanced_after={}",
+        exit_code,
+        budget_untouched_during_ring3,
+        tasks_advanced_after
     );
 
     exit_code

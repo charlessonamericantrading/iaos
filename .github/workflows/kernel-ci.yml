@@ -444,19 +444,51 @@ jobs:
           # between ring-0 tasks; see that module's own doc for why real
           # ring-3 preemption needs a fuller register-save mechanism this
           # Fase deliberately doesn't attempt yet). A real ring-3 program
-          # spins in a 20,000,000-iteration hand-encoded loop - generous
-          # headroom over the ~55ms one tick takes at this kernel's
-          # ~18.2Hz PIT rate - before exiting voluntarily (same safe-
-          # return mechanism as the tests above). exit_code=77 confirms
-          # the loop ran to completion and exited cleanly;
+          # spins in a hand-encoded loop before exiting voluntarily (same
+          # safe-return mechanism as the tests above). exit_code=77
+          # confirms the loop ran to completion and exited cleanly;
           # ticked_during_ring3=true confirms `interrupts.rs`'s new
           # `TIMER_TICKS_WHILE_RING3` counter (read from the CPU's own
           # `code_segment.rpl()` on the interrupt frame - a safe,
           # structured `x86_64` crate accessor, no naked asm needed for
           # this step) genuinely advanced during that loop's execution,
           # not just that SOME tick happened somewhere in the whole boot.
+          # `LOOP_COUNT` found the hard way (150,000,000, not the
+          # 20,000,000 first tried): a LOCAL rerun after this test's own
+          # first CI pass showed `ticked_during_ring3=false` once - QEMU's
+          # TCG JIT doesn't run this tiny loop at a fixed, predictable
+          # speed - so the original count was marginal, not safely above
+          # one tick period. Re-verified across several repeated local
+          # boots at the new count before trusting it again.
           grep -q "RING3\] ring3_timer_tick_test exit_code=77" boot.log
           grep -q "ticked_during_ring3=true" boot.log
+          # Confirms ring-0 preemption and a real ring-3 program coexist
+          # safely when run CONCURRENTLY for the first time (Fase 80) -
+          # closing a real, previously-untested gap this exact discovery
+          # exposed: `scheduler::preemptive::tick()` used to call
+          # `switch_to` unconditionally whenever preemption was enabled,
+          # with no awareness that the interrupted context might be
+          # ring-3 code (an arbitrary register state at an arbitrary
+          # point, needing `iretq` to resume correctly - not a nested
+          # call frame `switch_to` can safely swap out). Never
+          # exercised before this Fase (ring-3 execution and ring-0
+          # preemption enablement had always been sequential, never
+          # concurrent, in every earlier self-test) so not a prior
+          # regression, but a real blocker for eventual ring-3-aware
+          # scheduling. Fixed by threading `interrupted_ring3` from
+          # `timer_interrupt_handler` into `tick()`, which now skips
+          # task-switching (and the tick-budget countdown) entirely
+          # whenever it's true. `exit_code=88` confirms the ring-3 spin
+          # loop itself still completes normally;
+          # `budget_untouched_during_ring3=true` confirms the fix
+          # actually works (ticks landing during the ring-3 window don't
+          # decrement the concurrently-running ring-0 demo's own tick
+          # budget); `tasks_advanced_after=true` confirms ring-0
+          # preemption genuinely still works once ring-3 exits, not just
+          # that nothing crashed.
+          grep -q "RING3\] ring3_concurrent_preemption_test exit_code=88" boot.log
+          grep -q "budget_untouched_during_ring3=true" boot.log
+          grep -q "tasks_advanced_after=true" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -

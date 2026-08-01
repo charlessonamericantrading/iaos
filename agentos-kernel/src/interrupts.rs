@@ -175,7 +175,8 @@ pub fn init_pics() {
 
 extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
-    if stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3 {
+    let interrupted_ring3 = stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3;
+    if interrupted_ring3 {
         TIMER_TICKS_WHILE_RING3.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -188,7 +189,12 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
 
-    crate::scheduler::preemptive::tick();
+    // interrupted_ring3 threads straight through to tick() - see
+    // scheduler::preemptive::tick's own doc (Fase 80) for why this
+    // matters: it must skip ring-0 task-switching entirely whenever the
+    // interrupted context was ring-3, not just log it like the counter
+    // above does.
+    crate::scheduler::preemptive::tick(interrupted_ring3);
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
