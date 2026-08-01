@@ -179,6 +179,37 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         memory::heap::HEAP_SIZE / 1024
     );
 
+    // 2d-2. Map a real user-accessible page (Fase 70, the third step of
+    // the ring-3 arc after Fase 68's GDT/TSS and Fase 69's DPL=3 int
+    // 0x80 gate) - deliberately a NEW, separate mapping, not reusing the
+    // heap (which was, and stays, kernel-only). Still entirely a ring-0
+    // operation: nothing runs in ring-3 yet, so this only proves the
+    // MAPPING itself is genuinely correct (both structurally, via the
+    // real PTE flags read back through the page tables, and
+    // functionally, via a real write+read-back through the mapping) -
+    // a future Fase still needs the actual ring-3 entry to prove the
+    // USER_ACCESSIBLE bit is what makes the real difference.
+    kprintln!("[KERNEL INIT] Mapping a real user-accessible test page...");
+    memory::user_page::map_user_test_page(&mut mapper, &mut frame_allocator)
+        .expect("user test page mapping failed");
+    {
+        let info = memory::user_page::inspect_user_test_page(&mapper);
+        kprintln!(
+            "[MEMORY] user_page_test present={} writable={} user_accessible={} write_read_back_ok={}",
+            info.present,
+            info.writable,
+            info.user_accessible,
+            info.write_read_back_ok
+        );
+        serial_println!(
+            "[MEMORY] user_page_test present={} writable={} user_accessible={} write_read_back_ok={}",
+            info.present,
+            info.writable,
+            info.user_accessible,
+            info.write_read_back_ok
+        );
+    }
+
     // Hands the SAME allocator instance (cursor already advanced past
     // whatever heap init just claimed) to a global slot so later code -
     // e.g. a future real NIC driver's TX/RX descriptor rings - can keep

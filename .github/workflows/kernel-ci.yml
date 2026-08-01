@@ -104,6 +104,29 @@ jobs:
           # wrapper, real, separate follow-on work).
           grep -q "IDT\] syscall_int_test count_delta=1" boot.log
           grep -q "\[PIC\] 8259 remapped to vectors 32-47" boot.log
+          # Confirms a real, dedicated user-accessible page mapping
+          # (Fase 70, the third step of the ring-3 arc after Fase 68's
+          # GDT/TSS foundation and Fase 69's DPL=3 int 0x80 gate) -
+          # deliberately a NEW mapping (0x5555_5555_0000), not the heap
+          # (which stays kernel-only), verified checked-not-assumed to
+          # share no page-table level with the heap's own range before
+          # any code was written (PML4 index 170 vs. 136), so the
+          # x86_64 crate's own automatic parent_table_flags derivation
+          # in map_to creates fresh, correctly USER_ACCESSIBLE
+          # intermediate tables rather than inheriting the heap's
+          # stale, non-user-accessible ones - a real, easy-to-miss
+          # correctness subtlety, since x86_64 ANDs the effective
+          # permission across every page-table level, not just the
+          # leaf. Verified two independent ways: user_accessible=true
+          # is the real leaf PTE flag read back through the page
+          # tables (via Translate, not just trusting map_to's own Ok
+          # return), and write_read_back_ok=true is a real byte-
+          # pattern write+read-back through the mapping (ring-0 can
+          # freely access a USER_ACCESSIBLE page too - that bit only
+          # ever restricts ring-3). Still entirely a ring-0 operation -
+          # nothing runs in ring-3 yet to prove the bit makes an actual
+          # difference, that's separate, substantial follow-on work.
+          grep -q "MEMORY\] user_page_test present=true writable=true user_accessible=true write_read_back_ok=true" boot.log
           # Confirms the global frame allocator hands out real, distinct,
           # genuinely writable/readable physical frames (verified=true is
           # only printed if all 3 write/read-back checks passed - a
