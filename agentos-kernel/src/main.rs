@@ -271,6 +271,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ring3_reject_code
     );
 
+    // Fase 77: proves the pointer check above now covers a slice's WHOLE
+    // length, not just where it starts - a real ring-3 call whose
+    // "weights" pointer sits on a genuinely valid, user-accessible page
+    // but whose stated length runs off the end into an unmapped one must
+    // also be rejected. Same safe-return mechanism, same "runs
+    // unconditionally" reasoning as the two tests above.
+    kprintln!(
+        "[KERNEL INIT] Testing SYS_TENSOR_EVAL rejects a ring-3 slice that overruns its starting page..."
+    );
+    let ring3_overrun_code = ring3::run_ring3_slice_overrun_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - slice-overrun test returned {:#x}",
+        ring3_overrun_code
+    );
+
     // Hands the SAME allocator instance (cursor already advanced past
     // whatever heap init just claimed) to a global slot so later code -
     // e.g. a future real NIC driver's TX/RX descriptor rings - can keep

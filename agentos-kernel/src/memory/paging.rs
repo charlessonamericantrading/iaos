@@ -64,31 +64,61 @@ pub fn with_mapper<R>(f: impl FnOnce(&mut OffsetPageTable<'static>) -> R) -> R {
 ///
 /// Only checks the mapping is genuinely PRESENT - deliberately does NOT
 /// require `USER_ACCESSIBLE`. Safe to call regardless of who the caller
-/// is (ring-0 or ring-3) - see `pointer_is_user_accessible` below for the
+/// is (ring-0 or ring-3) - see `range_is_user_accessible` below for the
 /// stricter check that DOES depend on that, now that Fase 75 made caller
 /// privilege something `dispatch_syscall` can actually know.
-pub fn pointer_is_mapped(addr: u64) -> bool {
-    pointer_has_flags(addr, PageTableFlags::PRESENT)
+///
+/// Checks EVERY page `[addr, addr + len_bytes)` touches (Fase 77), not
+/// just the first one - a slice can start on a real, valid page and
+/// still run off the end into an unmapped (or, for a ring-3 caller,
+/// non-user-accessible) one if its stated length is wrong or hostile.
+/// `len_bytes == 0` always passes (nothing will actually be
+/// dereferenced - see `syscall.rs`'s own `pointer_is_mapped_checked`
+/// for why an empty slice's pointer value doesn't matter here).
+pub fn range_is_mapped(addr: u64, len_bytes: u64) -> bool {
+    range_has_flags(addr, len_bytes, PageTableFlags::PRESENT)
 }
 
-/// Stricter than `pointer_is_mapped`: also requires `USER_ACCESSIBLE`,
-/// i.e. genuinely safe for RING-3 code to have legitimately obtained -
-/// not just present in the page tables at all. The real motivation
-/// (Fase 76): now that `dispatch_syscall` can tell whether a syscall
-/// genuinely came from ring-3 (Fase 75's own `caller_rpl`), a ring-3
-/// caller passing a pointer to real, PRESENT but kernel-only memory
-/// (the heap, in particular - see `memory/user_page.rs`'s own doc:
-/// every mapping before Fase 70 was `PRESENT | WRITABLE` only, never
-/// `USER_ACCESSIBLE`) should be REJECTED, exactly like an unmapped
-/// pointer already is - a "confused deputy" risk `pointer_is_mapped`
-/// alone can't catch, since kernel memory legitimately passes THAT
-/// check. Only meaningful to call for a ring-3-originated pointer -
-/// see `syscall.rs`'s own call site for how the two checks are chosen.
-pub fn pointer_is_user_accessible(addr: u64) -> bool {
-    pointer_has_flags(
+/// Stricter than `range_is_mapped`: also requires `USER_ACCESSIBLE` on
+/// EVERY page the range touches, i.e. genuinely safe for RING-3 code to
+/// have legitimately obtained - not just present in the page tables at
+/// all. The real motivation (Fase 76): now that `dispatch_syscall` can
+/// tell whether a syscall genuinely came from ring-3 (Fase 75's own
+/// `caller_rpl`), a ring-3 caller passing a pointer to real, PRESENT but
+/// kernel-only memory (the heap, in particular - see
+/// `memory/user_page.rs`'s own doc: every mapping before Fase 70 was
+/// `PRESENT | WRITABLE` only, never `USER_ACCESSIBLE`) should be
+/// REJECTED, exactly like an unmapped pointer already is - a "confused
+/// deputy" risk `range_is_mapped` alone can't catch, since kernel memory
+/// legitimately passes THAT check. Only meaningful to call for a
+/// ring-3-originated pointer - see `syscall.rs`'s own call site for how
+/// the two checks are chosen.
+pub fn range_is_user_accessible(addr: u64, len_bytes: u64) -> bool {
+    range_has_flags(
         addr,
+        len_bytes,
         PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE,
     )
+}
+
+const PAGE_SIZE: u64 = 4096;
+
+fn range_has_flags(addr: u64, len_bytes: u64, required: PageTableFlags) -> bool {
+    if len_bytes == 0 {
+        return true;
+    }
+    // `checked_add` (not plain `+`) catches a hostile or overflowing
+    // `addr + len_bytes - 1` - e.g. a syscall caller passing a `len`
+    // deliberately chosen so the range's own end wraps back around to
+    // a low, otherwise-valid-looking address.
+    let Some(last_byte) = addr.checked_add(len_bytes - 1) else {
+        return false;
+    };
+    let first_page = addr / PAGE_SIZE;
+    let last_page = last_byte / PAGE_SIZE;
+    // Checking one address per page is enough - PRESENT/USER_ACCESSIBLE
+    // apply uniformly across a whole page, never partway through one.
+    (first_page..=last_page).all(|page| pointer_has_flags(page * PAGE_SIZE, required))
 }
 
 fn pointer_has_flags(addr: u64, required: PageTableFlags) -> bool {

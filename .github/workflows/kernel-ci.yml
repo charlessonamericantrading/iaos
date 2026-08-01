@@ -423,6 +423,20 @@ jobs:
           # valid-pointer test above (a ring-0 call, so unaffected by
           # this stricter check) still passes unchanged.
           grep -q "RING3\] ring3_pointer_reject_test exit_code=0xffffffffffffffff" boot.log
+          # Confirms SYS_TENSOR_EVAL's pointer checks now cover a
+          # slice's WHOLE length, not just where it starts (Fase 77) -
+          # a real ring-3 call whose "weights" pointer sits on a
+          # genuinely valid, PRESENT, USER_ACCESSIBLE address
+          # (USER_TEST_PAGE_ADDR+4092, only 4 bytes before the user
+          # page's own end) but whose stated length asks for 8 bytes
+          # (weights_len=2 f32s) must ALSO be rejected, since those
+          # extra 4 bytes fall in the next page, which was never mapped
+          # at all - a gap the STARTING-address-only check (Fase 74/76)
+          # could not have caught, since that one address alone looked
+          # completely legitimate. exit_code=0xffffffffffffffff is the
+          # same clean u64::MAX every other rejection case above
+          # produces, this time for a genuinely new reason.
+          grep -q "RING3\] ring3_slice_overrun_test exit_code=0xffffffffffffffff" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -

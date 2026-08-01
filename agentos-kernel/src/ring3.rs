@@ -425,6 +425,91 @@ pub fn run_ring3_pointer_reject_test() -> u64 {
     exit_code
 }
 
+/// Proves `SYS_TENSOR_EVAL`'s pointer checks now cover a slice's WHOLE
+/// length, not just its starting address (Fase 77). Reuses
+/// `run_ring3_pointer_reject_test`'s own shape almost exactly, with one
+/// deliberate change: `weights` points 4 bytes before the user page's
+/// own end (`USER_TEST_PAGE_ADDR + 4092`) - a real, `PRESENT` AND
+/// `USER_ACCESSIBLE` address, so the OLD (Fase 74/76) starting-address-
+/// only check would have WRONGLY ACCEPTED it - but `weights_len = 2`
+/// asks for 8 bytes (`2 * size_of::<f32>()`), and only 4 remain before
+/// the page boundary. The next page (`USER_TEST_PAGE_ADDR + 4096`) was
+/// never mapped at all (Fase 70's own page is a single, deliberately
+/// isolated 4 KiB mapping - see that module's own doc), so the RANGE
+/// genuinely runs off the end into nothing. `inputs`/`bias`/`outputs`
+/// all use `len = 0` (skipped by `pointer_is_mapped_checked` itself),
+/// keeping this test isolated to exactly the one new thing being
+/// proven, not re-proving Fase 76's own kernel-only-pointer check too.
+pub fn run_ring3_slice_overrun_test() -> u64 {
+    let info = gdt::ring3_info();
+    let user_cs = info.user_code_selector as u64;
+    let user_ss = info.user_data_selector as u64;
+
+    let code_addr = USER_TEST_PAGE_ADDR;
+    let stack_top = USER_TEST_PAGE_ADDR + 4096;
+    let args_addr = USER_TEST_PAGE_ADDR + 256;
+    // 4 bytes before the page's own end - real, mapped, user-accessible
+    // memory, but with no room left for the 8 bytes `weights_len = 2`
+    // asks for.
+    let overrunning_ptr = USER_TEST_PAGE_ADDR + 4092;
+
+    let args = crate::syscall::TensorEvalArgs {
+        weights: overrunning_ptr as *const f32,
+        weights_len: 2,
+        inputs: core::ptr::null(),
+        inputs_len: 0,
+        bias: core::ptr::null(),
+        bias_len: 0,
+        outputs: core::ptr::null_mut(),
+        outputs_len: 0,
+        in_dim: 1,
+        out_dim: 1,
+    };
+    unsafe {
+        core::ptr::write_volatile(args_addr as *mut crate::syscall::TensorEvalArgs, args);
+    }
+
+    let mut program = [0u8; 20];
+    program[0] = 0x48;
+    program[1] = 0xB8;
+    program[2..10].copy_from_slice(&crate::syscall::SYS_TENSOR_EVAL.to_le_bytes());
+    program[10] = 0x48;
+    program[11] = 0xBF;
+    program[12..20].copy_from_slice(&args_addr.to_le_bytes());
+    unsafe {
+        core::ptr::copy_nonoverlapping(program.as_ptr(), code_addr as *mut u8, program.len());
+        core::ptr::write_volatile((code_addr + 20) as *mut u8, 0xCD);
+        core::ptr::write_volatile((code_addr + 21) as *mut u8, 0x80);
+        core::ptr::write_volatile((code_addr + 22) as *mut u8, 0xCD);
+        core::ptr::write_volatile((code_addr + 23) as *mut u8, 0x81);
+    }
+
+    kprintln!("[RING3] Attempting SYS_TENSOR_EVAL from ring-3 with a slice that overruns its starting page - expecting rejection...");
+    serial_println!(
+        "[RING3] ring3_slice_overrun_test entering rip={:#x} cs={:#06x} ss={:#06x} rsp={:#x} rflags={:#x} overrunning_ptr={:#x}",
+        code_addr,
+        user_cs,
+        user_ss,
+        stack_top,
+        RING3_TEST_RFLAGS,
+        overrunning_ptr
+    );
+
+    let exit_code =
+        unsafe { enter_ring3(code_addr, user_cs, user_ss, stack_top, RING3_TEST_RFLAGS) };
+
+    kprintln!(
+        "[RING3] Back in ring-0 - SYS_TENSOR_EVAL from ring-3 (overrunning slice) returned {:#x}",
+        exit_code
+    );
+    serial_println!(
+        "[RING3] ring3_slice_overrun_test exit_code={:#x}",
+        exit_code
+    );
+
+    exit_code
+}
+
 /// A real ring-3-originated syscall (Fase 72), followed by the same
 /// proven `cli`-fault ending `run_ring3_test` (Fase 71) already
 /// established. The "program" is three real instructions, hand-encoded

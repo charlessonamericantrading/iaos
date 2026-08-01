@@ -45,27 +45,37 @@ pub struct TensorEvalArgs {
 /// so requiring `USER_ACCESSIBLE` unconditionally would reject them.
 /// Only meaningful because `dispatch_syscall` can now tell the two
 /// cases apart for real (Fase 75's own `caller_rpl`).
+///
+/// `len_bytes` (Fase 77) is the REAL byte length of whatever `ptr` will
+/// be turned into a slice over - every page the resulting range
+/// `[ptr, ptr + len_bytes)` touches is checked, not just the first one.
+/// A slice can start on a real, valid page and still run off the end
+/// into an unmapped (or non-user-accessible) one if its stated length
+/// is wrong or hostile - a gap `range_is_mapped`'s own predecessor
+/// (`pointer_is_mapped`, Fase 74/76) couldn't catch, since it only ever
+/// looked at the starting address.
 fn pointer_is_mapped_checked(
     name: &str,
     ptr: u64,
-    len: usize,
+    len_bytes: u64,
     require_user_accessible: bool,
 ) -> bool {
-    if len == 0 {
+    if len_bytes == 0 {
         return true;
     }
     let ok = if require_user_accessible {
-        crate::memory::paging::pointer_is_user_accessible(ptr)
+        crate::memory::paging::range_is_user_accessible(ptr, len_bytes)
     } else {
-        crate::memory::paging::pointer_is_mapped(ptr)
+        crate::memory::paging::range_is_mapped(ptr, len_bytes)
     };
     if ok {
         true
     } else {
         kprintln!(
-            "[SYSCALL ERROR] SYS_TENSOR_EVAL: {} pointer {:#x} rejected (require_user_accessible={})",
+            "[SYSCALL ERROR] SYS_TENSOR_EVAL: {} range {:#x}+{:#x} rejected (require_user_accessible={})",
             name,
             ptr,
+            len_bytes,
             require_user_accessible
         );
         false
@@ -134,7 +144,22 @@ pub fn dispatch_syscall(
             // check). Ring-0 callers - this kernel's own self-tests,
             // which legitimately use ordinary heap/stack memory - are
             // unaffected, since `caller_is_ring3` is false for them.
-            if !pointer_is_mapped_checked("args", arg1, 1, caller_is_ring3) {
+            //
+            // Fase 77: every length below is now a real BYTE count
+            // (`len * size_of::<f32>()`, `saturating_mul` since a
+            // hostile `len` could otherwise overflow the multiplication
+            // and wrap to a small, wrongly-passing value), and
+            // `range_is_mapped`/`range_is_user_accessible` check EVERY
+            // page that byte range touches, not just its first one - a
+            // slice starting on a valid page can still run off the end
+            // into an unmapped or kernel-only one if `len` is wrong.
+            const F32_SIZE: u64 = core::mem::size_of::<f32>() as u64;
+            if !pointer_is_mapped_checked(
+                "args",
+                arg1,
+                core::mem::size_of::<TensorEvalArgs>() as u64,
+                caller_is_ring3,
+            ) {
                 return u64::MAX;
             }
             let args_ptr = arg1 as *const TensorEvalArgs;
@@ -145,22 +170,22 @@ pub fn dispatch_syscall(
             if !pointer_is_mapped_checked(
                 "weights",
                 args.weights as u64,
-                args.weights_len,
+                (args.weights_len as u64).saturating_mul(F32_SIZE),
                 caller_is_ring3,
             ) || !pointer_is_mapped_checked(
                 "inputs",
                 args.inputs as u64,
-                args.inputs_len,
+                (args.inputs_len as u64).saturating_mul(F32_SIZE),
                 caller_is_ring3,
             ) || !pointer_is_mapped_checked(
                 "bias",
                 args.bias as u64,
-                args.bias_len,
+                (args.bias_len as u64).saturating_mul(F32_SIZE),
                 caller_is_ring3,
             ) || !pointer_is_mapped_checked(
                 "outputs",
                 args.outputs as u64,
-                args.outputs_len,
+                (args.outputs_len as u64).saturating_mul(F32_SIZE),
                 caller_is_ring3,
             ) {
                 return u64::MAX;
