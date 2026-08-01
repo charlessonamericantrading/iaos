@@ -216,6 +216,18 @@ jobs:
           # varies by build machine (the same class of risk Fase 15 hit
           # with file sizes) - only the match=true outcome is asserted.
           grep -qE "ATA\] write_test lba=[0-9]+ match=true" boot.log
+          # Confirms the FAT12 write test (Fase 24) both wrote real bytes
+          # that read back correctly AND genuinely restored the original
+          # content afterward - the second half matters as much as the
+          # first: BOOT-S~1/BOOT-S~2 are the bootloader crate's own
+          # boot-stage executables, not inert data, and leaving the test
+          # pattern in place would corrupt the boot chain for whatever
+          # boots this exact disk image next (found the hard way locally
+          # - see README's FAT32/FAT12 row). A missing "restored=true"
+          # here would mean this CI run's own image is now corrupted,
+          # even though this run itself already captured its full log.
+          grep -qE "FAT12\] write_test file=BOOT-S~2 len=[0-9]+ match=true" boot.log
+          grep -q "FAT12\] write_test restored=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.

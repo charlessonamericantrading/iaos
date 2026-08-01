@@ -143,6 +143,60 @@ impl Fat12Info {
     /// Finds `name` (case-insensitive, short 8.3 form) in the root
     /// directory and reads its full contents by walking its cluster
     /// chain through the in-memory FAT.
+    /// Overwrites an existing file's content with `data`, which must be
+    /// EXACTLY the same length as the file's current size - this first
+    /// version reuses the file's existing cluster chain as-is and
+    /// touches neither the FAT nor the directory entry (size field
+    /// included). Creating a new file (needs a free directory-entry
+    /// search + cluster allocation) or resizing an existing one (needs
+    /// FAT chain growth/shrink) are both substantially more work,
+    /// deliberately not attempted here.
+    pub fn write_file(&self, name: &str, data: &[u8]) -> Result<(), &'static str> {
+        let entries = self.list_root_directory()?;
+        let entry = entries
+            .iter()
+            .find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(name))
+            .ok_or("FAT12: file not found in root directory")?;
+
+        if data.len() != entry.size as usize {
+            return Err("FAT12: write_file only supports same-size overwrites for now");
+        }
+        if entry.size == 0 {
+            return Ok(());
+        }
+
+        let mut cluster = entry.start_cluster;
+        let mut written = 0usize;
+
+        loop {
+            let cluster_lba = self.cluster_to_lba(cluster);
+            for s in 0..self.sectors_per_cluster as u32 {
+                let remaining = data.len() - written;
+                if remaining == 0 {
+                    return Ok(());
+                }
+                let take = remaining.min(512);
+                let mut sector_buf = [0u8; 512];
+                sector_buf[..take].copy_from_slice(&data[written..written + take]);
+                // A cluster's last sector may only be partially covered
+                // by real file data (size isn't always a multiple of
+                // 512) - the trailing bytes beyond `take` are left
+                // zeroed. That's fine: nothing about a FAT file's bytes
+                // past its logical `size` is meaningful, and read_file
+                // only ever reads back exactly `entry.size` bytes.
+                ata::write_sector(cluster_lba + s, &sector_buf)?;
+                written += take;
+            }
+            if written >= data.len() {
+                return Ok(());
+            }
+            match self.next_cluster(cluster)? {
+                Some(next) => cluster = next,
+                None => return Err("FAT12: cluster chain ended before all data was written"),
+            }
+        }
+    }
+
     pub fn read_file(&self, name: &str) -> Result<Vec<u8>, &'static str> {
         let entries = self.list_root_directory()?;
         let entry = entries

@@ -333,6 +333,95 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // 7b-5. Real FAT12 file write, built on the ATA write primitive above
+    // - the simplest possible case: overwrite an EXISTING file's content
+    // with new data of the exact same length, reusing its existing
+    // cluster chain as-is (no FAT/directory-entry changes). Creating a
+    // new file or resizing one both need real cluster (re)allocation -
+    // substantially more work, deliberately not attempted in this same
+    // iteration.
+    //
+    // Targets BOOT-S~2 - but restores its ORIGINAL content afterward,
+    // unconditionally. Found the hard way (a repeat-boot-test caught it
+    // immediately): "BOOT-S~1"/"BOOT-S~2" are not inert data files -
+    // they're the `bootloader` crate's own boot-stage executables that
+    // the BIOS runs *before* this kernel ever starts. QEMU's `-drive`
+    // writes straight through to the host .img file, so overwriting
+    // BOOT-S~2 with test bytes and leaving it that way corrupts the boot
+    // chain for every *subsequent* boot against that same image (the
+    // first boot still looks fine, since the corruption happens *after*
+    // that boot's own chain already handed off to this kernel) - the
+    // symptom was a completely empty serial log on the next boot, no
+    // panic, nothing, because the corrupted stage 2 never got far enough
+    // to run any of this kernel's code at all. Restoring the original
+    // content before returning is what makes this self-test safe to run
+    // on every boot, unlike a persistent-effect assumption that turned
+    // out to be wrong.
+    kprintln!("[KERNEL INIT] Testing real FAT12 file write (overwrite + read-back)...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(fs) => match fs.read_file("BOOT-S~2") {
+                Ok(original) => {
+                    let test_pattern: alloc::vec::Vec<u8> =
+                        (0..original.len()).map(|i| (i % 256) as u8).collect();
+                    match fs.write_file("BOOT-S~2", &test_pattern) {
+                        Ok(()) => match fs.read_file("BOOT-S~2") {
+                            Ok(read_back) => {
+                                let matches = read_back == test_pattern;
+                                kprintln!(
+                                    "[FAT12] write+read-back test on BOOT-S~2 ({} bytes): {}",
+                                    test_pattern.len(),
+                                    if matches {
+                                        "OK (bytes match)"
+                                    } else {
+                                        "MISMATCH"
+                                    }
+                                );
+                                serial_println!(
+                                    "[FAT12] write_test file=BOOT-S~2 len={} match={}",
+                                    test_pattern.len(),
+                                    matches
+                                );
+                            }
+                            Err(e) => {
+                                kprintln!("[FAT12] write test: read-back failed: {}", e);
+                                serial_println!("[FAT12] write_test read_failed: {}", e);
+                            }
+                        },
+                        Err(e) => {
+                            kprintln!("[FAT12] write test: write failed: {}", e);
+                            serial_println!("[FAT12] write_test write_failed: {}", e);
+                        }
+                    }
+                    // Unconditional: runs regardless of the match/error
+                    // outcome above - this file must never end this boot
+                    // in anything but its genuine, original state.
+                    match fs.write_file("BOOT-S~2", &original) {
+                        Ok(()) => {
+                            serial_println!("[FAT12] write_test restored=true");
+                        }
+                        Err(e) => {
+                            kprintln!("[FAT12] CRITICAL: failed to restore BOOT-S~2: {}", e);
+                            serial_println!("[FAT12] write_test restore_failed: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    kprintln!("[FAT12] write test: couldn't read original BOOT-S~2: {}", e);
+                    serial_println!("[FAT12] write_test -> no original: {}", e);
+                }
+            },
+            Err(e) => {
+                kprintln!("[FAT12] write test: not FAT12 ({})", e);
+                serial_println!("[FAT12] write_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!("[FAT12] write test: couldn't find FAT partition: {}", e);
+            serial_println!("[FAT12] write_test -> no partition: {}", e);
+        }
+    }
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real
