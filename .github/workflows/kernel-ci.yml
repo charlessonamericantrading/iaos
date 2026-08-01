@@ -95,6 +95,15 @@ jobs:
             echo "FRAME ALLOC REGRESSION: frames aren't consecutive 4 KiB apart: ${frame_addrs[*]}."
             exit 1
           fi
+          # Confirms the GGUF header parser's input now genuinely round-trips
+          # through the FAT12 disk (Fase 41) - create_file writes the same
+          # 24-byte sample header to a real file, read_file reads it back,
+          # and round_trip_ok=true means those bytes matched byte-for-byte -
+          # not just that parse_header ran, which it always could on a
+          # hardcoded array regardless of whether disk I/O worked at all.
+          # The tensor math afterward is unchanged (still the same hardcoded
+          # toy weights), so this line alone is the meaningful new check.
+          grep -q "GGUF\] disk_load_test write_ok=true round_trip_ok=true cleanup_ok=true" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -

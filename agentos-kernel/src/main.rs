@@ -206,7 +206,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // 5. Test GGUF Quantized Model Parser & Tensor Matrix Execution
+    // 5. Test GGUF Quantized Model Parser & Tensor Matrix Execution - the
+    // header bytes now genuinely round-trip through the FAT12 disk
+    // (create -> read back -> parse) instead of living only as a
+    // compile-time array `parse_header` happened to be handed directly.
+    // `MODEL.BIN` deliberately fits plain 8.3 (avoids incidentally
+    // exercising VFAT again here - that's already its own dedicated
+    // self-test). The tensor math afterward is still the same toy
+    // computation on hardcoded weights, unchanged and explicitly out of
+    // scope - loading *real* quantized tensor weights from a real model
+    // file is a separate, much larger undertaking (actual GGUF tensor
+    // formats, memory-mapped weight loading) not attempted here.
     kprintln!("[GGUF INFERENCE] Testing Native GGUF Header Parser & Tensor Weights...");
     let sample_gguf_bytes: [u8; 24] = [
         0x47, 0x47, 0x55, 0x46, // "GGUF"
@@ -215,22 +225,59 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 8 KV Pairs
     ];
 
-    if let Ok(loader) = GgufModelLoader::parse_header(&sample_gguf_bytes) {
-        let weights: [f32; 16] = [
-            0.5, -0.2, 0.8, 0.1, 0.3, 0.9, -0.4, 0.6, -0.1, 0.4, 0.7, 0.2, 0.6, -0.5, 0.2, 0.8,
-        ];
-        let inputs: [f32; 4] = [1.0, 2.0, 0.5, 3.0];
-        let mut outputs: [f32; 4] = [0.0; 4];
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                let write_ok = fs.create_file("MODEL.BIN", &sample_gguf_bytes).is_ok();
+                let read_back = fs.read_file("MODEL.BIN");
+                let round_trip_ok = read_back.as_deref() == Ok(sample_gguf_bytes.as_slice());
+                let cleanup_ok = fs.delete_file("MODEL.BIN").is_ok();
+                kprintln!(
+                    "[GGUF LOADER] disk round-trip: write_ok={} round_trip_ok={} cleanup_ok={}",
+                    write_ok,
+                    round_trip_ok,
+                    cleanup_ok
+                );
+                serial_println!(
+                    "[GGUF] disk_load_test write_ok={} round_trip_ok={} cleanup_ok={}",
+                    write_ok,
+                    round_trip_ok,
+                    cleanup_ok
+                );
 
-        loader.execute_gguf_layer_pass(&weights, &inputs, &mut outputs, 4, 4);
+                if let Ok(header_bytes) = read_back {
+                    if let Ok(loader) = GgufModelLoader::parse_header(&header_bytes) {
+                        let weights: [f32; 16] = [
+                            0.5, -0.2, 0.8, 0.1, 0.3, 0.9, -0.4, 0.6, -0.1, 0.4, 0.7, 0.2, 0.6,
+                            -0.5, 0.2, 0.8,
+                        ];
+                        let inputs: [f32; 4] = [1.0, 2.0, 0.5, 3.0];
+                        let mut outputs: [f32; 4] = [0.0; 4];
 
-        kprintln!(
-            "[GGUF RESULT] Y = ReLU(W * X + B) -> [{:.2}, {:.2}, {:.2}, {:.2}]",
-            outputs[0],
-            outputs[1],
-            outputs[2],
-            outputs[3]
-        );
+                        loader.execute_gguf_layer_pass(&weights, &inputs, &mut outputs, 4, 4);
+
+                        kprintln!(
+                            "[GGUF RESULT] Y = ReLU(W * X + B) -> [{:.2}, {:.2}, {:.2}, {:.2}]",
+                            outputs[0],
+                            outputs[1],
+                            outputs[2],
+                            outputs[3]
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                kprintln!("[GGUF LOADER] disk round-trip: not FAT12 ({})", e);
+                serial_println!("[GGUF] disk_load_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!(
+                "[GGUF LOADER] disk round-trip: couldn't find FAT partition: {}",
+                e
+            );
+            serial_println!("[GGUF] disk_load_test -> no partition: {}", e);
+        }
     }
 
     // 6. Test Native VirtIO-Net & TCP/IPv4 Network Stack
