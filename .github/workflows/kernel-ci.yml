@@ -172,6 +172,16 @@ jobs:
           # by decode_tensor, not just structurally similar to what it
           # expects.
           grep -q "GGUF\] multi_tensor_test parse_many_ok=true tensor1_decode_ok=true tensor2_decode_ok=true" boot.log
+          # Confirms SYS_TENSOR_EVAL (Fase 55) genuinely dispatches to the
+          # real tensor engine now, not "Unknown System Call Number" (this
+          # syscall number had been defined but never wired to any match
+          # arm at all before this Fase). syscall_ok proves the real
+          # success code (0) came back, not the u64::MAX fallback.
+          # tensor_eval_correct proves the actual computed 2x2 layer
+          # output matches hand-computed values exactly - including
+          # ReLU's clipping branch on row 1's deliberately negative
+          # pre-activation - not just that some output happened to be 0.
+          grep -q "SYSCALL\] tensor_eval_test syscall_ok=true tensor_eval_correct=true outputs=\[4.00, 0.00\]" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -

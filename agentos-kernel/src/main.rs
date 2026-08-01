@@ -669,6 +669,78 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let spawned_pid = syscall::dispatch_syscall(syscall::SYS_AGENT_SPAWN, 10000, 0, 0);
     syscall::dispatch_syscall(syscall::SYS_KV_ALLOC, spawned_pid, 1024, 0);
 
+    // 7a-2. Test SYS_TENSOR_EVAL (Fase 55) - this syscall number has been
+    // defined since before this session's own start, but dispatch_syscall
+    // never had a match arm for it at all: calling it always fell through
+    // to "Unknown System Call Number", a genuine dead constant, the same
+    // class of gap Fase 50 found in GgufTensorInfo's own long-parsed-but-
+    // unused gtype field. Deliberately picked as this Fase's own area
+    // switch after five straight GGUF Fases (50-54): a small, ring-0-only
+    // slice of "make syscalls real" - wiring the dispatcher to the actual
+    // tensor engine - distinct from the much larger, still-deferred real
+    // ring-3/ring-0 transition (no user-mode GDT segments, no RSP0, no
+    // SYSCALL/SYSRET or DPL=3 interrupt gate exist at all yet - see
+    // syscall.rs's own TensorEvalArgs doc and this project's memory notes
+    // for why that larger undertaking keeps getting deferred).
+    //
+    // weights/inputs/bias/in_dim/out_dim are a small, fully hand-computable
+    // 2x2 layer: row0 = ReLU(1*1 + 2*1 + 1) = ReLU(4) = 4.0; row1 =
+    // ReLU(3*1 + 4*1 - 10) = ReLU(-3) = 0.0 - the negative bias on row1 is
+    // deliberate, so this test also exercises ReLU's clipping branch (a
+    // real negative pre-activation clamped to zero), not just plain
+    // addition. syscall_ok proves dispatch_syscall itself returned the
+    // real success code (0) for this syscall number, not the "Unknown
+    // System Call Number" fallback (u64::MAX) it would have returned
+    // before this Fase. tensor_eval_correct proves the syscall path
+    // genuinely drove TensorEngine::matmul_layer for real (through the
+    // TensorEvalArgs pointer, not a stub) - the actual computed outputs
+    // match the hand-computed expected values, not just "some 0 came
+    // back".
+    kprintln!("[KERNEL SYSCALL] Testing SYS_TENSOR_EVAL (real tensor engine via syscall)...");
+    {
+        let weights: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let inputs: [f32; 2] = [1.0, 1.0];
+        let bias: [f32; 2] = [1.0, -10.0];
+        let mut outputs: [f32; 2] = [0.0; 2];
+
+        let args = syscall::TensorEvalArgs {
+            weights: weights.as_ptr(),
+            weights_len: weights.len(),
+            inputs: inputs.as_ptr(),
+            inputs_len: inputs.len(),
+            bias: bias.as_ptr(),
+            bias_len: bias.len(),
+            outputs: outputs.as_mut_ptr(),
+            outputs_len: outputs.len(),
+            in_dim: 2,
+            out_dim: 2,
+        };
+        let result =
+            syscall::dispatch_syscall(syscall::SYS_TENSOR_EVAL, &args as *const _ as u64, 0, 0);
+        let syscall_ok = result == 0;
+
+        const EXPECTED_OUTPUTS: [f32; 2] = [4.0, 0.0];
+        let tensor_eval_correct = outputs
+            .iter()
+            .zip(EXPECTED_OUTPUTS.iter())
+            .all(|(a, b)| (a - b).abs() < 0.001);
+
+        kprintln!(
+            "[SYSCALL] tensor_eval_test: syscall_ok={} tensor_eval_correct={} outputs=[{:.2}, {:.2}]",
+            syscall_ok,
+            tensor_eval_correct,
+            outputs[0],
+            outputs[1]
+        );
+        serial_println!(
+            "[SYSCALL] tensor_eval_test syscall_ok={} tensor_eval_correct={} outputs=[{:.2}, {:.2}]",
+            syscall_ok,
+            tensor_eval_correct,
+            outputs[0],
+            outputs[1]
+        );
+    }
+
     // 7b. Test the Shell Command Dispatcher (same parser the IRQ1 keyboard
     // handler calls once a real key press ends a line - this exercises it
     // without needing one, so it's provable from a headless serial capture.
