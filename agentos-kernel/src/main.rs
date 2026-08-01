@@ -384,6 +384,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // 7b-5. Test the new `netcheck` shell command (Fase 46) - proves the
+    // same TX+RX capability is reachable through the real
+    // dispatch_command parsing path, not just the direct API call
+    // above, matching this session's established "prove the API, then
+    // prove the shell path separately" pattern.
+    shell::dispatch_command("netcheck");
+
     shell::dispatch_command("disk");
     shell::dispatch_command("ls");
     shell::dispatch_command("cat KERNEL~1");

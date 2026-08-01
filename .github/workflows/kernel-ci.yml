@@ -260,6 +260,12 @@ jobs:
           # about is the final, independent confirmation this is a real,
           # correctly-addressed reply from the network, not noise.
           grep -q "E1000\] rx_received 64 bytes eop=true is_arp_reply=true gateway_ip=Some(\[10, 0, 2, 2\])" boot.log
+          # Confirms the new `netcheck` shell command (Fase 46) reaches
+          # the same already-proven TX+RX round trip through the real
+          # dispatch_command parsing path, not just the direct API call
+          # above - the same "prove the API, then prove the shell path"
+          # pattern this session used for FAT12's own commands.
+          grep -q "SHELL\] netcheck -> ok" boot.log
           # Confirms the new ATA write path (Fase 23) genuinely wrote and
           # read back matching bytes - not just that write_sector()
           # returned without erroring. Deliberately NOT asserting the

@@ -20,10 +20,10 @@ pub fn dispatch_command(line: &str) {
     match cmd {
         "help" => {
             kprintln!(
-                "Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, clear"
+                "Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, netcheck, clear"
             );
             serial_println!(
-                "[SHELL] help -> Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, clear"
+                "[SHELL] help -> Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, netcheck, clear"
             );
         }
         "ps" => {
@@ -317,6 +317,27 @@ pub fn dispatch_command(line: &str) {
                         kprintln!("rm: {}", e);
                         serial_println!("[SHELL] rm {} -> FAILED: {}", filename, e);
                     }
+                }
+            }
+        }
+        "netcheck" => {
+            // Exposes the already-proven e1000 TX+RX capability (Fase
+            // 44/45) interactively, on demand, rather than only ever at
+            // boot - the same "prove the API first, then expose it via
+            // shell" pattern this session followed for FAT12's own
+            // touch/cat/rm commands. Zero changes to net::e1000 itself:
+            // receive_test_frame is already verified correct, reused
+            // here as a black box.
+            match crate::net::e1000::receive_test_frame() {
+                Ok(()) => {
+                    kprintln!(
+                        "Network check OK: sent a real ARP request and received a genuine reply."
+                    );
+                    serial_println!("[SHELL] netcheck -> ok");
+                }
+                Err(e) => {
+                    kprintln!("netcheck: {}", e);
+                    serial_println!("[SHELL] netcheck -> FAILED: {}", e);
                 }
             }
         }
