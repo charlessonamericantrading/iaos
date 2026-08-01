@@ -173,6 +173,19 @@ jobs:
           # script across 2000 random byte inputs before any Rust was
           # written - the full value-extraction loop was verified the
           # same way, not just hand arithmetic.
+          # Confirms real GGUF Q2_K super-block decoding (Fase 61) - the
+          # fifth K-quant format, and the simplest of the intricate
+          # K-quant family: each scales[16] byte holds both a scale
+          # (low nibble) and min (high nibble) directly, no bit-packing
+          # to derive. The plain 2-bit value (unsigned, no recentering)
+          # is dequantized affinely - the outer n/j/is/shift loop is
+          # structurally identical to Q3_K's own. Verified via the same
+          # scratch-script cross-check Q3_K introduced (16 distinct
+          # scale/min pairs, spanning the full nibble range) before any
+          # Rust was written. Likely completes the real, model-storage
+          # K-quant family (Q2_K through Q6_K) - only Q8_K remains, an
+          # internal computation format rather than a storage one.
+          grep -q "GGUF\] q2_k_test decode_q2_k_ok=true dispatch_q2_k_ok=true" boot.log
           grep -q "GGUF\] q3_k_test decode_q3_k_ok=true dispatch_q3_k_ok=true" boot.log
           grep -q "GGUF\] q4_k_test get_scale_min_k4_ok=true decode_q4_k_ok=true dispatch_q4_k_ok=true" boot.log
           # Confirms real GGUF Q6_K super-block decoding (Fase 58) - a

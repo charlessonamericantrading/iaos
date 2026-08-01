@@ -17,6 +17,7 @@ pub enum GgufGtype {
     Q4_0 = 2,
     Q4_1 = 3,
     Q8_0 = 8,
+    Q2_K = 10,
     Q3_K = 11,
     Q4_K = 12,
     Q5_K = 13,
@@ -31,6 +32,7 @@ impl GgufGtype {
             2 => Ok(GgufGtype::Q4_0),
             3 => Ok(GgufGtype::Q4_1),
             8 => Ok(GgufGtype::Q8_0),
+            10 => Ok(GgufGtype::Q2_K),
             11 => Ok(GgufGtype::Q3_K),
             12 => Ok(GgufGtype::Q4_K),
             13 => Ok(GgufGtype::Q5_K),
@@ -521,6 +523,92 @@ impl GgufModelLoader {
         values
     }
 
+    /// Decodes `bytes` as real GGML/GGUF Q2_K-quantized data - the
+    /// FIFTH K-quant format decoded here, and (after `Q3_K`'s SWAR
+    /// scale trick) a genuinely welcome return to simplicity: no bit-
+    /// packing scheme to derive at all. Each of `scales[16]`'s bytes
+    /// holds BOTH a sub-block's scale (low nibble, `sc & 0xF`) AND its
+    /// min (high nibble, `sc >> 4`) directly, unpacked, one byte per
+    /// sub-block - confirmed against GGML's actual `dequantize_row_
+    /// q2_K`, not assumed from the format's name alone (a wrong
+    /// assumption here would have been an easy one to reach for, given
+    /// `Q3_K`'s scales needed real bit-shuffling to unpack). The
+    /// quantized value itself is a plain 2 bits, used directly and
+    /// unsigned (`0..3`, no recentering, no companion high-bit array
+    /// the way `Q3_K`'s `hmask`/`Q5_K`'s `qh` need) - dequantized
+    /// affinely: `value = q_2bits * (d*scale) - (dmin*min)`, the same
+    /// shape as `Q4_K`'s formula, just with a trivial scale/min lookup
+    /// instead of 6-bit-packed ones.
+    ///
+    /// Struct layout (84 bytes, `QK_K=256`): `scales[16]` (`QK_K/16`,
+    /// one packed byte per sub-block) + `qs[64]` (`QK_K/4`, four 2-bit
+    /// values per byte) + `d`+`dmin` (2+2 bytes, LAST - like `Q3_K`/
+    /// `Q6_K`, unlike `Q4_K`/`Q5_K`'s scale-first layout). The outer
+    /// loop structure (an `n`/`j`/`is`/`shift` interplay, `q` advancing
+    /// 32 bytes per `n`-iteration over 2 iterations, `is` running 0..16
+    /// across both, `shift` cycling `0,2,4,6` and resetting each `n`)
+    /// is structurally identical to `Q3_K`'s own outer loop - the same
+    /// pattern, just without a second `hmask`-style array or bit-mask
+    /// to track alongside it.
+    ///
+    /// Verified computationally rather than by hand-tracing alone,
+    /// continuing the discipline `Q3_K` introduced: a scratch script
+    /// implementing this exact `n`/`j`/`is`/`shift` loop, run against a
+    /// deliberately distinct `scales` byte per sub-block (`scale=i`,
+    /// `min=15-i` for `i` in `0..16`, using the full 0-15 nibble range)
+    /// paired with a uniform `qs` byte (`0xE4`, the same convenient
+    /// four-distinct-2-bit-fields byte `Q6_K`'s own test uses) - the
+    /// 16 resulting dequantized values were confirmed by the script
+    /// before any Rust was written, not derived by hand alone.
+    pub fn decode_q2_k(bytes: &[u8]) -> Vec<f32> {
+        const BLOCK_SIZE: usize = 84; // 16(scales)+64(qs)+2(d)+2(dmin), d/dmin LAST
+        const SCALES_LEN: usize = 16;
+        const QS_LEN: usize = 64;
+
+        let (blocks, _remainder) = bytes.as_chunks::<BLOCK_SIZE>();
+        let mut values = Vec::with_capacity(blocks.len() * 256);
+        for block in blocks {
+            let scales = &block[0..SCALES_LEN];
+            let qs = &block[SCALES_LEN..SCALES_LEN + QS_LEN];
+            let d = f16_to_f32(u16::from_le_bytes([
+                block[SCALES_LEN + QS_LEN],
+                block[SCALES_LEN + QS_LEN + 1],
+            ]));
+            let dmin = f16_to_f32(u16::from_le_bytes([
+                block[SCALES_LEN + QS_LEN + 2],
+                block[SCALES_LEN + QS_LEN + 3],
+            ]));
+
+            let mut is = 0;
+            let mut q_offset = 0;
+            for _n in 0..2 {
+                for j in 0..4 {
+                    let shift = j * 2;
+
+                    let sc = scales[is];
+                    is += 1;
+                    let dl = d * (sc & 0x0F) as f32;
+                    let ml = dmin * (sc >> 4) as f32;
+                    for l in 0..16 {
+                        let q_bits = (qs[q_offset + l] >> shift) & 3;
+                        values.push(dl * q_bits as f32 - ml);
+                    }
+
+                    let sc = scales[is];
+                    is += 1;
+                    let dl = d * (sc & 0x0F) as f32;
+                    let ml = dmin * (sc >> 4) as f32;
+                    for l in 0..16 {
+                        let q_bits = (qs[q_offset + 16 + l] >> shift) & 3;
+                        values.push(dl * q_bits as f32 - ml);
+                    }
+                }
+                q_offset += 32;
+            }
+        }
+        values
+    }
+
     /// Decodes `bytes` as real GGML/GGUF Q3_K-quantized data - the
     /// FOURTH K-quant format decoded here, and structurally the most
     /// intricate yet: 16 sub-blocks of 16 elements each (not 8 sub-
@@ -767,6 +855,7 @@ impl GgufModelLoader {
             GgufGtype::Q8_0 => Ok(Self::decode_q8_0(bytes)),
             GgufGtype::Q4_0 => Ok(Self::decode_q4_0(bytes)),
             GgufGtype::Q4_1 => Ok(Self::decode_q4_1(bytes)),
+            GgufGtype::Q2_K => Ok(Self::decode_q2_k(bytes)),
             GgufGtype::Q3_K => Ok(Self::decode_q3_k(bytes)),
             GgufGtype::Q4_K => Ok(Self::decode_q4_k(bytes)),
             GgufGtype::Q5_K => Ok(Self::decode_q5_k(bytes)),

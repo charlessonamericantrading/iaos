@@ -849,6 +849,63 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 5b-9. Test real GGUF Q2_K super-block quantized tensor decoding
+    // (Fase 61) - the fifth K-quant format, and (after Q3_K's SWAR
+    // scale trick) a welcome return to simplicity: no bit-packing
+    // scheme at all. Each scales[16] byte holds BOTH a sub-block's
+    // scale (low nibble) AND its min (high nibble) directly, unpacked
+    // - confirmed against GGML's real dequantize_row_q2_K rather than
+    // assumed from the format's name. The quantized value is a plain
+    // 2 bits, used directly unsigned (no recentering, no companion
+    // high-bit array), dequantized affinely: value = q_2bits*(d*scale)
+    // - (dmin*min). The outer n/j/is/shift loop structure is identical
+    // to Q3_K's own, just without a second hmask-style array.
+    //
+    // decode_q2_k_ok uses a scratch-script-verified test (continuing
+    // Q3_K's discipline): 16 distinct scale/min pairs (scale=i, min=
+    // 15-i for i=0..16, using the full 0-15 nibble range) paired with
+    // a uniform qs byte (0xE4, the same convenient byte Q6_K's own
+    // test uses) - the 16 resulting values were confirmed by the same
+    // scratch script before any Rust was written.
+    kprintln!("[GGUF INFERENCE] Testing Q2_K super-block quantized tensor decoding...");
+    {
+        let mut scales = [0u8; 16];
+        for (i, s) in scales.iter_mut().enumerate() {
+            *s = (i as u8) | (((15 - i as u8) & 0x0F) << 4);
+        }
+
+        let mut q2k_block: Vec<u8> = Vec::with_capacity(84);
+        q2k_block.extend_from_slice(&scales);
+        q2k_block.extend(core::iter::repeat_n(0xE4u8, 64)); // qs[64]
+        q2k_block.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+        q2k_block.extend_from_slice(&0x3C00u16.to_le_bytes()); // dmin = 1.0, LAST
+
+        let decoded = GgufModelLoader::decode_q2_k(&q2k_block);
+        let expected_blocks: [f32; 16] = [
+            -15.0, -14.0, -11.0, -9.0, -3.0, 0.0, 9.0, 13.0, -7.0, -6.0, 5.0, 7.0, 21.0, 24.0,
+            41.0, 45.0,
+        ];
+        let mut expected_q2k: Vec<f32> = Vec::with_capacity(256);
+        for v in expected_blocks {
+            expected_q2k.extend(core::iter::repeat_n(v, 16));
+        }
+        let decode_q2_k_ok = decoded == expected_q2k;
+
+        let dispatch_q2_k_ok =
+            GgufModelLoader::decode_tensor(&q2k_block, GgufGtype::Q2_K) == Ok(expected_q2k);
+
+        kprintln!(
+            "[GGUF Q2_K] decode_q2_k_ok={} dispatch_q2_k_ok={}",
+            decode_q2_k_ok,
+            dispatch_q2_k_ok
+        );
+        serial_println!(
+            "[GGUF] q2_k_test decode_q2_k_ok={} dispatch_q2_k_ok={}",
+            decode_q2_k_ok,
+            dispatch_q2_k_ok
+        );
+    }
+
     // 5c. Test real GGUF multi-tensor-info support (Fase 51) -
     // GgufTensorInfo::parse has returned "how many bytes this one entry
     // consumed" since Fase 43 specifically so several could be parsed in
