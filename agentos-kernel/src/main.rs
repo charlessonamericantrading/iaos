@@ -123,6 +123,31 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     x86_64::instructions::interrupts::int3();
     kprintln!("[KERNEL INIT] Execution resumed after breakpoint - handler OK.");
 
+    // 2b-2. Test the real DPL=3 syscall gate (Fase 69, the second step of
+    // the ring-3 arc after Fase 68's own GDT/TSS foundation) - fires
+    // `int 0x80` for real right now, from ring-0 (no ring-3 code exists
+    // yet to actually test the privilege-lowering path itself, but
+    // CPL=0 <= DPL=3 is always a permitted invocation, so this already
+    // proves the gate is real and correctly wired, not just that its
+    // DPL bits read back as 3 in isolation). count_delta==1 is genuine
+    // proof the handler ran exactly once, not a coincidental read of an
+    // already-nonzero counter or a silently-swallowed fault.
+    kprintln!("[KERNEL INIT] Testing DPL=3 syscall gate (int 0x80)...");
+    let syscall_int_count_before = interrupts::syscall_int_count();
+    unsafe {
+        core::arch::asm!("int 0x80", options(nomem, nostack));
+    }
+    let syscall_int_count_after = interrupts::syscall_int_count();
+    let syscall_int_count_delta = syscall_int_count_after - syscall_int_count_before;
+    kprintln!(
+        "[KERNEL INIT] Resumed after int 0x80 - count_delta={}",
+        syscall_int_count_delta
+    );
+    serial_println!(
+        "[IDT] syscall_int_test count_delta={}",
+        syscall_int_count_delta
+    );
+
     // 2c. Remap the 8259 PIC & Enable Hardware Interrupts
     // Must happen in this order: the IDT (loaded above) already has real
     // handlers at vectors 32/33, so it's now safe to let the PIC start

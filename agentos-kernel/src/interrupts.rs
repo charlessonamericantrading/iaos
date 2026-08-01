@@ -5,6 +5,7 @@ use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::PrivilegeLevel;
 
 /// Monotonic count of real timer ticks since boot. A simple counter, so a
 /// plain `AtomicU64` (unlike the context-switch code's `saved_rsp` fields)
@@ -49,6 +50,30 @@ impl InterruptIndex {
 /// not even a catchable #GP) the first time this code ran a real read.
 pub const ATA_PRIMARY_IRQ_VECTOR: u8 = PIC_2_OFFSET + 6;
 
+/// The classic Unix/Linux x86 software-interrupt syscall vector - chosen
+/// specifically because it's a genuinely well-known, deliberate convention
+/// (not an arbitrary pick), and sits far from every other vector this
+/// kernel already uses (PIC remapped to 32-47, `ATA_PRIMARY_IRQ_VECTOR`=46 -
+/// see `init_pics`'s own doc). This is the first real piece of the ring-3
+/// transition arc (Fase 68's own `gdt.rs` work) that's actually
+/// INVOCABLE with a lowered privilege level, once ring-3 code exists to
+/// invoke it: the gate itself is registered below with `set_privilege_
+/// level(Ring3)`, unlike every other handler in this file (which default
+/// to DPL=0, meaning ring-3 code attempting `int` on any of THEM would
+/// itself take a #GP - by design, not an oversight, since none of those
+/// are meant to be a controlled entry point into the kernel).
+pub const SYSCALL_INT_VECTOR: u8 = 0x80;
+
+/// Counts real invocations of the DPL=3 syscall gate - lets a self-test
+/// verify the gate genuinely fired (not just "the CPU didn't crash"),
+/// the same reasoning `TIMER_TICKS` already established for verifying
+/// the timer IRQ actually happened.
+static SYSCALL_INT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn syscall_int_count() -> u64 {
+    SYSCALL_INT_COUNT.load(Ordering::Relaxed)
+}
+
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
@@ -66,6 +91,18 @@ lazy_static! {
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt[ATA_PRIMARY_IRQ_VECTOR].set_handler_fn(ata_primary_interrupt_handler);
+        // DPL=3, unlike every entry above (all default to DPL=0) - the
+        // one deliberate exception, since this is meant to eventually be
+        // a real, controlled entry point FROM ring-3 code, not just
+        // another kernel-internal handler. Verified for real below (Fase
+        // 69's own self-test actually executes `int 0x80`, from ring-0
+        // for now since no ring-3 code exists yet - CPL=0 <= DPL=3 is
+        // always permitted, so this doesn't yet prove ring-3 can reach
+        // it, only that the gate itself is correctly wired and DOES
+        // fire), not just read back as a structural claim.
+        idt[SYSCALL_INT_VECTOR]
+            .set_handler_fn(syscall_interrupt_handler)
+            .set_privilege_level(PrivilegeLevel::Ring3);
         idt
     };
 }
@@ -74,7 +111,7 @@ pub fn init_idt() {
     IDT.load();
     kprintln!("[IDT] Native IDT Loaded into CPU Register (LIDT)");
     serial_println!("[IDT] Native IDT Loaded into CPU Register (LIDT)");
-    kprintln!("[IDT] Handlers armed: breakpoint, double-fault(IST), page-fault, GPF, divide-error, invalid-opcode, timer(IRQ0), keyboard(IRQ1), ata-primary(IRQ14)");
+    kprintln!("[IDT] Handlers armed: breakpoint, double-fault(IST), page-fault, GPF, divide-error, invalid-opcode, timer(IRQ0), keyboard(IRQ1), ata-primary(IRQ14), syscall-int(0x80,DPL=3)");
 }
 
 /// Remaps the 8259 PIC to `PIC_1_OFFSET..PIC_2_OFFSET+8` and unmasks IRQs.
@@ -133,6 +170,23 @@ extern "x86-interrupt" fn ata_primary_interrupt_handler(_stack_frame: InterruptS
     unsafe {
         PICS.lock().notify_end_of_interrupt(ATA_PRIMARY_IRQ_VECTOR);
     }
+}
+
+/// Deliberately minimal for Fase 69's own scope: proves the DPL=3 gate
+/// itself is real and genuinely reachable via `int 0x80` (incrementing a
+/// counter a self-test can observe), without yet reading the caller's
+/// general-purpose registers (RAX/RDI/RSI/RDX would need to hold a real
+/// syscall number + args, which `extern "x86-interrupt"` handlers don't
+/// receive as parameters the way a normal calling convention would pass
+/// them - reading them correctly needs either inline asm or a hand-
+/// written naked wrapper, real, separate follow-on work, the same
+/// "don't cram two distinct technical challenges into one Fase"
+/// reasoning this project already applies elsewhere). No `notify_end_
+/// of_interrupt` here, unlike the IRQ handlers above - this is a
+/// *software* interrupt (`int 0x80`), never routed through the 8259
+/// PIC at all, so there's nothing to acknowledge.
+extern "x86-interrupt" fn syscall_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    SYSCALL_INT_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Non-fatal: a debugger/test breakpoint (int3). Execution continues after this.

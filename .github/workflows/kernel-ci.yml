@@ -86,6 +86,23 @@ jobs:
           grep -q "GDT\] ring3_test user_code_selector=0x002b user_data_selector=0x0023 user_code_rpl_ok=true user_data_rpl_ok=true rsp0_nonzero=true" boot.log
           grep -q "\[IDT\] Native IDT Loaded" boot.log
           grep -q "\[EXCEPTION\] Breakpoint" boot.log
+          # Confirms the real DPL=3 syscall gate (Fase 69, the second
+          # step of the ring-3 arc after Fase 68's own GDT/TSS
+          # foundation) - `int 0x80` (the classic Unix/Linux software-
+          # interrupt syscall vector) is fired for real right now, from
+          # ring-0 (no ring-3 code exists yet, but CPL=0 <= DPL=3 is
+          # always a permitted invocation, so this already proves the
+          # gate is real and correctly wired, not just that its DPL
+          # bits read back as 3 in isolation). count_delta=1 is genuine
+          # proof the handler ran exactly once - not a coincidental
+          # read of an already-nonzero counter, and not a silently
+          # swallowed fault. Deliberately minimal: no register-reading
+          # or real syscall dispatch wiring yet (extern "x86-interrupt"
+          # handlers don't receive the caller's general-purpose
+          # registers as parameters the way a normal calling convention
+          # would - that needs inline asm or a hand-written naked
+          # wrapper, real, separate follow-on work).
+          grep -q "IDT\] syscall_int_test count_delta=1" boot.log
           grep -q "\[PIC\] 8259 remapped to vectors 32-47" boot.log
           # Confirms the global frame allocator hands out real, distinct,
           # genuinely writable/readable physical frames (verified=true is
