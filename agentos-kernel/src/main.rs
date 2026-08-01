@@ -207,50 +207,62 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     // 5. Test GGUF Quantized Model Parser & Tensor Matrix Execution - the
-    // header bytes now genuinely round-trip through the FAT12 disk
-    // (create -> read back -> parse) instead of living only as a
-    // compile-time array `parse_header` happened to be handed directly.
+    // header bytes have genuinely round-tripped through the FAT12 disk
+    // since the prior Fase (create -> read back -> parse) instead of
+    // living only as a compile-time array `parse_header` happened to be
+    // handed directly. This Fase extends that same round trip to cover
+    // the actual tensor *weight values* too: the model file on disk is
+    // now the 24-byte header immediately followed by 64 bytes of raw
+    // little-endian f32 data (16 values), and the weights fed to the
+    // matmul come from decoding *those* disk-read bytes
+    // (`GgufModelLoader::decode_f32_le`), not a hardcoded Rust array.
     // `MODEL.BIN` deliberately fits plain 8.3 (avoids incidentally
     // exercising VFAT again here - that's already its own dedicated
-    // self-test). The tensor math afterward is still the same toy
-    // computation on hardcoded weights, unchanged and explicitly out of
-    // scope - loading *real* quantized tensor weights from a real model
-    // file is a separate, much larger undertaking (actual GGUF tensor
-    // formats, memory-mapped weight loading) not attempted here.
+    // self-test). Still a deliberately simplified, honest slice of real
+    // GGUF: no separate tensor-info section (variable-length names,
+    // dimensions, per-tensor offsets - `GgufTensorInfo` models that
+    // shape but nothing constructs one yet) - just the raw weight
+    // values, in the fixed order this toy engine already expected them
+    // in. Loading real *quantized* tensor formats is separate, larger
+    // scope, not attempted here.
     kprintln!("[GGUF INFERENCE] Testing Native GGUF Header Parser & Tensor Weights...");
-    let sample_gguf_bytes: [u8; 24] = [
+    const GGUF_HEADER: [u8; 24] = [
         0x47, 0x47, 0x55, 0x46, // "GGUF"
         0x03, 0x00, 0x00, 0x00, // Version 3
         0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 16 Tensors
         0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 8 KV Pairs
     ];
+    const GGUF_WEIGHTS: [f32; 16] = [
+        0.5, -0.2, 0.8, 0.1, 0.3, 0.9, -0.4, 0.6, -0.1, 0.4, 0.7, 0.2, 0.6, -0.5, 0.2, 0.8,
+    ];
+    let mut model_file_bytes = alloc::vec::Vec::with_capacity(24 + 64);
+    model_file_bytes.extend_from_slice(&GGUF_HEADER);
+    for w in GGUF_WEIGHTS {
+        model_file_bytes.extend_from_slice(&w.to_le_bytes());
+    }
 
     match shell::find_fat_partition() {
         Ok(partition) => match fat12::read_bpb(&partition) {
             Ok(mut fs) => {
-                let write_ok = fs.create_file("MODEL.BIN", &sample_gguf_bytes).is_ok();
+                let write_ok = fs.create_file("MODEL.BIN", &model_file_bytes).is_ok();
                 let read_back = fs.read_file("MODEL.BIN");
-                let round_trip_ok = read_back.as_deref() == Ok(sample_gguf_bytes.as_slice());
+                let round_trip_ok = read_back.as_deref() == Ok(model_file_bytes.as_slice());
                 let cleanup_ok = fs.delete_file("MODEL.BIN").is_ok();
-                kprintln!(
-                    "[GGUF LOADER] disk round-trip: write_ok={} round_trip_ok={} cleanup_ok={}",
-                    write_ok,
-                    round_trip_ok,
-                    cleanup_ok
-                );
-                serial_println!(
-                    "[GGUF] disk_load_test write_ok={} round_trip_ok={} cleanup_ok={}",
-                    write_ok,
-                    round_trip_ok,
-                    cleanup_ok
-                );
 
-                if let Ok(header_bytes) = read_back {
-                    if let Ok(loader) = GgufModelLoader::parse_header(&header_bytes) {
-                        let weights: [f32; 16] = [
-                            0.5, -0.2, 0.8, 0.1, 0.3, 0.9, -0.4, 0.6, -0.1, 0.4, 0.7, 0.2, 0.6,
-                            -0.5, 0.2, 0.8,
-                        ];
+                // Decoding the disk-read weight bytes back into f32
+                // exactly reproduces GGUF_WEIGHTS - the round trip
+                // (to_le_bytes -> disk -> from_le_bytes) is lossless, no
+                // arithmetic involved, so bit-for-bit equality is the
+                // correct check here, not a tolerance comparison.
+                let weights_decoded_ok = read_back
+                    .as_deref()
+                    .map(|b| GgufModelLoader::decode_f32_le(&b[24..]) == GGUF_WEIGHTS)
+                    .unwrap_or(false);
+
+                let mut tensor_output_ok = false;
+                if let Ok(full_bytes) = &read_back {
+                    if let Ok(loader) = GgufModelLoader::parse_header(&full_bytes[0..24]) {
+                        let weights = GgufModelLoader::decode_f32_le(&full_bytes[24..]);
                         let inputs: [f32; 4] = [1.0, 2.0, 0.5, 3.0];
                         let mut outputs: [f32; 4] = [0.0; 4];
 
@@ -263,8 +275,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                             outputs[2],
                             outputs[3]
                         );
+                        const EXPECTED_OUTPUTS: [f32; 4] = [0.8, 3.7, 1.65, 2.1];
+                        tensor_output_ok = outputs
+                            .iter()
+                            .zip(EXPECTED_OUTPUTS.iter())
+                            .all(|(a, b)| (a - b).abs() < 0.001);
                     }
                 }
+
+                kprintln!(
+                    "[GGUF LOADER] disk round-trip: write_ok={} round_trip_ok={} weights_decoded_ok={} tensor_output_ok={} cleanup_ok={}",
+                    write_ok, round_trip_ok, weights_decoded_ok, tensor_output_ok, cleanup_ok
+                );
+                serial_println!(
+                    "[GGUF] disk_load_test write_ok={} round_trip_ok={} weights_decoded_ok={} tensor_output_ok={} cleanup_ok={}",
+                    write_ok, round_trip_ok, weights_decoded_ok, tensor_output_ok, cleanup_ok
+                );
             }
             Err(e) => {
                 kprintln!("[GGUF LOADER] disk round-trip: not FAT12 ({})", e);

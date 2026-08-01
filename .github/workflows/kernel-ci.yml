@@ -101,9 +101,16 @@ jobs:
           # and round_trip_ok=true means those bytes matched byte-for-byte -
           # not just that parse_header ran, which it always could on a
           # hardcoded array regardless of whether disk I/O worked at all.
-          # The tensor math afterward is unchanged (still the same hardcoded
-          # toy weights), so this line alone is the meaningful new check.
-          grep -q "GGUF\] disk_load_test write_ok=true round_trip_ok=true cleanup_ok=true" boot.log
+          # Extended (Fase 42) to cover the tensor *weight values* too: the
+          # same file now also carries 64 bytes of raw little-endian f32
+          # data right after the header. weights_decoded_ok=true means
+          # decode_f32_le reproduced the exact original values from those
+          # disk-read bytes (a lossless byte round trip - safe to assert
+          # bit-for-bit, not a hypothetical arithmetic-precision concern).
+          # tensor_output_ok=true means running the matmul on those disk-
+          # decoded weights (not a hardcoded array anymore) produces the
+          # same known-correct result the hardcoded version always did.
+          grep -q "GGUF\] disk_load_test write_ok=true round_trip_ok=true weights_decoded_ok=true tensor_output_ok=true cleanup_ok=true" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -

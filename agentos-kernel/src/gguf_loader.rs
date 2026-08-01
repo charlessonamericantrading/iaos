@@ -1,6 +1,7 @@
 use crate::kprintln;
 use crate::serial_println;
 use crate::tensor_engine::TensorEngine;
+use alloc::vec::Vec;
 
 pub const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in Little Endian
 
@@ -73,6 +74,26 @@ impl GgufModelLoader {
             context_length: 4096,
             embedding_length: 2048,
         })
+    }
+
+    /// Decodes a byte buffer into little-endian `f32` values - the
+    /// simplest possible "tensor data" format this kernel understands.
+    /// Real GGUF tensor data sits behind a whole separate tensor-info
+    /// section (variable-length names, dimensions, quantization type,
+    /// per-tensor byte offsets - `GgufTensorInfo` above models that
+    /// shape but nothing constructs one yet); this is deliberately just
+    /// the raw weight values themselves; a real next step, not this
+    /// one. Any trailing bytes that don't form a complete 4-byte group
+    /// are silently dropped rather than erroring - the caller already
+    /// knows how many values it expects from context (`in_dim *
+    /// out_dim`), same as the rest of this toy engine.
+    pub fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
+            .collect()
     }
 
     /// Perform forward inference using loaded GGUF tensor weights
