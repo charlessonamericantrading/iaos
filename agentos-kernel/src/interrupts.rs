@@ -94,6 +94,22 @@ pub const SYSCALL_INT_VECTOR: u8 = 0x80;
 /// magic syscall number.
 pub const RING3_EXIT_INT_VECTOR: u8 = 0x81;
 
+/// A THIRD, dedicated DPL=3 vector (Fase 81) - the voluntary exit signal
+/// for a ring-3 "task" entered via `ring3::run_ring3_switchto_bootstrap_
+/// test`'s new bootstrap mechanism (`prepare_ring3_initial_stack` +
+/// `switch_to`), which is itself structurally different from BOTH the
+/// synchronous `enter_ring3`/`ring3_exit_entry_asm` pair above: that pair
+/// resumes an ordinary Rust call's own caller (`enter_ring3`'s own
+/// convention, including a `pushfq`/`popfq` pair since `enter_ring3`
+/// itself does the `pushfq`); this one resumes whoever called the
+/// cooperative-scheduler's own `switch_to` primitive, using ITS pop
+/// convention (r15/r14/r13/r12/rbx/rbp, no saved RFLAGS - `switch_to`
+/// never pushes any) instead. Reusing 0x81 for both would mean one
+/// handler branching on which convention applies - exactly the
+/// complexity RING3_EXIT_INT_VECTOR's own doc above already argued
+/// against once; the same reasoning applies again here.
+pub const RING3_TASK_EXIT_INT_VECTOR: u8 = 0x82;
+
 /// Counts real invocations of the DPL=3 syscall gate - lets a self-test
 /// verify the gate genuinely fired (not just "the CPU didn't crash"),
 /// the same reasoning `TIMER_TICKS` already established for verifying
@@ -142,6 +158,16 @@ lazy_static! {
             idt[RING3_EXIT_INT_VECTOR]
                 .set_handler_addr(VirtAddr::new(
                     crate::ring3::ring3_exit_entry_asm as *const () as u64,
+                ))
+                .set_privilege_level(PrivilegeLevel::Ring3);
+        }
+        // Same reasoning (DPL=3, raw set_handler_addr) - see
+        // RING3_TASK_EXIT_INT_VECTOR's own doc for why this is a THIRD,
+        // dedicated vector rather than folded into either handler above.
+        unsafe {
+            idt[RING3_TASK_EXIT_INT_VECTOR]
+                .set_handler_addr(VirtAddr::new(
+                    crate::ring3::ring3_task_exit_entry_asm as *const () as u64,
                 ))
                 .set_privilege_level(PrivilegeLevel::Ring3);
         }

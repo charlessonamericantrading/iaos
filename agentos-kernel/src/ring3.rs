@@ -753,3 +753,238 @@ pub fn run_ring3_syscall_test() -> ! {
         );
     }
 }
+
+// ---- Fase 81: a ring-3 "task" entered via the SAME switch_to/prepare_
+// initial_stack bootstrap the ring-0 cooperative/preemptive schedulers
+// already use, instead of enter_ring3's direct, synchronous iretq ----
+//
+// Every ring-3 mechanism above (run_ring3_test, run_ring3_syscall_test,
+// enter_ring3/run_ring3_exit_test) enters ring-3 via a plain Rust function
+// call that builds an iretq frame from its OWN arguments and executes it
+// directly - simple, and correct for "call into ring-3 and wait for it to
+// finish", but NOT the shape a real scheduler needs: `scheduler::
+// preemptive::tick`'s own doc explains why a tick landing on ring-3 code
+// currently has to be entirely invisible to it (Fase 80) - `switch_to`
+// cannot safely swap out an arbitrary interrupted ring-3 context the way
+// it does between two ring-0 tasks, because a ring-0 task's "resume
+// point" is always a nested `switch_to` call frame buried inside some
+// earlier invocation of `timer_interrupt_handler`, not an arbitrary
+// instruction address at an arbitrary privilege level.
+//
+// This Fase does NOT yet solve that (genuine mid-flight preemption of a
+// running ring-3 program is real, separate follow-on work - seeing
+// EXACTLY why is the whole point of building this first). What it DOES
+// prove: a ring-3 "task" can be entered the same way a ring-0 task is -
+// via `switch_to` landing on a freshly prepared stack - rather than via
+// enter_ring3's own bespoke calling convention. That's the necessary
+// foundation: only a task that ENTERS this way could ever be resumed via
+// `switch_to` from somewhere other than its own original caller later.
+//
+// The mechanism, mirroring `prepare_initial_stack` closely:
+// `prepare_ring3_initial_stack` lays out a fresh KERNEL-side stack so
+// `switch_to`'s own `ret` doesn't land on an ordinary `entry` function
+// (which would run at ring-0, the existing ring-0 task shape) but on
+// `ring3_entry_trampoline` instead - a naked function whose ENTIRE body
+// is a bare `iretq`, correct because the SAME fake stack also has a
+// complete 5-field iretq frame (RIP/CS/RFLAGS/RSP/SS) sitting exactly
+// where RSP points the instant the trampoline is reached (right after
+// `ret` pops the trampoline's own address). No register loads needed -
+// the stack layout alone does all the work.
+//
+// The return trip needs its own new mechanism too, NOT `enter_ring3`'s:
+// see `ring3_task_exit_entry_asm`'s own doc, plus RING3_TASK_EXIT_INT_
+// VECTOR's doc in interrupts.rs, for exactly why a third IDT vector
+// (0x82) rather than reusing 0x81.
+
+static mut RING3_TASK_CALLER_RSP: u64 = 0;
+static mut RING3_TASK_EXIT_CODE: u64 = 0;
+
+/// The address `prepare_ring3_initial_stack` points `switch_to`'s own
+/// `ret` at. By the time this runs, RSP already points exactly at the
+/// 5-field `iretq` frame that function built (RIP, CS, RFLAGS, RSP, SS,
+/// in that order, low to high) - so the entire body really is just
+/// `iretq`, with no register loads first.
+#[unsafe(naked)]
+extern "C" fn ring3_entry_trampoline() {
+    naked_asm!("iretq");
+}
+
+/// Lays out a fresh KERNEL-side stack so the FIRST `switch_to` into it
+/// enters ring-3 directly via `ring3_entry_trampoline`'s `iretq`, instead
+/// of "returning" into an ordinary ring-0 `entry` fn the way
+/// `prepare_initial_stack` does. Same 7-quadword switch_to shape
+/// (6 zeroed callee-saved slots + a return address) as that function,
+/// with 5 MORE quadwords above it holding the real iretq frame fields -
+/// unlike the 6 zeroed slots (whose exact sub-order never mattered, since
+/// they're all zero anyway), these 5 are all genuinely different values
+/// and MUST land at the exact offsets `iretq` itself expects, so they're
+/// written in the exact reverse order of how `iretq` consumes them (SS
+/// highest, RIP lowest of the five) - verified by hand against
+/// `switch_to`'s own pop sequence before writing this, not assumed.
+///
+/// # Safety
+/// Same preconditions as `enter_ring3`: `user_rip` must point at real,
+/// executable, user-accessible code; `user_rsp` a valid ring-3 stack
+/// pointer; `user_cs`/`user_ss` genuine RPL=3 selectors.
+pub(crate) unsafe fn prepare_ring3_initial_stack(
+    kernel_stack_top: *mut u8,
+    user_rip: u64,
+    user_cs: u64,
+    user_ss: u64,
+    user_rsp: u64,
+    user_rflags: u64,
+) -> u64 {
+    let top = ((kernel_stack_top as u64) & !0xf) - 8;
+    let mut sp = top;
+
+    sp -= 8;
+    *(sp as *mut u64) = user_ss;
+    sp -= 8;
+    *(sp as *mut u64) = user_rsp;
+    sp -= 8;
+    *(sp as *mut u64) = user_rflags;
+    sp -= 8;
+    *(sp as *mut u64) = user_cs;
+    sp -= 8;
+    *(sp as *mut u64) = user_rip;
+
+    sp -= 8;
+    *(sp as *mut u64) = ring3_entry_trampoline as *const () as u64;
+
+    for _ in 0..6 {
+        sp -= 8;
+        *(sp as *mut u64) = 0;
+    }
+
+    sp
+}
+
+/// Entry point for vector 0x82 (`RING3_TASK_EXIT_INT_VECTOR`) - the
+/// voluntary exit signal for a ring-3 task entered via
+/// `prepare_ring3_initial_stack` + `switch_to`. Resumes whoever called
+/// `switch_to` to enter this task, using `switch_to`'s OWN pop convention
+/// (r15/r14/r13/r12/rbx/rbp) rather than `enter_ring3`'s.
+///
+/// `sti` immediately before `ret`, NOT a saved-RFLAGS `popfq` like
+/// `ring3_exit_entry_asm` uses: `switch_to`'s own callers never had their
+/// RFLAGS captured in the first place (`switch_to` itself doesn't push
+/// them), so there's nothing for a `popfq` here to restore FROM. But the
+/// underlying problem `ring3_exit_entry_asm`'s own doc describes is
+/// identical: every IDT entry defaults to a 64-bit INTERRUPT gate, which
+/// unconditionally clears `RFLAGS.IF` on entry - without re-enabling it
+/// somehow, interrupts would stay off forever after this ran, the exact
+/// silent-hang failure mode Fase 73 hit for real. `sti` fixes it
+/// directly since `switch_to`'s caller had IF=1 to begin with (it was
+/// ordinary, non-interrupt kernel code). x86's documented one-instruction
+/// "sti shadow" (the instruction immediately after `sti` always executes
+/// before any interrupt can be taken) means the final `ret` itself is
+/// still guaranteed to run first - no window where a real timer tick
+/// could land mid-restore.
+#[unsafe(naked)]
+pub(crate) extern "C" fn ring3_task_exit_entry_asm() {
+    naked_asm!(
+        "mov [rip + {exit_code}], rax",
+        "mov rsp, [rip + {caller_rsp}]",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "sti",
+        "ret",
+        exit_code = sym RING3_TASK_EXIT_CODE,
+        caller_rsp = sym RING3_TASK_CALLER_RSP,
+    );
+}
+
+/// Proves the new switch_to-bootstrap mechanism works end to end: enter
+/// ring-3 via `prepare_ring3_initial_stack` + `switch_to` (NOT
+/// `enter_ring3`), run a real (small) computation - not just an
+/// immediate exit - then exit voluntarily via the new `int 0x82` vector
+/// and resume right here, exactly as if `switch_to` itself had returned
+/// normally.
+///
+/// The ring-3 "program" computes 5+4+3+2+1=15 in `eax` via a genuine loop
+/// before exiting - deliberately more than a trivial immediate-exit
+/// program, so the returned exit code is real proof the CPU executed
+/// actual ring-3 instructions correctly through this NEW bootstrap path
+/// (fresh kernel stack -> trampoline -> iretq -> real execution -> int
+/// 0x82 -> ring3_task_exit_entry_asm's own switch_to-style return), not
+/// just that some incidental value came back.
+///
+///   mov ecx, 5    -> B9 05 00 00 00
+///   mov eax, 0    -> B8 00 00 00 00
+///   add eax, ecx  -> 01 C8              (loop target, offset 10)
+///   dec ecx       -> FF C9
+///   jnz <loop>    -> 75 FA (rel8 = -6, back to `add eax, ecx`)
+///   int 0x82      -> CD 82 (RING3_TASK_EXIT_INT_VECTOR)
+pub fn run_ring3_switchto_bootstrap_test() -> u64 {
+    let info = gdt::ring3_info();
+    let user_cs = info.user_code_selector as u64;
+    let user_ss = info.user_data_selector as u64;
+
+    let code_addr = USER_TEST_PAGE_ADDR;
+    let stack_top = USER_TEST_PAGE_ADDR + 4096;
+
+    const EXPECTED_EXIT_CODE: u64 = 15;
+    const PROGRAM: [u8; 18] = [
+        0xB9, 0x05, 0x00, 0x00, 0x00, // mov ecx, 5
+        0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0
+        0x01, 0xC8, // add eax, ecx
+        0xFF, 0xC9, // dec ecx
+        0x75, 0xFA, // jnz -6 (back to `add eax, ecx`)
+        0xCD, 0x82, // int 0x82
+    ];
+    unsafe {
+        core::ptr::copy_nonoverlapping(PROGRAM.as_ptr(), code_addr as *mut u8, PROGRAM.len());
+    }
+
+    kprintln!("[RING3] Attempting a ring-3 task entered via the switch_to/prepare_initial_stack bootstrap (not enter_ring3) for the first time...");
+    serial_println!(
+        "[RING3] ring3_switchto_bootstrap_test entering rip={:#x} cs={:#06x} ss={:#06x} rsp={:#x} rflags={:#x}",
+        code_addr,
+        user_cs,
+        user_ss,
+        stack_top,
+        RING3_TEST_RFLAGS
+    );
+
+    let mut kernel_stack = alloc::boxed::Box::new([0u8; 16 * 1024]);
+    let kernel_stack_top = unsafe { kernel_stack.as_mut_ptr().add(16 * 1024) };
+    let new_rsp = unsafe {
+        prepare_ring3_initial_stack(
+            kernel_stack_top,
+            code_addr,
+            user_cs,
+            user_ss,
+            stack_top,
+            RING3_TEST_RFLAGS,
+        )
+    };
+
+    unsafe {
+        crate::scheduler::context_switch::switch_to(
+            core::ptr::addr_of_mut!(RING3_TASK_CALLER_RSP),
+            new_rsp,
+        );
+    }
+    // Resumes HERE once the ring-3 program voluntarily exits via int 0x82
+    // - ring3_task_exit_entry_asm's own switch_to-style ret lands right
+    // after this call, exactly as if switch_to itself had returned.
+
+    let exit_code = unsafe { core::ptr::addr_of!(RING3_TASK_EXIT_CODE).read() };
+    drop(kernel_stack);
+
+    kprintln!(
+        "[RING3] Back in ring-0 via the NEW switch_to-bootstrap exit path - exit_code={} (expected {})",
+        exit_code,
+        EXPECTED_EXIT_CODE
+    );
+    serial_println!(
+        "[RING3] ring3_switchto_bootstrap_test exit_code={}",
+        exit_code
+    );
+
+    exit_code
+}

@@ -2878,6 +2878,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ring3_concurrent_code
     );
 
+    // Fase 81: proves a ring-3 "task" can be entered via the SAME
+    // switch_to/prepare_initial_stack bootstrap the ring-0 schedulers use,
+    // instead of enter_ring3's own bespoke synchronous call/return - the
+    // necessary foundation genuine mid-flight ring-3 preemption (real
+    // separate follow-on work) will build on. Spawns no PCB entries of its
+    // own (unlike Fase 80's test), so - unlike that one - there's no
+    // hardcoded-PID ordering constraint on where this call goes.
+    kprintln!(
+        "[KERNEL INIT] Testing a ring-3 task entered via the switch_to bootstrap (not enter_ring3)..."
+    );
+    let ring3_switchto_code = ring3::run_ring3_switchto_bootstrap_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - switch_to-bootstrap test returned exit_code={}",
+        ring3_switchto_code
+    );
+
     kprintln!("==================================================");
     kprintln!("  [SUCCESS] AgentOS Native Kernel Boot Sequence Complete ");
     kprintln!("  [SHELL] AgentOS Native Console Ready. Type commands: ");

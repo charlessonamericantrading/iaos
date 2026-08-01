@@ -489,6 +489,19 @@ jobs:
           grep -q "RING3\] ring3_concurrent_preemption_test exit_code=88" boot.log
           grep -q "budget_untouched_during_ring3=true" boot.log
           grep -q "tasks_advanced_after=true" boot.log
+          # Fase 81: a ring-3 "task" entered via the SAME switch_to/
+          # prepare_initial_stack bootstrap the ring-0 schedulers already
+          # use (a fresh kernel stack + a trampoline whose entire body is
+          # `iretq`), instead of enter_ring3's own bespoke synchronous
+          # call/return - the necessary foundation genuine mid-flight
+          # ring-3 preemption (real, separate follow-on work) will build
+          # on. The ring-3 program computes 5+4+3+2+1=15 via a real loop
+          # before exiting through a THIRD, dedicated vector (0x82,
+          # deliberately separate from 0x80/0x81 - see interrupts.rs's
+          # own doc) - exit_code=15 is real proof of correct execution
+          # through this new path end to end, not just that some
+          # incidental value came back.
+          grep -q "RING3\] ring3_switchto_bootstrap_test exit_code=15" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -
