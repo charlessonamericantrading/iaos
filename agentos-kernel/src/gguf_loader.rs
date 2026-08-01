@@ -81,6 +81,31 @@ impl GgufTensorInfo {
             fields_start + 16,
         ))
     }
+
+    /// Parses `count` consecutive tensor-info entries in sequence,
+    /// starting at `bytes`' first byte - the real multi-tensor case every
+    /// actual GGUF file has (a model with any real number of tensors, not
+    /// just one), using `parse`'s own "bytes consumed" return value to
+    /// advance through the buffer each call rather than assuming a fixed
+    /// entry size (entries are variable-length: each has its own name).
+    /// Returns the parsed entries alongside the TOTAL bytes consumed
+    /// across all of them, so a caller knows exactly where the tensor-
+    /// info section ends and tensor data begins - `parse` already
+    /// returned this same kind of value per-entry specifically so this
+    /// case could be built on top of it without changing `parse` itself.
+    pub fn parse_many(bytes: &[u8], count: usize) -> Result<(Vec<Self>, usize), &'static str> {
+        let mut infos = Vec::with_capacity(count);
+        let mut offset = 0;
+        for _ in 0..count {
+            let remaining = bytes
+                .get(offset..)
+                .ok_or("GGUF: tensor-info offset past end of buffer")?;
+            let (info, consumed) = GgufTensorInfo::parse(remaining)?;
+            offset += consumed;
+            infos.push(info);
+        }
+        Ok((infos, offset))
+    }
 }
 
 /// Converts an IEEE 754 half-precision (binary16) bit pattern to `f32` -

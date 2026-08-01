@@ -405,6 +405,114 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 5c. Test real GGUF multi-tensor-info support (Fase 51) -
+    // GgufTensorInfo::parse has returned "how many bytes this one entry
+    // consumed" since Fase 43 specifically so several could be parsed in
+    // sequence, but nothing before this Fase ever actually looped over
+    // more than one - every prior test constructed exactly one tensor.
+    // parse_many builds on parse's existing return value without
+    // changing it at all. Deliberately disk-independent, same reasoning
+    // as the Q8_0 test above - this Fase is scoped to the parsing logic
+    // itself, not disk I/O (already proven in Fase 41-43).
+    //
+    // Constructs a buffer with TWO tensor-info entries back-to-back
+    // ("weights" F32, "scale_bias" Q8_0 - deliberately different gtypes,
+    // not just a duplicate) followed by both tensors' real data, offsets
+    // computed the same way the disk-load test's own MODEL.BIN
+    // construction does. parse_many_ok checks both entries' name/
+    // dimensions/gtype/offset are exactly right AND that the total
+    // consumed byte count lands exactly at the tensor-info section's own
+    // end - proof this isn't just "found 2 somethings" but that each
+    // entry's own length was tracked correctly across the whole
+    // sequence, not just the first one. tensor1/2_decode_ok then feed
+    // each parsed entry's OWN gtype into decode_tensor (Fase 50) - a
+    // genuinely different claim than Fase 50's own dispatch test (which
+    // used hand-built structs): this proves parse_many's real output is
+    // directly usable by decode_tensor, not just structurally similar to
+    // what it expects.
+    kprintln!("[GGUF INFERENCE] Testing GGUF multi-tensor-info support...");
+    {
+        use gguf_loader::{GgufModelLoader, GgufTensorInfo};
+
+        const NAME1: &str = "weights";
+        const NAME2: &str = "scale_bias";
+        const TENSOR1_DATA: [f32; 4] = [1.0, -2.0, 3.5, 0.0];
+
+        let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        buf.extend_from_slice(&(NAME1.len() as u32).to_le_bytes());
+        buf.extend_from_slice(NAME1.as_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes()); // dim0
+        buf.extend_from_slice(&2u32.to_le_bytes()); // dim1
+        buf.extend_from_slice(&(GgufGtype::F32 as u32).to_le_bytes());
+        let offset1_pos = buf.len();
+        buf.extend_from_slice(&0u32.to_le_bytes()); // offset placeholder
+
+        buf.extend_from_slice(&(NAME2.len() as u32).to_le_bytes());
+        buf.extend_from_slice(NAME2.as_bytes());
+        buf.extend_from_slice(&32u32.to_le_bytes()); // dim0
+        buf.extend_from_slice(&1u32.to_le_bytes()); // dim1
+        buf.extend_from_slice(&(GgufGtype::Q8_0 as u32).to_le_bytes());
+        let offset2_pos = buf.len();
+        buf.extend_from_slice(&0u32.to_le_bytes()); // offset placeholder
+
+        let tensor_info_section_len = buf.len();
+        buf[offset1_pos..offset1_pos + 4]
+            .copy_from_slice(&(tensor_info_section_len as u32).to_le_bytes());
+
+        for v in TENSOR1_DATA {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let tensor2_data_offset = buf.len();
+        buf[offset2_pos..offset2_pos + 4]
+            .copy_from_slice(&(tensor2_data_offset as u32).to_le_bytes());
+
+        buf.extend_from_slice(&0x3800u16.to_le_bytes()); // f16 scale = 0.5
+        let qs2: [i8; 32] = core::array::from_fn(|i| (i as i8) - 16);
+        for &v in &qs2 {
+            buf.push(v as u8);
+        }
+
+        let parse_many_result = GgufTensorInfo::parse_many(&buf, 2);
+        let parse_many_ok = matches!(&parse_many_result, Ok((infos, consumed))
+            if infos.len() == 2
+            && infos[0].name == NAME1 && infos[0].dimensions == [2, 2]
+            && infos[0].gtype == GgufGtype::F32 && infos[0].offset == tensor_info_section_len
+            && infos[1].name == NAME2 && infos[1].dimensions == [32, 1]
+            && infos[1].gtype == GgufGtype::Q8_0 && infos[1].offset == tensor2_data_offset
+            && *consumed == tensor_info_section_len);
+        let infos = parse_many_result.map(|(i, _)| i).unwrap_or_default();
+
+        let tensor1_decode_ok = infos
+            .first()
+            .map(|info| {
+                GgufModelLoader::decode_tensor(&buf[info.offset..info.offset + 16], info.gtype)
+                    == Ok(TENSOR1_DATA.to_vec())
+            })
+            .unwrap_or(false);
+        let expected2: alloc::vec::Vec<f32> = qs2.iter().map(|&v| v as f32 * 0.5).collect();
+        let tensor2_decode_ok = infos
+            .get(1)
+            .map(|info| {
+                GgufModelLoader::decode_tensor(&buf[info.offset..info.offset + 34], info.gtype)
+                    == Ok(expected2)
+            })
+            .unwrap_or(false);
+
+        kprintln!(
+            "[GGUF MULTI-TENSOR] parse_many_ok={} tensor1_decode_ok={} tensor2_decode_ok={}",
+            parse_many_ok,
+            tensor1_decode_ok,
+            tensor2_decode_ok
+        );
+        serial_println!(
+            "[GGUF] multi_tensor_test parse_many_ok={} tensor1_decode_ok={} tensor2_decode_ok={}",
+            parse_many_ok,
+            tensor1_decode_ok,
+            tensor2_decode_ok
+        );
+    }
+
     // 6. Test Native VirtIO-Net & TCP/IPv4 Network Stack
     kprintln!("[NET INIT] Initializing VirtIO-Net Hardware Adapter & TCP/IP Stack...");
     NativeNetworkStack::send_ipv4_packet([192, 168, 1, 1], b"AgentOS Kernel Online");

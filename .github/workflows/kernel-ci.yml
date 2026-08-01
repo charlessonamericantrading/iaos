@@ -128,6 +128,20 @@ jobs:
           # silently assuming everything is F32, the real gap this Fase
           # closes.
           grep -q "GGUF\] q8_0_test f16_vectors_ok=true q8_0_decode_ok=true dispatch_f32_ok=true dispatch_q8_0_ok=true dispatch_unimplemented_ok=true" boot.log
+          # Confirms real GGUF multi-tensor-info support (Fase 51) -
+          # GgufTensorInfo::parse_many, generalizing tensor-info parsing
+          # to any real number of tensors instead of just one.
+          # parse_many_ok checks both constructed entries' name/
+          # dimensions/gtype/offset are exactly right AND that the total
+          # bytes consumed lands exactly at the tensor-info section's own
+          # end - proof each entry's own length was tracked correctly
+          # across the whole sequence, not just the first one.
+          # tensor1/2_decode_ok feed each parsed entry's OWN gtype
+          # (deliberately different: F32 and Q8_0) into decode_tensor
+          # (Fase 50) - proof parse_many's real output is directly usable
+          # by decode_tensor, not just structurally similar to what it
+          # expects.
+          grep -q "GGUF\] multi_tensor_test parse_many_ok=true tensor1_decode_ok=true tensor2_decode_ok=true" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -
