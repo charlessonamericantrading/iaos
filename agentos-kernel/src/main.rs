@@ -2926,6 +2926,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ring3_full_preempt_hit
     );
 
+    // Fase 86: the real, larger step named as the necessary follow-on
+    // above - actually running a DIFFERENT ring-3 program in the gap a
+    // preempted one leaves behind, not just resuming the SAME one. See
+    // scheduler::ring3_mt's own module doc for the round-robin
+    // mechanism and ring3::run_ring3_mt_test's own doc for the full
+    // two-task test design.
+    kprintln!("[KERNEL INIT] Testing genuine multi-task ring-3 scheduling (two DIFFERENT programs alternating via the timer)...");
+    let (ring3_mt_task0, ring3_mt_task1, ring3_mt_switches) = ring3::run_ring3_mt_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - multi-task test returned task0_checksum={:#x} task1_last_eax={:#x} switch_count={}",
+        ring3_mt_task0,
+        ring3_mt_task1,
+        ring3_mt_switches
+    );
+
     kprintln!("==================================================");
     kprintln!("  [SUCCESS] AgentOS Native Kernel Boot Sequence Complete ");
     kprintln!("  [SHELL] AgentOS Native Console Ready. Type commands: ");

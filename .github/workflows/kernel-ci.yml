@@ -559,6 +559,25 @@ jobs:
           # "run something else while preempted" yet) - see ring3.rs's
           # own module doc for the full mechanism.
           grep -q "RING3\] ring3_full_preempt_test exit_code=0x11111111 intercepted=true" boot.log
+          # Fase 86: the real, larger step named as follow-on work in
+          # Fase 85's own doc - genuine multi-task ring-3 scheduling via
+          # the timer, actually running a DIFFERENT ring-3 program in
+          # the gap a preempted one leaves behind, not just resuming the
+          # SAME one. Task 0 (entered normally via enter_ring3/int 0x81,
+          # exactly Fase 85's own test program with a 0x1... register
+          # pattern) and task 1 (entered ONLY by scheduler::ring3_mt's
+          # own round-robin switching, cold, via a fresh bootstrap
+          # context - a 0x2... pattern, a much smaller loop, then an
+          # infinite non-destructive spin since it never exits on its
+          # own) alternate on every real timer tick. task0_checksum and
+          # task1_last_eax are both fixed, deterministic constants (each
+          # task's own 5-register XOR checksum) - only reproducible if
+          # BOTH programs genuinely ran to their own correct state
+          # across real, involuntary interruptions; switch_count (how
+          # many real switches actually happened) is deliberately NOT
+          # pinned here, the same reasoning already established for
+          # every other real-tick-count value in this file.
+          grep -q "RING3\] ring3_mt_test task0_checksum=0x10000004 task1_last_eax=0x20000004" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -

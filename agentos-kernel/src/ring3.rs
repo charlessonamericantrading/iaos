@@ -1428,3 +1428,211 @@ pub fn run_ring3_full_preempt_test() -> (u64, bool) {
 
     (exit_code, intercepted)
 }
+
+/// Builds a fresh, never-yet-run ring-3 task's own 160-byte context
+/// buffer, in the EXACT shape `timer_interrupt_entry_asm`'s own epilogue
+/// expects to resume from after `scheduler::ring3_mt::tick` hands it
+/// back (see that function's own doc, and `interrupts.rs`'s naked stub,
+/// for the full byte layout): 15 zeroed GPR slots (their values don't
+/// matter before the task's own first instruction overwrites them, the
+/// same reasoning `prepare_ring3_initial_stack`'s own 6 zeroed
+/// callee-saved slots already rely on) followed by a real 5-field
+/// `iretq` frame - RIP/CS/RFLAGS/RSP/SS, in the exact field order
+/// `iretq` consumes them (the same offsets `ring3_preempt`'s own
+/// 160-byte snapshot already uses: 0..120 = 15 GPRs, 120=RIP, 128=CS,
+/// 136=RFLAGS, 144=RSP, 152=SS).
+///
+/// Unlike Fase 81's own `prepare_ring3_initial_stack` (built for
+/// `switch_to`'s `ret`-based, 6-callee-saved-register convention, which
+/// needs a manufactured "return-to-trampoline" address as an
+/// indirection step before it can reach a real `iretq`), this needs NO
+/// trampoline at all: the timer stub's own epilogue reaches `iretq`
+/// DIRECTLY after popping the 15 (here: zeroed) GPRs, with no
+/// intermediate `ret` to redirect first - a genuine simplification
+/// Fase 86 gets for free specifically because it resumes via the timer
+/// stub's `iretq`-based tail rather than `switch_to`'s `ret`-based one.
+fn prepare_ring3_mt_task_ctx(
+    entry: u64,
+    user_cs: u64,
+    user_ss: u64,
+    stack_top: u64,
+    rflags: u64,
+) -> [u8; 160] {
+    let mut ctx = [0u8; 160];
+    ctx[120..128].copy_from_slice(&entry.to_le_bytes());
+    ctx[128..136].copy_from_slice(&user_cs.to_le_bytes());
+    ctx[136..144].copy_from_slice(&rflags.to_le_bytes());
+    ctx[144..152].copy_from_slice(&stack_top.to_le_bytes());
+    ctx[152..160].copy_from_slice(&user_ss.to_le_bytes());
+    ctx
+}
+
+/// Fase 86: the real, larger step `ring3_preempt`'s own module doc
+/// (Fase 85) named as the necessary follow-on - actually running a
+/// DIFFERENT ring-3 program in the gap a preempted one leaves behind,
+/// not just resuming the SAME one. See `scheduler::ring3_mt`'s own
+/// module doc for the round-robin mechanism; this function builds the
+/// two ring-3 programs and drives the experiment end to end.
+///
+/// **Task 0** (entered normally via the existing, unmodified
+/// `enter_ring3`/`int 0x81` exit mechanism - EXACTLY Fase 85's own test
+/// program, reused verbatim except for its 5 immediate constants,
+/// chosen with a `0x1...` prefix so a wrong-task-resumed bug would show
+/// up as an immediately wrong, distinguishable value): loads 5
+/// "caller-saved" registers, spins Fase 79/85's own already-proven
+/// `LOOP_COUNT=150_000_000` (reliably spanning multiple real tick
+/// periods), XORs them into `eax`, exits via `int 0x81`.
+///
+/// **Task 1** (entered ONLY by `scheduler::ring3_mt`'s own round-robin
+/// switching, cold, via `prepare_ring3_mt_task_ctx` above - it never
+/// runs via `enter_ring3` at all): the IDENTICAL shape with a `0x2...`
+/// prefix instead, and a MUCH smaller loop count, so it reliably
+/// finishes its own checksum early and spends the rest of the
+/// experiment just spinning (`jmp $`, harmless, and critically
+/// non-destructive of its own `eax`) rather than racing task 0's own
+/// much larger loop. Task 1 deliberately never exits on its own - there
+/// is no way for it to signal completion the way task 0 does, since two
+/// tasks both racing for the single existing `int 0x81`/
+/// `RING3_RETURN_RSP` slot would break the "the kernel regains control
+/// exactly once, when task 0 itself decides to" invariant every earlier
+/// ring3 test already relies on. Instead, verification reads task 1's
+/// own LAST-saved `eax` directly out of its dedicated context buffer
+/// (`scheduler::ring3_mt::run_multitasking`'s own return value) - valid
+/// precisely because `jmp $` never touches `eax`, so whatever value is
+/// sitting there the LAST time task 1 happens to be preempted (virtually
+/// certain to be well after it finished its own tiny loop, given how
+/// much smaller it is than task 0's) is its real, final checksum.
+///
+/// Deliberately does NOT prove a general N-task scheduler, priorities,
+/// or independent per-task exit - exactly like Fase 83's own
+/// cooperative test, this hardcodes 2 tasks and one one-directional
+/// completion signal (task 0's alone). A fully general ring-3 scheduler
+/// remains real, separate, larger follow-on work.
+pub fn run_ring3_mt_test() -> (u64, u32, usize) {
+    let info = gdt::ring3_info();
+    let user_cs = info.user_code_selector as u64;
+    let user_ss = info.user_data_selector as u64;
+
+    let code_addr = USER_TEST_PAGE_ADDR;
+    let task0_entry = code_addr;
+    let task1_entry = code_addr + 128;
+    let task0_stack_top = code_addr + 2048;
+    let task1_stack_top = code_addr + 3072;
+
+    const TASK0_EXPECTED: u32 = 0x1000_0004;
+    const TASK1_EXPECTED: u32 = 0x2000_0004;
+    const TASK0_LOOP_COUNT: u32 = 150_000_000;
+    const TASK1_LOOP_COUNT: u32 = 10_000_000;
+
+    let mut task0 = [0u8; 46];
+    task0[0] = 0xB8;
+    task0[1..5].copy_from_slice(&0x1000_0000u32.to_le_bytes());
+    task0[5] = 0xB9;
+    task0[6..10].copy_from_slice(&0x1000_0001u32.to_le_bytes());
+    task0[10] = 0xBA;
+    task0[11..15].copy_from_slice(&0x1000_0002u32.to_le_bytes());
+    task0[15] = 0xBE;
+    task0[16..20].copy_from_slice(&0x1000_0003u32.to_le_bytes());
+    task0[20] = 0xBF;
+    task0[21..25].copy_from_slice(&0x1000_0004u32.to_le_bytes());
+    task0[25] = 0x41;
+    task0[26] = 0xB8;
+    task0[27..31].copy_from_slice(&TASK0_LOOP_COUNT.to_le_bytes());
+    task0[31] = 0x41;
+    task0[32] = 0xFF;
+    task0[33] = 0xC8; // dec r8d
+    task0[34] = 0x75;
+    task0[35] = 0xFB; // jnz -5 (back to `dec r8d`)
+    task0[36] = 0x31;
+    task0[37] = 0xC8; // xor eax, ecx
+    task0[38] = 0x31;
+    task0[39] = 0xD0; // xor eax, edx
+    task0[40] = 0x31;
+    task0[41] = 0xF0; // xor eax, esi
+    task0[42] = 0x31;
+    task0[43] = 0xF8; // xor eax, edi
+    task0[44] = 0xCD;
+    task0[45] = 0x81; // int 0x81 (Fase 73's own exit vector)
+
+    let mut task1 = [0u8; 46];
+    task1[0] = 0xB8;
+    task1[1..5].copy_from_slice(&0x2000_0000u32.to_le_bytes());
+    task1[5] = 0xB9;
+    task1[6..10].copy_from_slice(&0x2000_0001u32.to_le_bytes());
+    task1[10] = 0xBA;
+    task1[11..15].copy_from_slice(&0x2000_0002u32.to_le_bytes());
+    task1[15] = 0xBE;
+    task1[16..20].copy_from_slice(&0x2000_0003u32.to_le_bytes());
+    task1[20] = 0xBF;
+    task1[21..25].copy_from_slice(&0x2000_0004u32.to_le_bytes());
+    task1[25] = 0x41;
+    task1[26] = 0xB8;
+    task1[27..31].copy_from_slice(&TASK1_LOOP_COUNT.to_le_bytes());
+    task1[31] = 0x41;
+    task1[32] = 0xFF;
+    task1[33] = 0xC8; // dec r8d
+    task1[34] = 0x75;
+    task1[35] = 0xFB; // jnz -5 (back to `dec r8d`)
+    task1[36] = 0x31;
+    task1[37] = 0xC8; // xor eax, ecx
+    task1[38] = 0x31;
+    task1[39] = 0xD0; // xor eax, edx
+    task1[40] = 0x31;
+    task1[41] = 0xF0; // xor eax, esi
+    task1[42] = 0x31;
+    task1[43] = 0xF8; // xor eax, edi
+    task1[44] = 0xEB;
+    task1[45] = 0xFE; // jmp $ (never exits - see this fn's own doc)
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(task0.as_ptr(), task0_entry as *mut u8, task0.len());
+        core::ptr::copy_nonoverlapping(task1.as_ptr(), task1_entry as *mut u8, task1.len());
+    }
+
+    let task1_ctx = prepare_ring3_mt_task_ctx(
+        task1_entry,
+        user_cs,
+        user_ss,
+        task1_stack_top,
+        RING3_TEST_RFLAGS,
+    );
+
+    kprintln!(
+        "[RING3] Attempting genuine multi-task ring-3 scheduling - two DIFFERENT programs alternating via involuntary timer ticks..."
+    );
+    serial_println!(
+        "[RING3] ring3_mt_test task0_entry={:#x} task1_entry={:#x} task0_loop={} task1_loop={}",
+        task0_entry,
+        task1_entry,
+        TASK0_LOOP_COUNT,
+        TASK1_LOOP_COUNT
+    );
+
+    let (task0_exit_code, task1_last_eax, switch_count) =
+        crate::scheduler::ring3_mt::run_multitasking(task1_ctx, || unsafe {
+            enter_ring3(
+                task0_entry,
+                user_cs,
+                user_ss,
+                task0_stack_top,
+                RING3_TEST_RFLAGS,
+            )
+        });
+
+    kprintln!(
+        "[RING3] Back in ring-0 - mt_test task0_checksum={:#x} (expected {:#x}) task1_last_eax={:#x} (expected {:#x}) switch_count={}",
+        task0_exit_code,
+        TASK0_EXPECTED,
+        task1_last_eax,
+        TASK1_EXPECTED,
+        switch_count
+    );
+    serial_println!(
+        "[RING3] ring3_mt_test task0_checksum={:#x} task1_last_eax={:#x} switch_count={}",
+        task0_exit_code,
+        task1_last_eax,
+        switch_count
+    );
+
+    (task0_exit_code, task1_last_eax, switch_count)
+}

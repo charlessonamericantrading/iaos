@@ -324,12 +324,14 @@ extern "C" fn timer_interrupt_entry_asm() {
 /// completely unchanged from Fase 80/84 - it already skips ring-0
 /// task-switching entirely whenever the interrupted context was ring-3,
 /// so this new return-value plumbing never interferes with it either
-/// way. `ring3_preempt::tick(saved_ctx_ptr)` runs ONLY for the ring-3
-/// case, strictly layered on top: it returns `saved_ctx_ptr` UNCHANGED
-/// (a genuine no-op) unless `scheduler::ring3_preempt`'s own explicit
-/// interception is armed - see that module's own doc - keeping this
-/// byte-identical to Fase 84's own already-verified behavior for every
-/// EXISTING self-test, none of which ever arms it.
+/// way. `ring3_preempt::tick(saved_ctx_ptr)` and (Fase 86) `ring3_mt::
+/// tick(..)` then run in a strictly layered CHAIN, ring-3-case only:
+/// each returns its own input UNCHANGED (a genuine no-op) unless ITS
+/// OWN mechanism is the one currently armed - see each module's own
+/// doc - so exactly one of the two ever actually does anything on any
+/// given boot (today's self-tests never enable both at once), and
+/// every EXISTING self-test that arms neither sees this whole chain stay
+/// byte-identical to Fase 84's own already-verified behavior.
 extern "C" fn handle_timer_tick(caller_rpl: u64, saved_ctx_ptr: u64) -> u64 {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
     let interrupted_ring3 = caller_rpl == 3;
@@ -354,7 +356,8 @@ extern "C" fn handle_timer_tick(caller_rpl: u64, saved_ctx_ptr: u64) -> u64 {
     crate::scheduler::preemptive::tick(interrupted_ring3);
 
     if interrupted_ring3 {
-        crate::scheduler::ring3_preempt::tick(saved_ctx_ptr)
+        let ctx = crate::scheduler::ring3_preempt::tick(saved_ctx_ptr);
+        crate::scheduler::ring3_mt::tick(ctx)
     } else {
         saved_ctx_ptr
     }
