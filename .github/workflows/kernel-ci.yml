@@ -71,14 +71,16 @@ jobs:
       # boots under this exact dual-netdev config, full 110-assertion
       # regression suite unchanged, e1000's own PCI slot/MAC/every
       # existing e1000 test untouched) before trusting this change here.
-      # Fase 90 investigation (temporary): a real packet capture on the
-      # e1000 netdev, the same `-object filter-dump` technique that
-      # resolved the VirtIO RX mystery and Fase 89's own MSS/padding
-      # bug - this time to see, on THIS Linux runner specifically,
-      # whether tcp_echo_test's real echo genuinely never arrives or
-      # whether something else is going on. Uploaded unconditionally
-      # (`if: always()` on the next step) so it's available even though
-      # this step itself is expected to keep failing until diagnosed.
+      # Fase 90: a real packet capture on the e1000 netdev, kept as
+      # standing CI infrastructure (not a one-off) - the same `-object
+      # filter-dump` technique has now been the decisive tool THREE
+      # times in this kernel's history (the VirtIO RX mystery, Fase 89's
+      # own MSS/padding bug, and the RX-rearm bug this same Fase found
+      # in CI specifically - a genuinely CI-only failure that never
+      # reproduced locally). Uploaded unconditionally (`if: always()` on
+      # the next step) so it's available for the NEXT time this area
+      # needs real evidence instead of a guess, without needing another
+      # push-and-wait round trip just to add the capture back.
       - name: Boot-test in QEMU
         run: |
           timeout 25 qemu-system-x86_64 \
@@ -92,7 +94,7 @@ jobs:
           cat boot.log
           echo "--------------------------"
 
-      - name: Upload packet capture (Fase 90 investigation)
+      - name: Upload packet capture
         if: always()
         uses: actions/upload-artifact@v4
         with:

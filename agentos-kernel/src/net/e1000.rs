@@ -1421,6 +1421,45 @@ fn build_tcp_frame(
     frame
 }
 
+/// Parses `data` (a raw received Ethernet frame's bytes) as a
+/// checksummed TCP reply from `target_ip` back to `src_ip`, returning
+/// the segment's parsed fields plus its payload slice only when every
+/// independent check passes (EtherType IPv4, IP protocol TCP, a valid
+/// IP header checksum, source IP matches, and `net::tcp::parse_tcp_
+/// segment`'s own TCP-level checksum) - the shared filtering logic
+/// `tcp_echo_test`'s own multi-slot polling phases both need, factored
+/// out once rather than hand-copied per phase.
+fn parse_reply_frame(
+    data: &[u8],
+    target_ip: [u8; 4],
+    src_ip: [u8; 4],
+) -> Option<(crate::net::tcp::TcpSegmentInfo, &[u8])> {
+    use crate::net::{icmp, tcp};
+    let ip_start = icmp::ETHERNET_HEADER_LEN;
+    let tcp_start = ip_start + icmp::IPV4_HEADER_LEN;
+    let is_our_reply = data.len() > tcp_start
+        && data[12] == 0x08
+        && data[13] == 0x00
+        && data[ip_start + 9] == tcp::IP_PROTOCOL_TCP
+        && icmp::checksum_is_valid(&data[ip_start..tcp_start])
+        && data[ip_start + 12..ip_start + 16] == target_ip;
+    if !is_our_reply {
+        return None;
+    }
+    let ip_total_len = u16::from_be_bytes([data[ip_start + 2], data[ip_start + 3]]) as usize;
+    let real_tcp_len = ip_total_len.saturating_sub(icmp::IPV4_HEADER_LEN);
+    let tcp_end = (tcp_start + real_tcp_len).min(data.len());
+    let info = tcp::parse_tcp_segment(target_ip, src_ip, &data[tcp_start..tcp_end]).ok()?;
+    let data_offset_words = data[tcp_start + 12] >> 4;
+    let payload_start = tcp_start + (data_offset_words as usize) * 4;
+    let payload = if payload_start <= tcp_end {
+        &data[payload_start..tcp_end]
+    } else {
+        &[]
+    };
+    Some((info, payload))
+}
+
 /// Fase 90: picks up exactly where `tcp_syn_test` deliberately stopped
 /// (its own doc comment: "does NOT yet send the final ACK ... or track
 /// any ongoing connection state") and proves the resulting connection
@@ -1481,7 +1520,7 @@ pub fn tcp_echo_test(
     target_port: u16,
     payload: &[u8],
 ) -> Result<alloc::vec::Vec<u8>, &'static str> {
-    use crate::net::{icmp, tcp};
+    use crate::net::tcp;
 
     let dest_mac = arp_resolve(target_ip)?;
     let (dev, mmio_base) = find_mmio_base()?;
@@ -1490,6 +1529,8 @@ pub fn tcp_echo_test(
     const SRC_IP: [u8; 4] = [10, 0, 2, 15]; // SLIRP guest default
     const SRC_PORT: u16 = 54322; // distinct from tcp_syn_test's own 54321, so a leftover half-open handshake from that test can never be confused with this one's fresh 4-tuple
     const INITIAL_SEQ: u32 = 0x3000_0000;
+    const NUM_RX_SLOTS: usize = 4; // this connection's own SYN-ACK, the stack's own immediate bare ACK, the real echo, plus one spare
+    const RX_SLOT_STRIDE: u64 = 256;
 
     let syn_header = tcp::build_tcp_header(
         SRC_IP,
@@ -1511,11 +1552,31 @@ pub fn tcp_echo_test(
     let phys_offset = PHYS_MEM_OFFSET.load(Ordering::Relaxed);
     let rx_ring_virt = (phys_offset + rx_ring_frame.start_address().as_u64()) as *mut RxDescriptor;
     let tx_ring_virt = (phys_offset + tx_ring_frame.start_address().as_u64()) as *mut TxDescriptor;
+    let rx_buf_virt = (phys_offset + rx_buf_frame.start_address().as_u64()) as *const u8;
+    let rx_buf_phys = rx_buf_frame.start_address().as_u64();
     let tx_buf_virt = (phys_offset + tx_buf_frame.start_address().as_u64()) as *mut u8;
     let tx_buf_phys = tx_buf_frame.start_address().as_u64();
     const TX_SLOT_STRIDE: u64 = 256; // comfortably bigger than any single SYN/ACK/DATA frame here (<= 54 + payload.len() bytes)
 
-    // Arm RX first, same ordering reasoning as arp_resolve/ping/tcp_syn_test.
+    // Arm RX with NUM_RX_SLOTS real, distinct-buffer descriptors up
+    // front, at fixed offsets within one shared buffer page (the same
+    // approach the TX side below already uses) - deliberately NOT the
+    // single-slot-reused-mid-flight pattern `tcp_syn_test`/`arp_resolve`/
+    // `ping` all use. That pattern has a real, latent bug this function
+    // is the first to actually expose: confirmed against QEMU's own
+    // real `hw/net/e1000.c` (`e1000_has_rxbufs`/`e1000_receive_iov`,
+    // fetched at this project's own pinned QEMU commit), the device
+    // only accepts a new frame while `RDH != RDT`. Receiving one frame
+    // advances `RDH` past the slot it used, and rewriting that SAME
+    // slot's descriptor while re-writing `RDT` with the value it
+    // already had changes nothing from the device's point of view - the
+    // ring silently stays "full" (`RDH == RDT`) and every later frame is
+    // dropped via `e1000_receiver_overrun`, forever. `tcp_syn_test` and
+    // friends never notice, because they only ever need ONE real
+    // receive per call; this function needs up to three within one
+    // session (the SYN-ACK, the stack's own immediate bare ACK, and the
+    // real echo), so it pre-arms enough real slots up front instead of
+    // ever rearming one mid-flight.
     unsafe {
         let empty_rx = RxDescriptor {
             addr: 0,
@@ -1528,23 +1589,25 @@ pub fn tcp_echo_test(
         for i in 0..NUM_RX_DESCRIPTORS {
             core::ptr::write_volatile(rx_ring_virt.add(i), empty_rx);
         }
-        core::ptr::write_volatile(
-            rx_ring_virt,
-            RxDescriptor {
-                addr: rx_buf_frame.start_address().as_u64(),
-                length: 0,
-                checksum: 0,
-                status: 0,
-                errors: 0,
-                special: 0,
-            },
-        );
+        for i in 0..NUM_RX_SLOTS {
+            core::ptr::write_volatile(
+                rx_ring_virt.add(i),
+                RxDescriptor {
+                    addr: rx_buf_phys + (i as u64) * RX_SLOT_STRIDE,
+                    length: 0,
+                    checksum: 0,
+                    status: 0,
+                    errors: 0,
+                    special: 0,
+                },
+            );
+        }
         let rx_ring_phys = rx_ring_frame.start_address().as_u64();
         write_reg(mmio_base, REG_RDBAL, (rx_ring_phys & 0xFFFF_FFFF) as u32);
         write_reg(mmio_base, REG_RDBAH, (rx_ring_phys >> 32) as u32);
         write_reg(mmio_base, REG_RDLEN, (NUM_RX_DESCRIPTORS * 16) as u32);
         write_reg(mmio_base, REG_RDH, 0);
-        write_reg(mmio_base, REG_RDT, 1);
+        write_reg(mmio_base, REG_RDT, NUM_RX_SLOTS as u32);
         write_reg(mmio_base, REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
     }
 
@@ -1618,10 +1681,12 @@ pub fn tcp_echo_test(
 
     send_and_wait(0, &syn_frame)?;
 
-    // Phase 1: receive + validate the real SYN-ACK - the same
-    // independent checks (EtherType, IP protocol, IP header checksum,
-    // source IP, Total-Length-based trim before the TCP checksum)
-    // `tcp_syn_test` itself established.
+    // Phase 1: poll RX slot 0 - the first (and, for this connection's
+    // own fresh 4-tuple, only) frame this session will ever receive
+    // should be the real SYN-ACK. Slot 0 has exactly one real buffer
+    // behind it and is never reused, so once its DD bit is set there is
+    // nothing further to wait for, whether or not the frame turns out
+    // to be the expected reply.
     let mut peer_isn: Option<u32> = None;
     let rx_start_tick = crate::interrupts::timer_ticks();
     unsafe {
@@ -1630,60 +1695,17 @@ pub fn tcp_echo_test(
             if status & RXD_STAT_DD != 0 {
                 let length =
                     core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).length)) as usize;
-                let buf_virt = (phys_offset + rx_buf_frame.start_address().as_u64()) as *const u8;
-                let data = core::slice::from_raw_parts(buf_virt, length);
-
-                let ip_start = icmp::ETHERNET_HEADER_LEN;
-                let tcp_start = ip_start + icmp::IPV4_HEADER_LEN;
-                let is_our_reply = data.len() > tcp_start
-                    && data[12] == 0x08
-                    && data[13] == 0x00
-                    && data[ip_start + 9] == tcp::IP_PROTOCOL_TCP
-                    && icmp::checksum_is_valid(&data[ip_start..tcp_start])
-                    && data[ip_start + 12..ip_start + 16] == target_ip;
-
-                let ip_total_len = if is_our_reply {
-                    u16::from_be_bytes([data[ip_start + 2], data[ip_start + 3]]) as usize
-                } else {
-                    0
-                };
-                let real_tcp_len = ip_total_len.saturating_sub(icmp::IPV4_HEADER_LEN);
-                let tcp_end = (tcp_start + real_tcp_len).min(data.len());
-
-                if is_our_reply {
-                    if let Ok(info) =
-                        tcp::parse_tcp_segment(target_ip, SRC_IP, &data[tcp_start..tcp_end])
-                    {
-                        let is_syn_ack = info.flags == (tcp::TCP_FLAG_SYN | tcp::TCP_FLAG_ACK)
-                            && info.source_port == target_port
-                            && info.dest_port == SRC_PORT
-                            && info.ack_num == INITIAL_SEQ.wrapping_add(1);
-                        if is_syn_ack {
-                            peer_isn = Some(info.seq_num);
-                        }
+                let data = core::slice::from_raw_parts(rx_buf_virt, length);
+                if let Some((info, _)) = parse_reply_frame(data, target_ip, SRC_IP) {
+                    let is_syn_ack = info.flags == (tcp::TCP_FLAG_SYN | tcp::TCP_FLAG_ACK)
+                        && info.source_port == target_port
+                        && info.dest_port == SRC_PORT
+                        && info.ack_num == INITIAL_SEQ.wrapping_add(1);
+                    if is_syn_ack {
+                        peer_isn = Some(info.seq_num);
                     }
                 }
-
-                // Rearm regardless of match - either this phase is done
-                // and phase 4 needs a fresh descriptor, or this frame
-                // wasn't our SYN-ACK and we keep waiting, same
-                // reasoning as tcp_syn_test/arp_resolve.
-                core::ptr::write_volatile(
-                    rx_ring_virt,
-                    RxDescriptor {
-                        addr: rx_buf_frame.start_address().as_u64(),
-                        length: 0,
-                        checksum: 0,
-                        status: 0,
-                        errors: 0,
-                        special: 0,
-                    },
-                );
-                write_reg(mmio_base, REG_RDT, 1);
-
-                if peer_isn.is_some() {
-                    break;
-                }
+                break;
             }
             if crate::interrupts::timer_ticks() - rx_start_tick > 90 {
                 break;
@@ -1737,80 +1759,52 @@ pub fn tcp_echo_test(
         .wrapping_add(1)
         .wrapping_add(payload.len() as u32);
 
-    // Phase 4: poll for cat's own echoed reply, skipping any bare ACK
-    // the stack sends first to acknowledge phase 3 before cat itself
-    // has actually written the echo back.
+    // Phase 4: poll RX slots 1..NUM_RX_SLOTS in arrival order for the
+    // real echo - typically slot 1 is the stack's own immediate bare ACK
+    // for phase 3's data (empty payload, skipped) and slot 2 is the real
+    // echo, but the loop just keeps advancing through whatever pre-armed
+    // slots remain rather than assuming a fixed count of interim frames.
+    // Each slot has its own real, never-reused buffer, so once a slot's
+    // DD bit is set there is nothing more to learn from it - move on to
+    // the next slot immediately (no `hlt()`) rather than waiting, since
+    // a later slot may already be ready too.
     let echo_start_tick = crate::interrupts::timer_ticks();
+    let mut slot = 1usize;
     unsafe {
         loop {
-            let status = core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).status));
+            if slot >= NUM_RX_SLOTS {
+                break;
+            }
+            let status =
+                core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt.add(slot)).status));
             if status & RXD_STAT_DD != 0 {
                 let length =
-                    core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).length)) as usize;
-                let buf_virt = (phys_offset + rx_buf_frame.start_address().as_u64()) as *const u8;
+                    core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt.add(slot)).length))
+                        as usize;
+                let buf_virt = rx_buf_virt.add(slot * RX_SLOT_STRIDE as usize);
                 let data = core::slice::from_raw_parts(buf_virt, length);
-
-                let ip_start = icmp::ETHERNET_HEADER_LEN;
-                let tcp_start = ip_start + icmp::IPV4_HEADER_LEN;
-                let is_our_reply = data.len() > tcp_start
-                    && data[12] == 0x08
-                    && data[13] == 0x00
-                    && data[ip_start + 9] == tcp::IP_PROTOCOL_TCP
-                    && icmp::checksum_is_valid(&data[ip_start..tcp_start])
-                    && data[ip_start + 12..ip_start + 16] == target_ip;
-
-                let ip_total_len = if is_our_reply {
-                    u16::from_be_bytes([data[ip_start + 2], data[ip_start + 3]]) as usize
-                } else {
-                    0
-                };
-                let real_tcp_len = ip_total_len.saturating_sub(icmp::IPV4_HEADER_LEN);
-                let tcp_end = (tcp_start + real_tcp_len).min(data.len());
-
-                if is_our_reply {
-                    if let Ok(info) =
-                        tcp::parse_tcp_segment(target_ip, SRC_IP, &data[tcp_start..tcp_end])
-                    {
-                        let data_offset_words = data[tcp_start + 12] >> 4;
-                        let payload_start = tcp_start + (data_offset_words as usize) * 4;
-                        let echoed = if payload_start <= tcp_end {
-                            &data[payload_start..tcp_end]
-                        } else {
-                            &[]
-                        };
-                        let is_echo = info.source_port == target_port
-                            && info.dest_port == SRC_PORT
-                            && info.ack_num == expected_ack
-                            && !echoed.is_empty();
-                        if is_echo {
-                            kprintln!(
-                                "[E1000] tcp_echo_test: real echo received ({} bytes)",
-                                echoed.len()
-                            );
-                            serial_println!(
-                                "[E1000] tcp_echo_test target={:?} port={} handshake_complete=true echo_len={} echo_matches={}",
-                                target_ip,
-                                target_port,
-                                echoed.len(),
-                                echoed == payload
-                            );
-                            return Ok(echoed.to_vec());
-                        }
+                if let Some((info, echoed)) = parse_reply_frame(data, target_ip, SRC_IP) {
+                    let is_echo = info.source_port == target_port
+                        && info.dest_port == SRC_PORT
+                        && info.ack_num == expected_ack
+                        && !echoed.is_empty();
+                    if is_echo {
+                        kprintln!(
+                            "[E1000] tcp_echo_test: real echo received ({} bytes)",
+                            echoed.len()
+                        );
+                        serial_println!(
+                            "[E1000] tcp_echo_test target={:?} port={} handshake_complete=true echo_len={} echo_matches={}",
+                            target_ip,
+                            target_port,
+                            echoed.len(),
+                            echoed == payload
+                        );
+                        return Ok(echoed.to_vec());
                     }
                 }
-
-                core::ptr::write_volatile(
-                    rx_ring_virt,
-                    RxDescriptor {
-                        addr: rx_buf_frame.start_address().as_u64(),
-                        length: 0,
-                        checksum: 0,
-                        status: 0,
-                        errors: 0,
-                        special: 0,
-                    },
-                );
-                write_reg(mmio_base, REG_RDT, 1);
+                slot += 1;
+                continue;
             }
             if crate::interrupts::timer_ticks() - echo_start_tick > 90 {
                 break;
