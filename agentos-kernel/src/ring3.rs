@@ -1062,6 +1062,45 @@ static mut RING3_COOP_TASK_PRIORITY: [u8; RING3_COOP_MAX_TASKS] = [0; RING3_COOP
 /// OTHER mechanism.
 static mut RING3_COOP_TASK_DONE: [bool; RING3_COOP_MAX_TASKS] = [false; RING3_COOP_MAX_TASKS];
 
+/// Fase 101: the "arm" step every coop self-test repeated inline -
+/// assigning each task's own (RSP, priority) pair, then resetting the
+/// done-mask/active-count/current-index fresh. Extracted here since
+/// Fase 96 left 3 byte-for-byte-identical inline copies across
+/// `run_ring3_cooperative_test`/`run_priority_cooperative_test`/
+/// `run_early_exit_cooperative_test` - unlike `scheduler::ring3_mt`'s
+/// own `run_multitasking` (Fase 91), which every ring3_mt self-test
+/// already calls through one shared entry point, `ring3_coop` had NO
+/// such single function before this; each test poked the static arrays
+/// directly. Generalized over a slice rather than hardcoded to 3, the
+/// same "N-task, not a fixed pair" shape `run_multitasking` established
+/// for the OTHER mechanism. Does NOT touch `prepare_ring3_initial_stack`
+/// (which builds each RSP value) or any of the 3 tests' own different
+/// post-run read-back/cleanup logic - purely the shared setup slice.
+fn arm_ring3_coop_tasks(tasks: &[(u64, u8)]) {
+    assert!(
+        tasks.len() <= RING3_COOP_MAX_TASKS,
+        "arm_ring3_coop_tasks: {} tasks requested, only {RING3_COOP_MAX_TASKS} slots exist",
+        tasks.len()
+    );
+    unsafe {
+        let rsp_slots = core::ptr::addr_of_mut!(RING3_COOP_TASK_RSP);
+        let prio_slots = core::ptr::addr_of_mut!(RING3_COOP_TASK_PRIORITY);
+        for (i, (rsp, prio)) in tasks.iter().enumerate() {
+            (*rsp_slots)[i] = *rsp;
+            (*prio_slots)[i] = *prio;
+        }
+        // Reset the done-mask fresh for this test - shared static state
+        // a PRIOR test in the same boot could have left set, since
+        // nothing else ever clears it besides a fresh arm.
+        let done = core::ptr::addr_of_mut!(RING3_COOP_TASK_DONE);
+        for i in 0..RING3_COOP_MAX_TASKS {
+            (*done)[i] = false;
+        }
+        *core::ptr::addr_of_mut!(RING3_COOP_ACTIVE_TASKS) = tasks.len();
+        *core::ptr::addr_of_mut!(RING3_COOP_CURRENT) = 0;
+    }
+}
+
 // Fase 97: `ring3_coop_yield_helper` and `ring3_coop_task_done_helper`
 // below now call `scheduler::tier_select::select_next` directly - this
 // used to be its own local copy of that exact algorithm (ported from
@@ -1492,25 +1531,11 @@ pub fn run_ring3_cooperative_test() -> (u64, [u8; 4]) {
     // made to `run_ring3_mt_test`'s own existing callers when priority
     // was added to that OTHER mechanism.
     use crate::scheduler::process::Priority;
-    unsafe {
-        let tasks = core::ptr::addr_of_mut!(RING3_COOP_TASK_RSP);
-        (*tasks)[0] = rsp0;
-        (*tasks)[1] = rsp1;
-        (*tasks)[2] = rsp2;
-        let prios = core::ptr::addr_of_mut!(RING3_COOP_TASK_PRIORITY);
-        (*prios)[0] = Priority::Normal as u8;
-        (*prios)[1] = Priority::Normal as u8;
-        (*prios)[2] = Priority::Normal as u8;
-        // Fase 96: reset the done-mask fresh for this test - shared
-        // static state a PRIOR test in the same boot could have left
-        // set, since nothing else ever clears it besides a fresh setup.
-        let done = core::ptr::addr_of_mut!(RING3_COOP_TASK_DONE);
-        for i in 0..RING3_COOP_MAX_TASKS {
-            (*done)[i] = false;
-        }
-        *core::ptr::addr_of_mut!(RING3_COOP_ACTIVE_TASKS) = 3;
-        *core::ptr::addr_of_mut!(RING3_COOP_CURRENT) = 0;
-    }
+    arm_ring3_coop_tasks(&[
+        (rsp0, Priority::Normal as u8),
+        (rsp1, Priority::Normal as u8),
+        (rsp2, Priority::Normal as u8),
+    ]);
 
     kprintln!(
         "[RING3] Attempting 3 ring-3 tasks cooperatively interleaving via a round-robin yield vector (0x83)..."
@@ -1650,25 +1675,11 @@ pub fn run_priority_cooperative_test() -> (u64, [u8; 4]) {
         )
     };
 
-    unsafe {
-        let tasks = core::ptr::addr_of_mut!(RING3_COOP_TASK_RSP);
-        (*tasks)[0] = rsp0;
-        (*tasks)[1] = rsp1;
-        (*tasks)[2] = rsp2;
-        let prios = core::ptr::addr_of_mut!(RING3_COOP_TASK_PRIORITY);
-        (*prios)[0] = Priority::High as u8;
-        (*prios)[1] = Priority::Background as u8;
-        (*prios)[2] = Priority::Background as u8;
-        // Fase 96: reset the done-mask fresh for this test - see the
-        // identical reset in run_ring3_cooperative_test's own setup for
-        // why (shared static state a prior test could have left set).
-        let done = core::ptr::addr_of_mut!(RING3_COOP_TASK_DONE);
-        for i in 0..RING3_COOP_MAX_TASKS {
-            (*done)[i] = false;
-        }
-        *core::ptr::addr_of_mut!(RING3_COOP_ACTIVE_TASKS) = 3;
-        *core::ptr::addr_of_mut!(RING3_COOP_CURRENT) = 0;
-    }
+    arm_ring3_coop_tasks(&[
+        (rsp0, Priority::High as u8),
+        (rsp1, Priority::Background as u8),
+        (rsp2, Priority::Background as u8),
+    ]);
 
     kprintln!(
         "[RING3] Testing REAL priority in the cooperative-yield mechanism (task0=High vs task1/task2=Background)..."
@@ -1845,22 +1856,11 @@ pub fn run_early_exit_cooperative_test() -> (u64, [u8; 4], bool, bool, bool) {
         )
     };
 
-    unsafe {
-        let tasks = core::ptr::addr_of_mut!(RING3_COOP_TASK_RSP);
-        (*tasks)[0] = rsp0;
-        (*tasks)[1] = rsp1;
-        (*tasks)[2] = rsp2;
-        let prios = core::ptr::addr_of_mut!(RING3_COOP_TASK_PRIORITY);
-        (*prios)[0] = Priority::Normal as u8;
-        (*prios)[1] = Priority::Normal as u8;
-        (*prios)[2] = Priority::Normal as u8;
-        let done = core::ptr::addr_of_mut!(RING3_COOP_TASK_DONE);
-        for i in 0..RING3_COOP_MAX_TASKS {
-            (*done)[i] = false;
-        }
-        *core::ptr::addr_of_mut!(RING3_COOP_ACTIVE_TASKS) = 3;
-        *core::ptr::addr_of_mut!(RING3_COOP_CURRENT) = 0;
-    }
+    arm_ring3_coop_tasks(&[
+        (rsp0, Priority::Normal as u8),
+        (rsp1, Priority::Normal as u8),
+        (rsp2, Priority::Normal as u8),
+    ]);
 
     kprintln!(
         "[RING3] Testing voluntary early exit in the cooperative-yield mechanism (task1 retires via int 0x85 instead of yielding)..."
