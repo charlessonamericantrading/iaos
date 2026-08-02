@@ -1151,6 +1151,22 @@ jobs:
           # real run confirms it, so peer_fin_received's specific value
           # is observed and recorded, not gated on.
           grep -q "E1000\] tcp_close_test target=\[10, 0, 2, 100\] port=9999 fin_sent=true" boot.log
+          # Fase 106: the first real UDP round trip this kernel has ever
+          # attempted (every prior network Fase built TCP or ICMP).
+          # guestfwd was directly confirmed NOT to support UDP (tested
+          # locally: `guestfwd=udp:...` is rejected outright as an
+          # "Invalid guest forwarding rule"), so this targets SLIRP's own
+          # built-in DNS proxy at 10.0.2.3:53 instead - the one real,
+          # always-on UDP peer genuinely available with zero extra QEMU
+          # flags. Only asserting the fully deterministic half here: the
+          # query was built and transmitted successfully. Whether SLIRP's
+          # DNS proxy actually replies depends on real network conditions
+          # (unlike ping's own gateway target, which always answers
+          # locally) - reply_received/qr_bit_set/answer_count are logged
+          # and observed, not gated on, the same honest-uncertain-value
+          # discipline the tcp_close_test assertion right above already
+          # established for peer_fin_received.
+          grep -q "E1000\] dns_query_test target=\[10, 0, 2, 3\] port=53 sent=true" boot.log
           # Confirms the new ATA write path (Fase 23) genuinely wrote and
           # read back matching bytes - not just that write_sector()
           # returned without erroring. Deliberately NOT asserting the

@@ -2075,6 +2075,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // Fase 106: the first real UDP round trip this kernel has ever
+    // attempted (every prior network Fase built TCP or ICMP). Targets
+    // SLIRP's own built-in DNS proxy (10.0.2.3:53) since guestfwd was
+    // directly confirmed NOT to support UDP - see net::e1000::dns_query_
+    // test's own doc for the full reasoning. Genuinely uncertain whether
+    // real DNS resolution succeeds in this environment - only sent=true
+    // is deterministic; reply_received/qr_bit_set/answer_count are
+    // logged honestly rather than assumed.
+    kprintln!(
+        "[KERNEL INIT] Testing real UDP round trip via SLIRP's DNS proxy (net::e1000::dns_query_test)..."
+    );
+    match net::e1000::dns_query_test([10, 0, 2, 3]) {
+        Ok(_) => {}
+        Err(e) => {
+            kprintln!("[E1000] dns_query_test(10.0.2.3:53): {}", e);
+            serial_println!("[E1000] dns_query_test_result -> FAILED: {}", e);
+        }
+    }
+
     shell::dispatch_command("disk");
     shell::dispatch_command("ls");
     shell::dispatch_command("cat KERNEL~1");

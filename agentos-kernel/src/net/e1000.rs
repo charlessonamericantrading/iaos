@@ -1922,3 +1922,312 @@ pub fn tcp_echo_test(
 
     Ok(echoed_vec)
 }
+
+/// Fase 106: the first real UDP round trip this kernel has ever
+/// attempted - every prior network Fase (88-102) built TCP (connection-
+/// oriented) or ICMP (its own dedicated protocol number). `net::udp`
+/// provides the header/checksum primitives; this function is the first
+/// thing that actually sends one over the wire.
+///
+/// **`guestfwd` was directly confirmed NOT to support UDP before this was
+/// designed, not assumed**: `qemu-system-x86_64 -netdev user,...,guestfwd=
+/// udp:...` was tried locally and rejected outright with `Invalid guest
+/// forwarding rule` - `guestfwd`'s own `cmd:`-backed forwarding is TCP-only
+/// in real QEMU/SLIRP, so the exact mechanism every TCP test in this
+/// kernel (89, 90, 102) depends on for a controlled, always-on peer
+/// simply isn't available for UDP. Instead, this targets SLIRP's own
+/// BUILT-IN DNS proxy, always present at `10.0.2.3:53` for any `-netdev
+/// user` instance with zero extra QEMU flags - the one real, always-on
+/// UDP peer genuinely available here.
+///
+/// This does NOT implement a DNS resolver - `DNS_QUERY` is one fixed,
+/// hand-built 29-byte "A? example.com" query (transaction ID `0x1234`),
+/// used purely as real payload content a real UDP peer will genuinely
+/// reply to. Parsing the reply only reads the 12-byte DNS header far
+/// enough to confirm it's genuinely OUR reply (matching transaction ID)
+/// and genuinely A reply (the QR bit) - never any resource-record data,
+/// which would be real, separate, substantially larger DNS-client work
+/// this Fase deliberately does not attempt.
+///
+/// **Genuinely, deliberately uncertain going in, the same honest posture
+/// Fase 89/90/102 themselves used**: SLIRP's DNS proxy forwards to
+/// whatever real resolver the HOST machine has configured, so whether it
+/// replies at all depends on real network conditions this kernel has no
+/// control over - unlike `ping`'s own target (SLIRP's gateway, which
+/// always answers its own ICMP echo locally, no external dependency at
+/// all). Because of this, only the fully deterministic fact - the query
+/// was built and transmitted successfully - is represented by `Ok` at
+/// all; `reply_received`/`qr_bit_set`/`answer_count` are returned and
+/// logged honestly rather than assumed, to be read from real output
+/// rather than assumed correct.
+pub fn dns_query_test(target_ip: [u8; 4]) -> Result<(bool, bool, u16), &'static str> {
+    use crate::net::{icmp, udp};
+
+    // A hand-built, fixed DNS query: "A? example.com", transaction ID
+    // 0x1234. Every offset hand-verified by sequential counting, the
+    // same discipline this kernel's own hand-assembled ring-3 programs
+    // already use for machine code - here applied to a wire-protocol
+    // message instead.
+    //
+    //  0.. 2: transaction ID = 0x1234
+    //  2.. 4: flags = 0x0100 (standard query, recursion desired)
+    //  4.. 6: QDCOUNT = 1
+    //  6.. 8: ANCOUNT = 0
+    //  8..10: NSCOUNT = 0
+    // 10..12: ARCOUNT = 0
+    // 12..20: QNAME label "example" (length-prefixed: 0x07 + 7 bytes)
+    // 20..24: QNAME label "com" (length-prefixed: 0x03 + 3 bytes)
+    //     24: QNAME terminator (0x00)
+    // 25..27: QTYPE = 1 (A)
+    // 27..29: QCLASS = 1 (IN)
+    const DNS_QUERY: [u8; 29] = [
+        0x12, 0x34, // transaction ID
+        0x01, 0x00, // flags: standard query, recursion desired
+        0x00, 0x01, // QDCOUNT = 1
+        0x00, 0x00, // ANCOUNT = 0
+        0x00, 0x00, // NSCOUNT = 0
+        0x00, 0x00, // ARCOUNT = 0
+        0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', // "example"
+        0x03, b'c', b'o', b'm', // "com"
+        0x00, // QNAME terminator
+        0x00, 0x01, // QTYPE = A
+        0x00, 0x01, // QCLASS = IN
+    ];
+    const DNS_TRANSACTION_ID: [u8; 2] = [0x12, 0x34];
+
+    let dest_mac = arp_resolve(target_ip)?;
+    let (dev, mmio_base) = find_mmio_base()?;
+    dev.enable_bus_mastering();
+    let src_mac = read_mac(mmio_base);
+    const SRC_IP: [u8; 4] = [10, 0, 2, 15]; // SLIRP guest default
+    const SRC_PORT: u16 = 45678;
+    const DEST_PORT: u16 = 53;
+
+    let udp_header = udp::build_udp_header(SRC_IP, target_ip, SRC_PORT, DEST_PORT, &DNS_QUERY);
+    let ipv4_header = icmp::build_ipv4_header(
+        1,
+        64,
+        udp::IP_PROTOCOL_UDP,
+        SRC_IP,
+        target_ip,
+        udp_header.len() + DNS_QUERY.len(),
+    );
+    let eth_header = icmp::build_ethernet_header(dest_mac, src_mac, icmp::ETHERTYPE_IPV4);
+
+    let mut frame: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(
+        icmp::ETHERNET_HEADER_LEN + icmp::IPV4_HEADER_LEN + udp_header.len() + DNS_QUERY.len(),
+    );
+    frame.extend_from_slice(&eth_header);
+    frame.extend_from_slice(&ipv4_header);
+    frame.extend_from_slice(&udp_header);
+    frame.extend_from_slice(&DNS_QUERY);
+
+    let rx_ring_frame = crate::memory::frame_allocator::allocate_frame();
+    let rx_buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let tx_ring_frame = crate::memory::frame_allocator::allocate_frame();
+    let tx_buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let phys_offset = PHYS_MEM_OFFSET.load(Ordering::Relaxed);
+    let rx_ring_virt = (phys_offset + rx_ring_frame.start_address().as_u64()) as *mut RxDescriptor;
+    let tx_ring_virt = (phys_offset + tx_ring_frame.start_address().as_u64()) as *mut TxDescriptor;
+    let tx_buf_virt = (phys_offset + tx_buf_frame.start_address().as_u64()) as *mut u8;
+
+    // Arm RX first, same ordering reasoning as arp_resolve/ping/tcp_syn_test.
+    unsafe {
+        let empty_rx = RxDescriptor {
+            addr: 0,
+            length: 0,
+            checksum: 0,
+            status: 0,
+            errors: 0,
+            special: 0,
+        };
+        for i in 0..NUM_RX_DESCRIPTORS {
+            core::ptr::write_volatile(rx_ring_virt.add(i), empty_rx);
+        }
+        core::ptr::write_volatile(
+            rx_ring_virt,
+            RxDescriptor {
+                addr: rx_buf_frame.start_address().as_u64(),
+                length: 0,
+                checksum: 0,
+                status: 0,
+                errors: 0,
+                special: 0,
+            },
+        );
+        let rx_ring_phys = rx_ring_frame.start_address().as_u64();
+        write_reg(mmio_base, REG_RDBAL, (rx_ring_phys & 0xFFFF_FFFF) as u32);
+        write_reg(mmio_base, REG_RDBAH, (rx_ring_phys >> 32) as u32);
+        write_reg(mmio_base, REG_RDLEN, (NUM_RX_DESCRIPTORS * 16) as u32);
+        write_reg(mmio_base, REG_RDH, 0);
+        write_reg(mmio_base, REG_RDT, 1);
+        write_reg(mmio_base, REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(frame.as_ptr(), tx_buf_virt, frame.len());
+
+        let empty_tx = TxDescriptor {
+            addr: 0,
+            length: 0,
+            cso: 0,
+            cmd: 0,
+            status: 0,
+            css: 0,
+            special: 0,
+        };
+        for i in 0..NUM_TX_DESCRIPTORS {
+            core::ptr::write_volatile(tx_ring_virt.add(i), empty_tx);
+        }
+        core::ptr::write_volatile(
+            tx_ring_virt,
+            TxDescriptor {
+                addr: tx_buf_frame.start_address().as_u64(),
+                length: frame.len() as u16,
+                cso: 0,
+                cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
+                status: 0,
+                css: 0,
+                special: 0,
+            },
+        );
+
+        let ctrl = read_reg(mmio_base, REG_CTRL);
+        write_reg(mmio_base, REG_CTRL, ctrl | CTRL_SLU);
+
+        let tx_ring_phys = tx_ring_frame.start_address().as_u64();
+        write_reg(mmio_base, REG_TDBAL, (tx_ring_phys & 0xFFFF_FFFF) as u32);
+        write_reg(mmio_base, REG_TDBAH, (tx_ring_phys >> 32) as u32);
+        write_reg(mmio_base, REG_TDLEN, (NUM_TX_DESCRIPTORS * 16) as u32);
+        write_reg(mmio_base, REG_TDH, 0);
+        write_reg(mmio_base, REG_TDT, 0);
+        write_reg(mmio_base, REG_TIPG, TIPG_DEFAULT);
+        write_reg(
+            mmio_base,
+            REG_TCTL,
+            TCTL_EN | TCTL_PSP | TCTL_CT_DEFAULT | TCTL_COLD_FULL_DUPLEX,
+        );
+        write_reg(mmio_base, REG_TDT, 1);
+    }
+
+    let tx_start_tick = crate::interrupts::timer_ticks();
+    let mut tx_ok = false;
+    unsafe {
+        loop {
+            let status = core::ptr::read_volatile(core::ptr::addr_of!((*tx_ring_virt).status));
+            if status & TXD_STATUS_DD != 0 {
+                tx_ok = true;
+                break;
+            }
+            if crate::interrupts::timer_ticks() - tx_start_tick > 90 {
+                break;
+            }
+            x86_64::instructions::hlt();
+        }
+    }
+    if !tx_ok {
+        return Err("dns_query_test: TX timed out waiting for descriptor DD");
+    }
+
+    let mut reply_received = false;
+    let mut qr_bit_set = false;
+    let mut answer_count: u16 = 0;
+    let rx_start_tick = crate::interrupts::timer_ticks();
+    unsafe {
+        loop {
+            let status = core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).status));
+            if status & RXD_STAT_DD != 0 {
+                let length =
+                    core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).length)) as usize;
+                let buf_virt = (phys_offset + rx_buf_frame.start_address().as_u64()) as *const u8;
+                let data = core::slice::from_raw_parts(buf_virt, length);
+
+                // Ethernet: EtherType IPv4. IPv4: protocol UDP, source
+                // address is the DNS proxy we queried. Each check is
+                // independent real evidence, the same reasoning ping's
+                // own is_our_reply check already established.
+                let ip_start = icmp::ETHERNET_HEADER_LEN;
+                let udp_start = ip_start + icmp::IPV4_HEADER_LEN;
+                let dns_start = udp_start + udp::UDP_HEADER_LEN;
+                let is_our_reply = data.len() > dns_start
+                    && data[12] == 0x08
+                    && data[13] == 0x00
+                    && data[ip_start + 9] == udp::IP_PROTOCOL_UDP
+                    && icmp::checksum_is_valid(&data[ip_start..udp_start])
+                    && data[ip_start + 12..ip_start + 16] == target_ip;
+
+                // Fase 89's own real-world bug (tcp_syn_test) applies
+                // identically here: the received buffer's own length is
+                // NOT the same as the real UDP datagram's length - a
+                // reply is very likely padded up to Ethernet's 60-byte
+                // minimum frame size, extra bytes the sender's own UDP
+                // length field never counted and that must NOT be fed
+                // into the pseudo-header checksum sum. The IPv4 header's
+                // own Total Length field is the one authoritative source
+                // for how many bytes past the IP header genuinely belong
+                // to this packet.
+                let ip_total_len = if is_our_reply {
+                    u16::from_be_bytes([data[ip_start + 2], data[ip_start + 3]]) as usize
+                } else {
+                    0
+                };
+                let real_udp_len = ip_total_len.saturating_sub(icmp::IPV4_HEADER_LEN);
+                let udp_end = (udp_start + real_udp_len).min(data.len());
+
+                if is_our_reply {
+                    if let Ok(info) =
+                        udp::parse_udp_datagram(target_ip, SRC_IP, &data[udp_start..udp_end])
+                    {
+                        if info.dest_port == SRC_PORT
+                            && info.source_port == DEST_PORT
+                            && dns_start + 8 <= udp_end
+                            && data[dns_start..dns_start + 2] == DNS_TRANSACTION_ID
+                        {
+                            reply_received = true;
+                            qr_bit_set = data[dns_start + 2] & 0x80 != 0;
+                            answer_count =
+                                u16::from_be_bytes([data[dns_start + 6], data[dns_start + 7]]);
+                            break;
+                        }
+                    }
+                }
+
+                // Not our reply - rearm this same descriptor and keep
+                // polling, same reasoning as arp_resolve/ping.
+                core::ptr::write_volatile(
+                    rx_ring_virt,
+                    RxDescriptor {
+                        addr: rx_buf_frame.start_address().as_u64(),
+                        length: 0,
+                        checksum: 0,
+                        status: 0,
+                        errors: 0,
+                        special: 0,
+                    },
+                );
+                write_reg(mmio_base, REG_RDT, 1);
+            }
+            if crate::interrupts::timer_ticks() - rx_start_tick > 90 {
+                break;
+            }
+            x86_64::instructions::hlt();
+        }
+    }
+
+    kprintln!(
+        "[E1000] dns_query_test to {:?}:53 - sent=true reply_received={} qr_bit_set={} answer_count={}",
+        target_ip,
+        reply_received,
+        qr_bit_set,
+        answer_count
+    );
+    serial_println!(
+        "[E1000] dns_query_test target={:?} port=53 sent=true reply_received={} qr_bit_set={} answer_count={}",
+        target_ip,
+        reply_received,
+        qr_bit_set,
+        answer_count
+    );
+
+    Ok((reply_received, qr_bit_set, answer_count))
+}
