@@ -194,11 +194,13 @@ pub fn dispatch_syscall(
             // real, present memory - trusted at exactly the level every
             // other raw pointer already used throughout this codebase is
             // (e.g. e1000's DMA buffers), now with an actual check behind
-            // that trust instead of an unconditional assumption. Still
-            // does NOT verify the stated lengths stay within a single
-            // mapping (a slice starting on a valid page could still run
-            // off the end into unmapped memory) - real, separate
-            // follow-on work, not this Fase's own scope.
+            // that trust instead of an unconditional assumption. Fase 77
+            // closed the one gap an earlier version of this comment used
+            // to flag here: `pointer_is_mapped_checked` above was passed
+            // each pointer's REAL byte length, and checks every page the
+            // resulting range touches, not just the first one - a slice
+            // cannot run off the end into unmapped memory without that
+            // being caught above, before any of these four are built.
             unsafe {
                 let weights = core::slice::from_raw_parts(args.weights, args.weights_len);
                 let inputs = core::slice::from_raw_parts(args.inputs, args.inputs_len);

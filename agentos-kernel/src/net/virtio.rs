@@ -656,21 +656,18 @@ pub struct RxRecvInfo {
 /// `gateway_ip=Some([10, 0, 2, 2])` - the actual success path, reached
 /// for the first time in this mystery's whole 5-round history.
 ///
-/// **Separately, and still genuinely open**: the kernel's own standard
-/// boot command (`kernel-ci.yml`'s invocation, matching
-/// `boot_kernel.bat`) still adds `-device virtio-net-pci` with no
-/// explicit `-netdev` of its own, so under THAT exact command this
-/// device still has no working backend at all (QEMU's one implicit
-/// default netdev goes to e1000 instead) - this fix is real and verified
-/// under an explicit dual-`-netdev` config, but CI's own boot-test will
-/// still show a timeout here, for this separate, already-understood,
-/// pre-existing reason - not evidence this fix doesn't work. Wiring
-/// virtio-net-pci its own explicit `-netdev` into the SHARED boot
-/// command (now that doing so would finally have a real payoff) is
-/// real, separate follow-on work of its own, deliberately not bundled
-/// into this fix - it needs its own dedicated verification that e1000's
-/// own already-stable behavior doesn't shift when made explicit
-/// alongside it, a bigger-blast-radius change than this fix's own scope.
+/// **Update (Fase 82)**: the kernel's own standard boot command
+/// (`kernel-ci.yml`'s invocation, matching `boot_kernel.bat`) now DOES
+/// give virtio-net-pci its own explicit `-netdev user`, alongside
+/// e1000's own explicit `-netdev` (previously relying on QEMU's one
+/// implicit default, always claimed by e1000, which is what left this
+/// device with no working backend at all under CI). This was the
+/// follow-on work this paragraph used to describe as not yet bundled in -
+/// verified locally first (3 repeated boots under this exact dual-netdev
+/// config, full-suite regression unchanged, e1000's own PCI slot/MAC/
+/// every existing e1000 test untouched) before landing in CI, where this
+/// device's own second-round-trip test (this fix) now has a real backend
+/// to actually run against.
 ///
 /// Deliberately a NEW, independent function rather than reusing or
 /// refactoring `send_test_frame` - its exact behavior and log output are
