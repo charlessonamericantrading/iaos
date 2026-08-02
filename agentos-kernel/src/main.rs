@@ -3273,6 +3273,35 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         early_exit_switches
     );
 
+    // Fase 105: proves a NON-task-0 ring3_mt task can voluntarily YIELD
+    // (int 0x86) - give up its turn while remaining eligible - rather
+    // than only ever being switched away involuntarily by the timer or
+    // permanently via int 0x84's own RETIRE (the test right above this
+    // one). See ring3::run_voluntary_yield_ring3_mt_test's own doc. Safe
+    // to place here for the same reason every other ring3_mt-family test
+    // in this block is: no PCB entry spawned, only the ring-0 priority
+    // test below must stay absolutely last.
+    kprintln!(
+        "[KERNEL INIT] Testing voluntary yield in ring3_mt (task1 yields via int 0x86, should resume and keep running, then retires via int 0x84)..."
+    );
+    let (
+        voluntary_yield_task0,
+        voluntary_yield_task1_eax,
+        voluntary_yield_task1_done,
+        voluntary_yield_task2_eax,
+        voluntary_yield_task2_done,
+        voluntary_yield_switches,
+    ) = ring3::run_voluntary_yield_ring3_mt_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - voluntary_yield_mt_test returned task0_checksum={:#x} task1_last_eax={:#x} task1_done={} task2_last_eax={:#x} task2_done={} switch_count={}",
+        voluntary_yield_task0,
+        voluntary_yield_task1_eax,
+        voluntary_yield_task1_done,
+        voluntary_yield_task2_eax,
+        voluntary_yield_task2_done,
+        voluntary_yield_switches
+    );
+
     // Fase 98: proves a ring-3 program's machine code can flow through
     // the real FAT12 filesystem (write, read back, delete) and still
     // execute correctly, not just that a kernel-embedded byte array can -

@@ -2084,6 +2084,63 @@ pub(crate) extern "C" fn ring3_mt_task_done_entry_asm() {
     );
 }
 
+/// Fase 105: entry point for vector 0x86 - `scheduler::ring3_mt`'s own
+/// voluntary YIELD signal, the missing counterpart to `RING3_COOP_
+/// YIELD_INT_VECTOR` this mechanism never had (it previously only ever
+/// gave up a task's turn involuntarily, via the timer, or permanently,
+/// via `int 0x84`/`ring3_mt_task_done_entry_asm` above). Byte-for-byte
+/// the SAME naked-asm shape as that function (and, transitively,
+/// `interrupts::timer_interrupt_entry_asm`) - copied verbatim rather
+/// than re-derived, since this vector operates on the exact same
+/// 160-byte full-GPR context format for the exact same reason: whichever
+/// task the scheduler picks next could clobber any register, so a
+/// voluntary give-up-the-turn must be resumable exactly like an
+/// involuntary preemption would be. The ONE difference from `ring3_mt_
+/// task_done_entry_asm`: `call`s `scheduler::ring3_mt::tick` - the
+/// UNCHANGED function a real timer tick already calls - instead of
+/// `task_done`, since yielding keeps the current task eligible to run
+/// again rather than retiring it for good.
+#[unsafe(naked)]
+pub(crate) extern "C" fn ring3_mt_yield_entry_asm() {
+    naked_asm!(
+        "push rbx",
+        "push rcx",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rax",
+        "mov rdi, rsp",
+        "call {helper}",
+        "mov rsp, rax",
+        "pop rax",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rcx",
+        "pop rbx",
+        "iretq",
+        helper = sym crate::scheduler::ring3_mt::tick,
+    );
+}
+
 /// Builds a fresh, never-yet-run ring-3 task's own 160-byte context
 /// buffer, in the EXACT shape `timer_interrupt_entry_asm`'s own epilogue
 /// expects to resume from after `scheduler::ring3_mt::tick` hands it
@@ -2189,6 +2246,85 @@ fn build_ring3_mt_checksum_program(
             program[45] = 0xFE; // jmp $ (never exits - see this fn's own doc)
         }
     }
+    program
+}
+
+/// Fase 105: builds a ring-3 program that voluntarily yields via `int
+/// 0x86` (`interrupts::RING3_MT_YIELD_INT_VECTOR`) partway through,
+/// rather than only ever giving up its turn via an involuntary timer
+/// tick or retiring for good via `int 0x84`. Deliberately its OWN
+/// dedicated builder rather than a third `ProgramEnding` variant on
+/// `build_ring3_mt_checksum_program` above - that function's own shape
+/// (one register load, one loop, one checksum, one ending) doesn't fit a
+/// program that needs to prove it kept running AFTER being resumed, the
+/// same "write a genuinely new shape rather than force-fit an existing
+/// one" call Fase 96 already made for its own early-exit cooperative
+/// test.
+///
+/// Every individual instruction encoding here is copied verbatim from
+/// `build_ring3_mt_checksum_program` above (`mov eax, imm32` = `B8` +
+/// 4 bytes; `mov r8d, imm32` = `41 B8` + 4 bytes; the `dec r8d`/`jnz -5`
+/// pair as one reusable 5-byte "spin loop_count times" unit; `int 0x84`
+/// = `CD 84`) plus one genuinely new byte pair, `int 0x86` = `CD 86`,
+/// the direct analog of every other `int 0x8X` immediate-interrupt
+/// encoding already used throughout this file. Every offset below was
+/// hand-verified by sequential counting, the same discipline this whole
+/// ring-3 arc has used since Fase 83's own hand-assembly work:
+///
+/// - `0`: `mov eax, register_prefix` (an initial "task started" marker)
+/// - `5`: `mov r8d, loop_before`
+/// - `11..16`: `dec r8d` / `jnz -5` (spins `loop_before` times)
+/// - `16`: `mov eax, register_prefix+1` (proves the FIRST loop finished)
+/// - `21`: `int 0x86` (voluntary yield - does NOT retire this slot)
+/// - `23`: `mov eax, register_prefix+2` (proves the task genuinely
+///   RESUMED at the correct instruction after yielding, rather than
+///   never running again)
+/// - `28..39`: `mov r8d, loop_after` / `dec r8d` / `jnz -5` (spins
+///   `loop_after` times, proving it kept running afterward, not just
+///   executed one lucky instruction)
+/// - `39`: `mov eax, register_prefix+3` (proves the SECOND loop finished)
+/// - `44`: `int 0x84` (retires for good, same as every other background
+///   task in this test family)
+///
+/// If the voluntary yield were silently broken (the slot never resumed,
+/// the same failure shape a broken `task_done` would produce), the last
+/// observed `eax` would stay stuck at `register_prefix+1` forever -
+/// structurally distinguishable from the correct final value of
+/// `register_prefix+3`, not a coincidentally-matching wrong answer.
+fn build_voluntary_yield_program(
+    register_prefix: u32,
+    loop_before: u32,
+    loop_after: u32,
+) -> [u8; 46] {
+    let mut program = [0u8; 46];
+    program[0] = 0xB8;
+    program[1..5].copy_from_slice(&register_prefix.to_le_bytes());
+    program[5] = 0x41;
+    program[6] = 0xB8;
+    program[7..11].copy_from_slice(&loop_before.to_le_bytes());
+    program[11] = 0x41;
+    program[12] = 0xFF;
+    program[13] = 0xC8; // dec r8d
+    program[14] = 0x75;
+    program[15] = 0xFB; // jnz -5 (back to `dec r8d`)
+    program[16] = 0xB8;
+    program[17..21].copy_from_slice(&(register_prefix + 1).to_le_bytes());
+    program[21] = 0xCD;
+    program[22] = 0x86; // int 0x86 (Fase 105's own voluntary yield vector)
+    program[23] = 0xB8;
+    program[24..28].copy_from_slice(&(register_prefix + 2).to_le_bytes());
+    program[28] = 0x41;
+    program[29] = 0xB8;
+    program[30..34].copy_from_slice(&loop_after.to_le_bytes());
+    program[34] = 0x41;
+    program[35] = 0xFF;
+    program[36] = 0xC8; // dec r8d
+    program[37] = 0x75;
+    program[38] = 0xFB; // jnz -5 (back to `dec r8d`)
+    program[39] = 0xB8;
+    program[40..44].copy_from_slice(&(register_prefix + 3).to_le_bytes());
+    program[44] = 0xCD;
+    program[45] = 0x84; // int 0x84 (Fase 93's own retire vector)
     program
 }
 
@@ -2592,6 +2728,148 @@ pub fn run_early_exit_ring3_mt_test() -> (u64, u32, bool, u32, bool, usize) {
     );
     serial_println!(
         "[RING3] early_exit_mt_test task0_checksum={:#x} task1_last_eax={:#x} task1_done={} task2_last_eax={:#x} task2_done={} switch_count={}",
+        task0_exit_code,
+        task1_last_eax,
+        task1_done,
+        task2_last_eax,
+        task2_done,
+        switch_count
+    );
+
+    (
+        task0_exit_code,
+        task1_last_eax,
+        task1_done,
+        task2_last_eax,
+        task2_done,
+        switch_count,
+    )
+}
+
+/// Fase 105: proves a NON-task-0 ring3_mt task can voluntarily YIELD
+/// (give up its current turn via `int 0x86` while remaining eligible to
+/// run again) rather than only ever being switched away involuntarily by
+/// the timer, or permanently via `int 0x84`'s own RETIRE - the mirror
+/// image of `run_early_exit_ring3_mt_test` above, which proved the
+/// RETIRE half of this same pairing back in Fase 93. Every task here
+/// shares `Priority::Normal` (nothing about priority selection is under
+/// test), the same isolation discipline `run_early_exit_ring3_mt_test`
+/// itself already used for its own new variable.
+///
+/// **Task 0** (`0x1...` pattern, unchanged `LOOP_COUNT=150_000_000`,
+/// `ExitViaInt81`): identical to every earlier ring3_mt test. **Task 1**
+/// (`0x2...` pattern, `build_voluntary_yield_program`) is the ONE new
+/// thing: spins a first small loop, writes a marker, voluntarily yields
+/// via `int 0x86`; only if it genuinely gets resumed later does it then
+/// spin a SECOND small loop and write a DIFFERENT final marker before
+/// retiring via `int 0x84`. **Task 2** (`0x3...` pattern, its own
+/// distinct small loop, unchanged `SpinForever`) is the same control
+/// every prior test in this family uses, proving task 1's new yield
+/// vector doesn't affect anyone else.
+///
+/// Verification has the same "structural, not coincidental" property
+/// `run_early_exit_ring3_mt_test`'s own doc already established: if the
+/// new vector silently failed to resume task 1 (treating a yield like an
+/// accidental retire), the last observed `eax` would be stuck at
+/// `TASK1_EXPECTED_BEFORE_YIELD` (the marker written right before `int
+/// 0x86`) forever, a value structurally DIFFERENT from - not
+/// coincidentally equal to - the correct final `TASK1_EXPECTED` (written
+/// only after the second loop, which only runs post-resume). `task1_
+/// done=true` additionally confirms the pre-existing RETIRE mechanism
+/// still works correctly for a task that voluntarily yielded first -
+/// proof the two mechanisms compose, not just that each works alone.
+pub fn run_voluntary_yield_ring3_mt_test() -> (u64, u32, bool, u32, bool, usize) {
+    use crate::scheduler::process::Priority;
+
+    let info = gdt::ring3_info();
+    let user_cs = info.user_code_selector as u64;
+    let user_ss = info.user_data_selector as u64;
+
+    let code_addr = USER_TEST_PAGE_ADDR;
+    let task0_entry = code_addr;
+    let task1_entry = code_addr + 128;
+    let task2_entry = code_addr + 256;
+    let task0_stack_top = code_addr + 2048;
+    let task1_stack_top = code_addr + 3072;
+    let task2_stack_top = code_addr + 4096;
+
+    const TASK0_EXPECTED: u32 = 0x1000_0004;
+    const TASK1_EXPECTED_BEFORE_YIELD: u32 = 0x2000_0001;
+    const TASK1_EXPECTED: u32 = 0x2000_0003;
+    const TASK2_EXPECTED: u32 = 0x3000_0004;
+    const TASK0_LOOP_COUNT: u32 = 150_000_000;
+    const TASK1_LOOP_BEFORE: u32 = 5_000_000;
+    const TASK1_LOOP_AFTER: u32 = 5_000_000;
+    const TASK2_LOOP_COUNT: u32 = 6_000_000;
+
+    let task0 =
+        build_ring3_mt_checksum_program(0x1000_0000, TASK0_LOOP_COUNT, ProgramEnding::ExitViaInt81);
+    let task1 = build_voluntary_yield_program(0x2000_0000, TASK1_LOOP_BEFORE, TASK1_LOOP_AFTER);
+    let task2 =
+        build_ring3_mt_checksum_program(0x3000_0000, TASK2_LOOP_COUNT, ProgramEnding::SpinForever);
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(task0.as_ptr(), task0_entry as *mut u8, task0.len());
+        core::ptr::copy_nonoverlapping(task1.as_ptr(), task1_entry as *mut u8, task1.len());
+        core::ptr::copy_nonoverlapping(task2.as_ptr(), task2_entry as *mut u8, task2.len());
+    }
+
+    let task1_ctx = prepare_ring3_mt_task_ctx(
+        task1_entry,
+        user_cs,
+        user_ss,
+        task1_stack_top,
+        RING3_TEST_RFLAGS,
+    );
+    let task2_ctx = prepare_ring3_mt_task_ctx(
+        task2_entry,
+        user_cs,
+        user_ss,
+        task2_stack_top,
+        RING3_TEST_RFLAGS,
+    );
+
+    kprintln!(
+        "[RING3] Testing voluntary yield in ring3_mt (task1 yields via int 0x86, should resume and keep running, then retires via int 0x84)..."
+    );
+    serial_println!(
+        "[RING3] voluntary_yield_mt_test starting: task0=Normal(exits) task1=Normal(yields once, then retires) task2=Normal(spins forever)"
+    );
+
+    let (task0_exit_code, other_last_eax, other_done, switch_count) =
+        crate::scheduler::ring3_mt::run_multitasking(
+            Priority::Normal,
+            &[(Priority::Normal, task1_ctx), (Priority::Normal, task2_ctx)],
+            || unsafe {
+                enter_ring3(
+                    task0_entry,
+                    user_cs,
+                    user_ss,
+                    task0_stack_top,
+                    RING3_TEST_RFLAGS,
+                )
+            },
+        );
+    let task1_last_eax = other_last_eax[0];
+    let task2_last_eax = other_last_eax[1];
+    let task1_done = other_done[0];
+    let task2_done = other_done[1];
+
+    kprintln!(
+        "[RING3] Back in ring-0 - voluntary_yield_mt_test task0_checksum={:#x} (expected {:#x}) task1_last_eax={:#x} (expected {:#x}, would be stuck at {:#x} if the yield never resumed) task1_done={} task2_last_eax={:#x} (expected {:#x}) task2_done={} switch_count={}",
+        task0_exit_code,
+        TASK0_EXPECTED,
+        task1_last_eax,
+        TASK1_EXPECTED,
+        TASK1_EXPECTED_BEFORE_YIELD,
+        task1_done,
+        task2_last_eax,
+        TASK2_EXPECTED,
+        task2_done,
+        switch_count
+    );
+    serial_println!(
+        "[RING3] voluntary_yield_mt_test task0_checksum={:#x} task1_last_eax={:#x} task1_done={} task2_last_eax={:#x} task2_done={} switch_count={}",
         task0_exit_code,
         task1_last_eax,
         task1_done,

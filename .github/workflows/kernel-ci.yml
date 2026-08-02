@@ -720,6 +720,22 @@ jobs:
           # after one last correct tick could also produce) - and that the
           # unrelated control task's own old behavior is untouched.
           grep -q "RING3\] early_exit_mt_test task0_checksum=0x10000004 task1_last_eax=0x20000004 task1_done=true task2_last_eax=0x30000004 task2_done=false" boot.log
+          # Fase 105: the mirror image of the test right above - a
+          # NON-task-0 ring3_mt task can now voluntarily YIELD (a new
+          # dedicated vector, int 0x86) and remain eligible to run again,
+          # instead of only ever giving up its turn involuntarily (the
+          # timer) or permanently (int 0x84, tested above). Task 1 here
+          # spins a small loop, writes 0x20000001, yields via int 0x86,
+          # then - only if genuinely resumed - spins a second small loop
+          # and writes 0x20000003 before retiring via int 0x84. Task 2
+          # keeps the unrelated SpinForever control unchanged. task1_last_
+          # eax=0x20000003 (not 0x20000001, the value it would be stuck at
+          # forever if the yield never resumed) is the real, structural
+          # proof the resume genuinely happened - not a coincidentally-
+          # matching wrong answer. task1_done=true additionally proves the
+          # pre-existing retire mechanism still composes correctly with a
+          # task that yielded first.
+          grep -q "RING3\] voluntary_yield_mt_test task0_checksum=0x10000004 task1_last_eax=0x20000003 task1_done=true task2_last_eax=0x30000004 task2_done=false" boot.log
           # Fase 98: every ring-3 program before this one has been a
           # kernel-source byte array, never bytes that flowed through the
           # real filesystem. This test writes the SAME 15-byte program

@@ -155,6 +155,35 @@ pub const RING3_MT_TASK_DONE_INT_VECTOR: u8 = 0x84;
 /// helper` instead of `ring3::ring3_coop_yield_helper`.
 pub const RING3_COOP_TASK_DONE_INT_VECTOR: u8 = 0x85;
 
+/// A SEVENTH DPL=3 vector (Fase 105) - `scheduler::ring3_mt`'s own
+/// missing counterpart to `RING3_COOP_YIELD_INT_VECTOR`. Since Fase 93,
+/// `ring3_mt` has had a voluntary RETIRE (`int 0x84`, permanent - the
+/// slot never runs again) but no voluntary YIELD (give up the current
+/// turn, remain eligible to run again later) - the exact capability
+/// `ring3_coop`'s own `int 0x83` has had since Fase 83. Before this,
+/// only an involuntary timer tick could ever make a `ring3_mt` task give
+/// up its turn without retiring for good.
+///
+/// Structurally, this is the SAME 160-byte full-15-GPR context
+/// `RING3_MT_TASK_DONE_INT_VECTOR` already operates on (a voluntary
+/// give-up-the-turn is resumed exactly like an involuntary preemption
+/// would be - some OTHER task the scheduler picks next could clobber any
+/// register, so nothing less than the full set is safe to resume from),
+/// so its entry stub reuses `timer_interrupt_entry_asm`'s exact shape
+/// verbatim too, the same reuse `RING3_MT_TASK_DONE_INT_VECTOR`'s own doc
+/// already justified - but it calls `scheduler::ring3_mt::tick` (the
+/// SAME selection logic a real timer tick already runs, completely
+/// unchanged) instead of `task_done`, since yielding keeps the task
+/// eligible rather than retiring it. Unlike `task_done`, task 0 is not
+/// structurally barred from ever using this vector - a voluntary yield
+/// doesn't remove a slot from the selection pool the way retiring does,
+/// so nothing about task 0's own "the only exit path" invariant is at
+/// risk - this Fase's own test simply doesn't happen to exercise that
+/// case, matching the "exercise the new thing on a background task,
+/// keep an unrelated control task alongside it" precedent every prior
+/// `ring3_mt` generalization in this arc already used.
+pub const RING3_MT_YIELD_INT_VECTOR: u8 = 0x86;
+
 /// Counts real invocations of the DPL=3 syscall gate - lets a self-test
 /// verify the gate genuinely fired (not just "the CPU didn't crash"),
 /// the same reasoning `TIMER_TICKS` already established for verifying
@@ -254,6 +283,16 @@ lazy_static! {
             idt[RING3_COOP_TASK_DONE_INT_VECTOR]
                 .set_handler_addr(VirtAddr::new(
                     crate::ring3::ring3_coop_task_done_entry_asm as *const () as u64,
+                ))
+                .set_privilege_level(PrivilegeLevel::Ring3);
+        }
+        // Same reasoning (DPL=3, raw set_handler_addr) - see
+        // RING3_MT_YIELD_INT_VECTOR's own doc for why this is a
+        // SEVENTH, dedicated vector.
+        unsafe {
+            idt[RING3_MT_YIELD_INT_VECTOR]
+                .set_handler_addr(VirtAddr::new(
+                    crate::ring3::ring3_mt_yield_entry_asm as *const () as u64,
                 ))
                 .set_privilege_level(PrivilegeLevel::Ring3);
         }
