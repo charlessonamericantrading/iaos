@@ -15,7 +15,7 @@
 //! (bare or trailing a label sequence) to find out what name it points
 //! at - only ever how many bytes it occupies, real but strictly
 //! narrower than general name decompression - nor does it handle
-//! multiple QUESTIONS, or decode any record type besides A - real,
+//! multiple QUESTIONS, or decode any record type besides A/AAAA - real,
 //! separate, substantially larger DNS-client work if ever needed.
 //!
 //! Fase 115: `parse_first_a_record` now genuinely searches THROUGH
@@ -43,6 +43,21 @@
 //! loop-prevention work needed to close this gap, unlike a real
 //! name-decompression routine would need.
 //!
+//! Fase 124: `parse_first_aaaa_record` decodes AAAA (IPv6, RFC 3596)
+//! records the same way `parse_first_a_record` already decodes A -
+//! genuinely additive, not a generalization of what "not a resolver"
+//! means, since AAAA's RDATA is a fixed 16-byte address exactly like
+//! A's fixed 4-byte one (unlike CNAME, whose RDATA is itself a NAME
+//! that could be compressed - decoding THAT would need real
+//! chain-following/loop-prevention logic this module still doesn't
+//! have, a genuinely different and larger problem). The record-walking
+//! loop itself (skip non-matching records via their own RDLENGTH) was
+//! shared between both functions via `find_first_record_rdata`, since
+//! it was byte-for-byte identical except for which TYPE to look for and
+//! how many RDATA bytes the caller copies out - the same real, not
+//! speculative, duplication this project's own later Fases (97, 111,
+//! 119, 122) have each found and unified elsewhere.
+//!
 //! Fase 110 adds the encoding-side mirror of the same idea: `build_query`
 //! builds a real question section for ANY caller-supplied hostname,
 //! closing the gap `dns_query_test`'s own Fase 106 doc left open (it
@@ -55,6 +70,9 @@ use alloc::vec::Vec;
 
 pub const DNS_HEADER_LEN: usize = 12;
 pub const DNS_TYPE_A: u16 = 1;
+/// RFC 3596: the AAAA record type (a host's IPv6 address, the exact
+/// IPv6 counterpart to `DNS_TYPE_A`'s IPv4 one).
+pub const DNS_TYPE_AAAA: u16 = 28;
 pub const DNS_QCLASS_IN: u16 = 1;
 /// RFC 1035 section 3.1: a label's length byte is stored in 6 bits (the
 /// top two bits are reserved for the `11` compression-pointer marker
@@ -105,6 +123,52 @@ pub const MAX_LABEL_LEN: usize = 63;
 /// actually being looked at, not previously needed when only the first
 /// one was ever inspected.
 pub fn parse_first_a_record(message: &[u8], question_len: usize) -> Result<[u8; 4], &'static str> {
+    let rdata = find_first_record_rdata(message, question_len, DNS_TYPE_A)
+        .map_err(|_| "no A record found among this reply's own answer records")?;
+    if rdata.len() != 4 {
+        return Err("A record's own RDLENGTH is not 4");
+    }
+    let mut ip = [0u8; 4];
+    ip.copy_from_slice(rdata);
+    Ok(ip)
+}
+
+/// Searches THROUGH a DNS response's own answer records for the first
+/// AAAA (RFC 3596, IPv6) record, the exact same way `parse_first_a_record`
+/// searches for the first A one - see that function's own doc for the
+/// NAME-field/RDLENGTH-skip details shared by both (Fase 124: both call
+/// [`find_first_record_rdata`] underneath).
+pub fn parse_first_aaaa_record(
+    message: &[u8],
+    question_len: usize,
+) -> Result<[u8; 16], &'static str> {
+    let rdata = find_first_record_rdata(message, question_len, DNS_TYPE_AAAA)
+        .map_err(|_| "no AAAA record found among this reply's own answer records")?;
+    if rdata.len() != 16 {
+        return Err("AAAA record's own RDLENGTH is not 16");
+    }
+    let mut ip = [0u8; 16];
+    ip.copy_from_slice(rdata);
+    Ok(ip)
+}
+
+/// The record-walking loop shared by `parse_first_a_record` and
+/// `parse_first_aaaa_record` (Fase 124): searches THROUGH a DNS
+/// response's own answer records (up to `ancount` of them) and returns
+/// the RDATA slice of the first one whose TYPE matches `record_type`,
+/// skipping any non-matching record using its own declared RDLENGTH -
+/// real, necessary work now that more than one record (and more than
+/// one TYPE) is actually being looked for, not previously needed when
+/// only a single hardcoded TYPE was ever inspected. Does NOT validate
+/// the matching record's own RDLENGTH against what its TYPE actually
+/// requires - that's each caller's own job (a 4-byte check for A, a
+/// 16-byte one for AAAA), since this function has no opinion on what a
+/// "correct" length is for a TYPE it doesn't itself know the meaning of.
+fn find_first_record_rdata(
+    message: &[u8],
+    question_len: usize,
+    record_type: u16,
+) -> Result<&[u8], &'static str> {
     if message.len() < DNS_HEADER_LEN {
         return Err("DNS message shorter than the 12-byte header");
     }
@@ -123,7 +187,7 @@ pub fn parse_first_a_record(message: &[u8], question_len: usize) -> Result<[u8; 
         if message.len() < fixed_start + 10 {
             return Err("DNS message too short to contain the answer record's fixed fields");
         }
-        let record_type = u16::from_be_bytes([message[fixed_start], message[fixed_start + 1]]);
+        let this_type = u16::from_be_bytes([message[fixed_start], message[fixed_start + 1]]);
         let rdlength =
             u16::from_be_bytes([message[fixed_start + 8], message[fixed_start + 9]]) as usize;
         let rdata_start = fixed_start + 10;
@@ -131,20 +195,15 @@ pub fn parse_first_a_record(message: &[u8], question_len: usize) -> Result<[u8; 
             return Err("DNS message too short to contain the answer record's own RDATA");
         }
 
-        if record_type == DNS_TYPE_A {
-            if rdlength != 4 {
-                return Err("A record's own RDLENGTH is not 4");
-            }
-            let mut ip = [0u8; 4];
-            ip.copy_from_slice(&message[rdata_start..rdata_start + 4]);
-            return Ok(ip);
+        if this_type == record_type {
+            return Ok(&message[rdata_start..rdata_start + rdlength]);
         }
 
-        // Not an A record - skip past it (using its own declared
+        // Not the requested type - skip past it (using its own declared
         // RDLENGTH) and check the next answer.
         offset = rdata_start + rdlength;
     }
-    Err("no A record found among this reply's own answer records")
+    Err("no record of the requested type found among this reply's own answer records")
 }
 
 /// Returns the byte length of the NAME field starting at `offset` -

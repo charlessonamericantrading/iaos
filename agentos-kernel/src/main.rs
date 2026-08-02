@@ -2174,13 +2174,53 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let truncated_partial_pointer_rejected =
             dns::parse_first_a_record(&PARTIAL_COMPRESSION_REPLY[..34], QUESTION_LEN).is_err();
 
+        // Fase 124: `parse_first_aaaa_record` decodes AAAA (IPv6)
+        // records - real, additive capability, the record-walking loop
+        // itself shared with parse_first_a_record via
+        // find_first_record_rdata (see net::dns's own module doc).
+        // Same "example.com" question section as every other fixture in
+        // this suite; answer NAME is a compression pointer (the common
+        // case, already covered for A by a_record_parsed_ok), RDATA is
+        // 2001:db8::1 (RFC 3849's documentation prefix, the IPv6
+        // counterpart to the RFC 5737 TEST-NET addresses used elsewhere
+        // in this suite).
+        #[rustfmt::skip]
+        const AAAA_RECORD_REPLY: [u8; 57] = [
+            // header: transaction ID, flags, QDCOUNT=1, ANCOUNT=1, NSCOUNT=0, ARCOUNT=0
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // question: "example.com" AAAA/IN (17 bytes)
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x1C, 0x00, 0x01,
+            // answer: NAME=compression pointer to offset 12, TYPE=AAAA,
+            // CLASS=IN, TTL=600, RDLENGTH=16, RDATA=2001:db8::1
+            0xC0, 0x0C, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x02, 0x58, 0x00, 0x10,
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        const EXPECTED_AAAA_IP: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ];
+        let aaaa_record_parsed_ok =
+            dns::parse_first_aaaa_record(&AAAA_RECORD_REPLY, QUESTION_LEN) == Ok(EXPECTED_AAAA_IP);
+
+        // Proves the shared record-walking loop genuinely filters by
+        // TYPE, not just "whatever matches first": FAKE_REPLY's own
+        // single answer is a real, well-formed A record, and asking
+        // `parse_first_aaaa_record` to find an AAAA one in it correctly
+        // fails, since none exists - reusing an existing fixture rather
+        // than a dedicated one, since FAKE_REPLY already proves exactly
+        // the shape needed (a reply with answers, but none of the
+        // requested type).
+        let no_matching_aaaa_rejected =
+            dns::parse_first_aaaa_record(&FAKE_REPLY, QUESTION_LEN).is_err();
+
         kprintln!(
-            "[DNS] answer-parse self-test: a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} malformed_name_rejected={} multi_answer_ok={} uncompressed_name_parsed_ok={} partial_compression_parsed_ok={} truncated_partial_pointer_rejected={}",
-            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, malformed_name_rejected, multi_answer_ok, uncompressed_name_parsed_ok, partial_compression_parsed_ok, truncated_partial_pointer_rejected
+            "[DNS] answer-parse self-test: a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} malformed_name_rejected={} multi_answer_ok={} uncompressed_name_parsed_ok={} partial_compression_parsed_ok={} truncated_partial_pointer_rejected={} aaaa_record_parsed_ok={} no_matching_aaaa_rejected={}",
+            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, malformed_name_rejected, multi_answer_ok, uncompressed_name_parsed_ok, partial_compression_parsed_ok, truncated_partial_pointer_rejected, aaaa_record_parsed_ok, no_matching_aaaa_rejected
         );
         serial_println!(
-            "[DNS] answer_parse_selftest a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} malformed_name_rejected={} multi_answer_ok={} uncompressed_name_parsed_ok={} partial_compression_parsed_ok={} truncated_partial_pointer_rejected={}",
-            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, malformed_name_rejected, multi_answer_ok, uncompressed_name_parsed_ok, partial_compression_parsed_ok, truncated_partial_pointer_rejected
+            "[DNS] answer_parse_selftest a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} malformed_name_rejected={} multi_answer_ok={} uncompressed_name_parsed_ok={} partial_compression_parsed_ok={} truncated_partial_pointer_rejected={} aaaa_record_parsed_ok={} no_matching_aaaa_rejected={}",
+            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, malformed_name_rejected, multi_answer_ok, uncompressed_name_parsed_ok, partial_compression_parsed_ok, truncated_partial_pointer_rejected, aaaa_record_parsed_ok, no_matching_aaaa_rejected
         );
     }
 

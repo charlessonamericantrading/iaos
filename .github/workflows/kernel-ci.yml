@@ -1134,7 +1134,12 @@ jobs:
           # NAME parses to the correct IP; truncated_partial_pointer_
           # rejected proves the new bounds check rejects a pointer
           # missing its own second byte.
-          grep -q "DNS\] answer_parse_selftest a_record_parsed_ok=true zero_answers_rejected=true non_a_record_rejected=true malformed_name_rejected=true multi_answer_ok=true uncompressed_name_parsed_ok=true partial_compression_parsed_ok=true truncated_partial_pointer_rejected=true" boot.log
+          # Fase 124: parse_first_aaaa_record decodes AAAA (IPv6)
+          # records too - aaaa_record_parsed_ok proves a real AAAA
+          # answer parses to the correct address; no_matching_aaaa_
+          # rejected proves the shared record-walking helper genuinely
+          # filters by TYPE (an A-only reply correctly yields no AAAA).
+          grep -q "DNS\] answer_parse_selftest a_record_parsed_ok=true zero_answers_rejected=true non_a_record_rejected=true malformed_name_rejected=true multi_answer_ok=true uncompressed_name_parsed_ok=true partial_compression_parsed_ok=true truncated_partial_pointer_rejected=true aaaa_record_parsed_ok=true no_matching_aaaa_rejected=true" boot.log
           # Fase 110: DNS query building (net::dns::build_query /
           # encode_qname) - pure logic, no hardware dependency, the
           # encoding-side mirror of the answer-parsing self-test right
