@@ -2957,9 +2957,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // allocates a real cluster holding "." (self) and ".." (parent,
     // cluster 0 meaning "the root") entries, the real FAT convention for
     // a directory - distinct from a plain file's cluster, which just
-    // holds opaque data. Deliberately NOT self-cleaning (no rmdir/
-    // delete_directory yet - out of scope for this Fase, matching how
-    // create_file/delete_file were built as separate steps): TESTDIR
+    // holds opaque data. Deliberately NOT self-cleaning at the time this
+    // test was written (Fase 31 - rmdir/delete_directory didn't exist
+    // yet, shipped two Fases later at Fase 33, matching how
+    // create_file/delete_file were built as separate steps too): TESTDIR
     // persists across repeat boots the same way AGENTOS.TXT does, and
     // mkdir on an existing name fails gracefully ("already exists"),
     // same tolerance create_file already established. The one thing

@@ -1,7 +1,11 @@
 //! Minimal read-only FAT32 support: parse the BIOS Parameter Block (BPB),
 //! walk the FAT cluster chain, list a directory, and read a file's
-//! contents by name. Short (8.3) names only; VFAT long-filename entries
-//! are recognized and skipped, not reconstructed.
+//! contents by name. At Fase 15 (when this module was first written),
+//! VFAT long-filename entries were only recognized and skipped, not
+//! reconstructed - Fase 38/40's own long-name reconstruction later
+//! landed directly in the shared `fat_common::parse_dir_sector` this
+//! module already calls, so a long name is genuinely usable here too
+//! now, not just in `fat12.rs`.
 //!
 //! Directory-entry parsing is shared with `fat12.rs` via `fat_common` -
 //! that part of the on-disk format is identical across FAT12/16/32, only
