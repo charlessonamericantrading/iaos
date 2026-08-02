@@ -2029,13 +2029,44 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let uncompressed_name_rejected =
             dns::parse_first_a_record(&uncompressed_name, QUESTION_LEN).is_err();
 
+        // Fase 115: the real, previously-unexamined case - this kernel's
+        // own real CI runs have observed answer_count=2 for "example.com"
+        // since Fase 106, yet this function had never actually been
+        // proven correct for more than a single answer record. Same
+        // question section as FAKE_REPLY, but ANCOUNT=2: a CNAME answer
+        // FIRST (RDLENGTH=2, an arbitrary 2-byte RDATA - its own content
+        // doesn't matter, only its declared length, since skipping past
+        // it correctly is exactly what's being tested), then a real A
+        // record SECOND. Proves parse_first_a_record genuinely walks
+        // past the non-A record using ITS OWN RDLENGTH rather than
+        // assuming the first answer already is the one it wants.
+        #[rustfmt::skip]
+        const MULTI_ANSWER_REPLY: [u8; 59] = [
+            // header: transaction ID, flags, QDCOUNT=1, ANCOUNT=2, NSCOUNT=0, ARCOUNT=0
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+            // question: "example.com" A/IN (17 bytes) - same as FAKE_REPLY
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+            // answer 1: NAME=compression pointer, TYPE=CNAME(5), CLASS=IN,
+            // TTL=600, RDLENGTH=2, RDATA=an arbitrary 2-byte compression
+            // pointer (its content is irrelevant - only its LENGTH matters,
+            // to prove the skip-past-it arithmetic is correct)
+            0xC0, 0x0C, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x02, 0x58, 0x00, 0x02, 0xC0, 0x0C,
+            // answer 2: NAME=compression pointer, TYPE=A, CLASS=IN,
+            // TTL=600, RDLENGTH=4, RDATA=192.0.2.42 (RFC 5737 TEST-NET-1)
+            0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x58, 0x00, 0x04, 192, 0, 2, 42,
+        ];
+        const EXPECTED_MULTI_IP: [u8; 4] = [192, 0, 2, 42];
+        let multi_answer_ok =
+            dns::parse_first_a_record(&MULTI_ANSWER_REPLY, QUESTION_LEN) == Ok(EXPECTED_MULTI_IP);
+
         kprintln!(
-            "[DNS] answer-parse self-test: a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} uncompressed_name_rejected={}",
-            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, uncompressed_name_rejected
+            "[DNS] answer-parse self-test: a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} uncompressed_name_rejected={} multi_answer_ok={}",
+            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, uncompressed_name_rejected, multi_answer_ok
         );
         serial_println!(
-            "[DNS] answer_parse_selftest a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} uncompressed_name_rejected={}",
-            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, uncompressed_name_rejected
+            "[DNS] answer_parse_selftest a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} uncompressed_name_rejected={} multi_answer_ok={}",
+            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, uncompressed_name_rejected, multi_answer_ok
         );
     }
 

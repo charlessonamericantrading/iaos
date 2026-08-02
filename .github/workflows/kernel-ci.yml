@@ -1097,7 +1097,17 @@ jobs:
           # test's own live parsed_a_record field is deliberately NOT
           # asserted on below, for the identical reason its own
           # reply_received/qr_bit_set/answer_count fields aren't either.
-          grep -q "DNS\] answer_parse_selftest a_record_parsed_ok=true zero_answers_rejected=true non_a_record_rejected=true uncompressed_name_rejected=true" boot.log
+          #
+          # Fase 115: multi_answer_ok (appended to this same line) is a
+          # real, previously-unexamined case - this kernel's own real CI
+          # runs have observed answer_count=2 for "example.com" since
+          # Fase 106, yet parse_first_a_record had never actually been
+          # proven correct for more than a single answer record. New
+          # fixture: ANCOUNT=2, a CNAME answer first (skipped via its
+          # own declared RDLENGTH), a real A record second - proves the
+          # function genuinely walks past a non-A record instead of
+          # just assuming the first answer already is the one it wants.
+          grep -q "DNS\] answer_parse_selftest a_record_parsed_ok=true zero_answers_rejected=true non_a_record_rejected=true uncompressed_name_rejected=true multi_answer_ok=true" boot.log
           # Fase 110: DNS query building (net::dns::build_query /
           # encode_qname) - pure logic, no hardware dependency, the
           # encoding-side mirror of the answer-parsing self-test right
