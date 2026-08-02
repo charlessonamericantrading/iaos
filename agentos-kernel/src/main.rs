@@ -3280,12 +3280,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // entry (a synchronous enter_ring3 call, same as Fase 73's own exit
     // test), so it's safe to run here, before the PID-sensitive test
     // below.
-    let (disk_loaded_roundtrip_ok, disk_loaded_exit_code, disk_loaded_data_write_verified) =
-        ring3::run_ring3_disk_loaded_test();
-    kprintln!(
-        "[KERNEL INIT] Back from ring-3 - disk_loaded_test roundtrip_ok={} exit_code={} data_write_verified={}",
+    let (
         disk_loaded_roundtrip_ok,
         disk_loaded_exit_code,
+        disk_loaded_data_load_verified,
+        disk_loaded_data_write_verified,
+    ) = ring3::run_ring3_disk_loaded_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - disk_loaded_test roundtrip_ok={} exit_code={} data_load_verified={} data_write_verified={}",
+        disk_loaded_roundtrip_ok,
+        disk_loaded_exit_code,
+        disk_loaded_data_load_verified,
         disk_loaded_data_write_verified
     );
 

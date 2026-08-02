@@ -745,7 +745,17 @@ jobs:
           # is read back from ring-0 after the program exits, real proof
           # the write actually reached that page, not just that the
           # program ran and exited correctly.
-          grep -q "RING3\] ring3_disk_loaded_test roundtrip_ok=true exit_code=42 data_write_verified=true" boot.log
+          # Fase 104 update: the file is no longer just raw program
+          # bytes - it's a real, minimal header (magic + code_len +
+          # data_len) the kernel actually PARSES to split code from a
+          # genuine initial-data region, rather than assuming "the whole
+          # file is code" (true of every version of this test before
+          # this one). data_load_verified=true is checked BEFORE
+          # enter_ring3 even runs - proof the header-driven copy of the
+          # file's own declared data region landed correctly - fully
+          # independent of data_write_verified=true, which still checks
+          # the program's own later runtime write to the same page.
+          grep -q "RING3\] ring3_disk_loaded_test roundtrip_ok=true exit_code=42 data_load_verified=true data_write_verified=true" boot.log
           # Fase 87: the preemptive (timer-driven) scheduler's own
           # `priority` field was tracked and displayed since Fase 31 but
           # never actually used by tick()'s own task-selection logic -

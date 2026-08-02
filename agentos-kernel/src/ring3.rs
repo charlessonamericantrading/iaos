@@ -2639,11 +2639,11 @@ pub fn run_early_exit_ring3_mt_test() -> (u64, u32, bool, u32, bool, usize) {
 // Fases ago).
 //
 // Deliberately does NOT attempt to build any kind of general program
-// loader (parsing an executable format, ...) - that remains real,
-// substantially larger, separate follow-on work. This Fase only proves
-// the one new fact everything else would depend on: bytes read back
-// from a real file are byte-for-byte what was written, and the CPU
-// treats them as valid ring-3 code when copied into an executable page.
+// loader - that remains real, substantially larger, separate follow-on
+// work. This Fase only proves the one new fact everything else would
+// depend on: bytes read back from a real file are byte-for-byte what
+// was written, and the CPU treats them as valid ring-3 code when copied
+// into an executable page.
 //
 // Fase 99 update: runs on USER_DISK_PROGRAM_PAGE_ADDR, a SECOND,
 // independent page (see memory::user_page's own doc for its
@@ -2668,6 +2668,64 @@ pub fn run_early_exit_ring3_mt_test() -> (u64, u32, bool, u32, bool, usize) {
 // `build_cooperative_test_program` already proved correct for feeding a
 // hand-assembled ring-3 program a runtime address, rather than inventing
 // a new addressing pattern.
+//
+// Fase 104 update: the file this test writes to disk is no longer just
+// the raw program bytes - it is now a real, minimal header (`parse_
+// program_header`'s own doc has the exact layout) followed by the code
+// region and a genuine INITIAL DATA region, and the kernel actually
+// PARSES that header to learn how many bytes are code vs. data, rather
+// than the Rust test function simply assuming "the whole file is code"
+// (true of every version of this test before this one). The header's
+// own declared lengths are checked against the buffer's REAL length
+// before trusting them for anything - a real loader must never copy
+// `header.code_len` bytes from a buffer shorter than that, no matter
+// how much it trusts where the header came from.
+
+/// Fase 104: the disk-loaded test's own real, minimal executable-format
+/// header - deliberately NOT ELF or any existing real format (both are
+/// substantially larger than this one Fase needs), but a genuine,
+/// validated header nonetheless, not just a comment describing the file
+/// layout. Byte layout, 12 bytes total: `magic` (4 bytes, `PROGRAM_
+/// MAGIC`), `code_len` (4-byte little-endian `u32`), `data_len` (4-byte
+/// little-endian `u32`) - followed immediately by `code_len` bytes of
+/// code, then `data_len` bytes of initial data.
+const PROGRAM_MAGIC: [u8; 4] = *b"AGP1";
+const PROGRAM_HEADER_LEN: usize = 12;
+
+struct ProgramHeader {
+    code_len: u32,
+    data_len: u32,
+}
+
+/// Parses `bytes` as a `PROGRAM_MAGIC`-tagged header followed by its own
+/// declared code and data regions, returning slices INTO `bytes` for
+/// each (no copying). Checked, not trusted: rejects a buffer shorter
+/// than the header itself, a wrong magic, and - the check a real loader
+/// cannot skip - a buffer whose REAL length doesn't exactly match
+/// `header + code_len + data_len` (via `checked_add`, so a header lying
+/// about huge lengths fails cleanly here instead of wrapping into a
+/// too-small sum that would then let an out-of-bounds slice through).
+fn parse_program_header(bytes: &[u8]) -> Result<(ProgramHeader, &[u8], &[u8]), &'static str> {
+    if bytes.len() < PROGRAM_HEADER_LEN {
+        return Err("parse_program_header: buffer shorter than the header itself");
+    }
+    if bytes[0..4] != PROGRAM_MAGIC {
+        return Err("parse_program_header: bad magic");
+    }
+    let code_len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let data_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let expected_total = PROGRAM_HEADER_LEN
+        .checked_add(code_len as usize)
+        .and_then(|n| n.checked_add(data_len as usize))
+        .ok_or("parse_program_header: declared lengths overflow")?;
+    if bytes.len() != expected_total {
+        return Err("parse_program_header: declared lengths don't match the real buffer size");
+    }
+    let code_end = PROGRAM_HEADER_LEN + code_len as usize;
+    let code = &bytes[PROGRAM_HEADER_LEN..code_end];
+    let data = &bytes[code_end..];
+    Ok((ProgramHeader { code_len, data_len }, code, data))
+}
 
 /// Builds the disk-loaded test's own program bytes, parameterized on
 /// `data_addr` so the SAME 8-byte absolute address `USER_DISK_PROGRAM_
@@ -2706,13 +2764,27 @@ fn build_disk_loaded_program(data_addr: u64) -> [u8; 31] {
     p
 }
 
-pub fn run_ring3_disk_loaded_test() -> (bool, u64, bool) {
+pub fn run_ring3_disk_loaded_test() -> (bool, u64, bool, bool) {
     let program = build_disk_loaded_program(USER_DISK_PROGRAM_DATA_ADDR);
+    // Fase 104: a real initial-data blob, distinct from the signature
+    // byte the program itself writes at runtime - proves the KERNEL's
+    // own header-driven load path (this data lands on the page BEFORE
+    // enter_ring3 is ever called) independently of the PROGRAM's own
+    // later runtime write to the exact same page.
+    const INITIAL_DATA: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+
+    let mut file_content =
+        alloc::vec::Vec::with_capacity(PROGRAM_HEADER_LEN + program.len() + INITIAL_DATA.len());
+    file_content.extend_from_slice(&PROGRAM_MAGIC);
+    file_content.extend_from_slice(&(program.len() as u32).to_le_bytes());
+    file_content.extend_from_slice(&(INITIAL_DATA.len() as u32).to_le_bytes());
+    file_content.extend_from_slice(&program);
+    file_content.extend_from_slice(&INITIAL_DATA);
 
     let loaded = match shell::find_fat_partition() {
         Ok(partition) => match fat12::read_bpb(&partition) {
             Ok(mut fs) => {
-                let write_ok = fs.create_file("RING3.BIN", &program).is_ok();
+                let write_ok = fs.create_file("RING3.BIN", &file_content).is_ok();
                 let read_back = fs.read_file("RING3.BIN").ok();
                 let _ = fs.delete_file("RING3.BIN");
                 if write_ok {
@@ -2726,7 +2798,7 @@ pub fn run_ring3_disk_loaded_test() -> (bool, u64, bool) {
         Err(_) => None,
     };
 
-    let roundtrip_ok = loaded.as_deref() == Some(program.as_slice());
+    let roundtrip_ok = loaded.as_deref() == Some(file_content.as_slice());
     if !roundtrip_ok {
         // No real destination address to distrust here - simply never
         // enter ring-3 at all rather than execute whatever stale bytes
@@ -2734,9 +2806,24 @@ pub fn run_ring3_disk_loaded_test() -> (bool, u64, bool) {
         serial_println!(
             "[RING3] ring3_disk_loaded_test roundtrip_ok=false - skipping ring-3 entry"
         );
-        return (false, 0, false);
+        return (false, 0, false, false);
     }
     let loaded = loaded.unwrap();
+
+    let (_header, code, data) = match parse_program_header(&loaded) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            // Shouldn't happen given this same function just built the
+            // header itself, but a real loader must treat header
+            // parsing as fallible right up to the point it's used, not
+            // assume its own prior success guarantees this step.
+            serial_println!(
+                "[RING3] ring3_disk_loaded_test roundtrip_ok=true header_parse_failed={} - skipping ring-3 entry",
+                e
+            );
+            return (true, 0, false, false);
+        }
+    };
 
     let info = gdt::ring3_info();
     let user_cs = info.user_code_selector as u64;
@@ -2745,8 +2832,23 @@ pub fn run_ring3_disk_loaded_test() -> (bool, u64, bool) {
     let stack_top = USER_DISK_PROGRAM_STACK_ADDR + 4096;
 
     unsafe {
-        core::ptr::copy_nonoverlapping(loaded.as_ptr(), code_addr as *mut u8, loaded.len());
+        core::ptr::copy_nonoverlapping(code.as_ptr(), code_addr as *mut u8, code.len());
     }
+
+    // Fase 104: the kernel copies the header's own declared initial-data
+    // region to the data page BEFORE the program ever runs, and verifies
+    // that copy immediately - independent of, and prior to, the
+    // program's own later runtime write to the same page.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            USER_DISK_PROGRAM_DATA_ADDR as *mut u8,
+            data.len(),
+        );
+    }
+    let data_load_verified = unsafe {
+        core::slice::from_raw_parts(USER_DISK_PROGRAM_DATA_ADDR as *const u8, data.len())
+    } == data;
 
     kprintln!(
         "[KERNEL INIT] Testing a ring-3 program loaded from a real FAT12 file instead of a kernel-embedded array..."
@@ -2754,21 +2856,23 @@ pub fn run_ring3_disk_loaded_test() -> (bool, u64, bool) {
     let exit_code =
         unsafe { enter_ring3(code_addr, user_cs, user_ss, stack_top, RING3_TEST_RFLAGS) };
 
-    // The program just wrote a real signature byte to a genuinely
-    // separate DATA page. Ring-0 can read it back regardless of
-    // USER_ACCESSIBLE - that bit only ever restricts ring-3, never
-    // ring-0, the same reasoning memory::user_page's own doc already
-    // established for the first such page back in Fase 70.
+    // The program just wrote a real signature byte to the same DATA
+    // page, overwriting the kernel-loaded initial data this same
+    // function already verified above. Ring-0 can read it back
+    // regardless of USER_ACCESSIBLE - that bit only ever restricts
+    // ring-3, never ring-0, the same reasoning memory::user_page's own
+    // doc already established for the first such page back in Fase 70.
     const DATA_SIGNATURE: u8 = 0x99;
     let data_write_verified =
         unsafe { core::ptr::read_volatile(USER_DISK_PROGRAM_DATA_ADDR as *const u8) }
             == DATA_SIGNATURE;
 
     serial_println!(
-        "[RING3] ring3_disk_loaded_test roundtrip_ok=true exit_code={} data_write_verified={}",
+        "[RING3] ring3_disk_loaded_test roundtrip_ok=true exit_code={} data_load_verified={} data_write_verified={}",
         exit_code,
+        data_load_verified,
         data_write_verified
     );
 
-    (true, exit_code, data_write_verified)
+    (true, exit_code, data_load_verified, data_write_verified)
 }
