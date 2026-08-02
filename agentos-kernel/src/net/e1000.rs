@@ -1450,8 +1450,11 @@ fn parse_reply_frame(
     let real_tcp_len = ip_total_len.saturating_sub(icmp::IPV4_HEADER_LEN);
     let tcp_end = (tcp_start + real_tcp_len).min(data.len());
     let info = tcp::parse_tcp_segment(target_ip, src_ip, &data[tcp_start..tcp_end]).ok()?;
-    let data_offset_words = data[tcp_start + 12] >> 4;
-    let payload_start = tcp_start + (data_offset_words as usize) * 4;
+    // Fase 118: header_len (already validated inside parse_tcp_segment
+    // itself) replaces what used to be a second, independent re-read of
+    // data[tcp_start + 12] >> 4 here - the same data_offset_words value,
+    // computed twice by two separate expressions that happened to agree.
+    let payload_start = tcp_start + info.header_len;
     let payload = if payload_start <= tcp_end {
         &data[payload_start..tcp_end]
     } else {

@@ -1077,7 +1077,15 @@ jobs:
           # stamp (one header byte XOR-flipped after building a valid
           # segment must now be rejected). All three checks must be true
           # for this exact line to appear.
-          grep -q "TCP\] header_selftest pseudo_checksum_hand_computed_ok=true syn_fields_ok=true corrupted_checksum_rejected=true" boot.log
+          #
+          # Fase 118: header_len_with_options_ok (appended to this same
+          # line) proves TcpSegmentInfo::header_len is correct for a
+          # segment WITH options (data_offset=6, the realistic shape a
+          # real TCP stack's own SYN-ACK almost always has, per Fase 89's
+          # own finding), not just the bare 20-byte shape build_tcp_header
+          # itself always emits. syn_fields_ok's own check also now
+          # includes header_len==20 for the no-options case.
+          grep -q "TCP\] header_selftest pseudo_checksum_hand_computed_ok=true syn_fields_ok=true corrupted_checksum_rejected=true header_len_with_options_ok=true" boot.log
           # Fase 107: DNS answer-record parsing (net::dns) - pure logic,
           # no hardware dependency, closing the exact gap Fase 106's own
           # dns_query_test doc left open (confirming a reply exists is

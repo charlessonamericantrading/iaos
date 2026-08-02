@@ -1913,10 +1913,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     //
     // syn_fields_ok round-trips a real 20-byte SYN header (build_tcp_
     // header -> parse_tcp_segment) and checks every field survived
-    // exactly. corrupted_checksum_rejected is the actual proof this
-    // isn't a rubber stamp: one header byte is XOR-flipped after
-    // building a valid segment, and parse_tcp_segment must now report a
-    // mismatch instead of silently accepting corrupted data.
+    // exactly, including header_len (Fase 118). corrupted_checksum_
+    // rejected is the actual proof this isn't a rubber stamp: one header
+    // byte is XOR-flipped after building a valid segment, and parse_
+    // tcp_segment must now report a mismatch instead of silently
+    // accepting corrupted data. header_len_with_options_ok (Fase 118)
+    // proves header_len is ALSO correct for a segment with options
+    // (data_offset=6), the realistic shape a real TCP stack's own
+    // SYN-ACK almost always has (Fase 89's own finding) - not just the
+    // bare 20-byte shape build_tcp_header itself always emits.
     kprintln!("[KERNEL INIT] Testing real TCP header construction/parsing...");
     {
         use net::tcp;
@@ -1957,6 +1962,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     && info.ack_num == 0
                     && info.flags == tcp::TCP_FLAG_SYN
                     && info.window == 65535
+                    && info.header_len == 20
             })
             .unwrap_or(false);
 
@@ -1965,13 +1971,48 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let corrupted_checksum_rejected =
             tcp::parse_tcp_segment(SRC_IP, DST_IP, &corrupted).is_err();
 
+        // Fase 118: header_len must also be correct for the realistic
+        // WITH-options shape (Fase 89's own finding: a real TCP stack's
+        // SYN-ACK almost always carries at least an MSS option, making
+        // data_offset 6, not 5) - not just the bare 20-byte shape
+        // build_tcp_header itself emits. Hand-built as a 24-byte segment
+        // (data_offset=6, 4 arbitrary NOP option bytes - their content is
+        // irrelevant, only skipped past via header_len) with its own
+        // checksum independently recomputed via the same
+        // internet_checksum-based approach pseudo_checksum_hand_computed_ok
+        // above already uses, not by reusing net::tcp's own private
+        // pseudo-checksum helper - a real, external cross-check, not a
+        // tautology.
+        let syn_header_with_options: [u8; 24] = {
+            let mut seg = [0u8; 24];
+            seg[0..12].copy_from_slice(&syn_header[0..12]);
+            seg[12] = 0x60; // data_offset = 6 (24 bytes / 4)
+            seg[13] = tcp::TCP_FLAG_SYN;
+            seg[14..16].copy_from_slice(&syn_header[14..16]); // window, unchanged
+            seg[20..24].copy_from_slice(&[0x01, 0x01, 0x01, 0x01]); // 4 NOP option bytes
+            let mut buf = alloc::vec::Vec::with_capacity(12 + seg.len());
+            buf.extend_from_slice(&SRC_IP);
+            buf.extend_from_slice(&DST_IP);
+            buf.push(0);
+            buf.push(tcp::IP_PROTOCOL_TCP);
+            buf.extend_from_slice(&(seg.len() as u16).to_be_bytes());
+            buf.extend_from_slice(&seg);
+            let checksum = net::icmp::internet_checksum(&buf);
+            seg[16..18].copy_from_slice(&checksum.to_be_bytes());
+            seg
+        };
+        let header_len_with_options_ok =
+            tcp::parse_tcp_segment(SRC_IP, DST_IP, &syn_header_with_options)
+                .map(|info| info.header_len == 24)
+                .unwrap_or(false);
+
         kprintln!(
-            "[TCP] header self-test: pseudo_checksum_hand_computed_ok={} syn_fields_ok={} corrupted_checksum_rejected={}",
-            pseudo_checksum_hand_computed_ok, syn_fields_ok, corrupted_checksum_rejected
+            "[TCP] header self-test: pseudo_checksum_hand_computed_ok={} syn_fields_ok={} corrupted_checksum_rejected={} header_len_with_options_ok={}",
+            pseudo_checksum_hand_computed_ok, syn_fields_ok, corrupted_checksum_rejected, header_len_with_options_ok
         );
         serial_println!(
-            "[TCP] header_selftest pseudo_checksum_hand_computed_ok={} syn_fields_ok={} corrupted_checksum_rejected={}",
-            pseudo_checksum_hand_computed_ok, syn_fields_ok, corrupted_checksum_rejected
+            "[TCP] header_selftest pseudo_checksum_hand_computed_ok={} syn_fields_ok={} corrupted_checksum_rejected={} header_len_with_options_ok={}",
+            pseudo_checksum_hand_computed_ok, syn_fields_ok, corrupted_checksum_rejected, header_len_with_options_ok
         );
     }
 

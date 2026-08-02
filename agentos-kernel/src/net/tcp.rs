@@ -103,6 +103,14 @@ pub struct TcpSegmentInfo {
     pub ack_num: u32,
     pub flags: u8,
     pub window: u16,
+    /// Real byte length of the header (including any options) - where
+    /// this segment's own payload starts, i.e. `segment[header_len..]`.
+    /// Already computed internally to validate `data_offset_words`
+    /// (Fase 89); exposed (Fase 118) so a caller that also wants the
+    /// payload doesn't have to re-read `segment[12] >> 4` a second time
+    /// itself, an accidental duplication `net::e1000::parse_reply_frame`
+    /// had been doing since Fase 90.
+    pub header_len: usize,
 }
 
 /// Parses `segment`'s header fields, having first verified its
@@ -131,6 +139,12 @@ pub struct TcpSegmentInfo {
 /// `segment` is the TCP header followed by its payload (if any) - unlike
 /// ICMP, the checksum here depends on IPs the segment bytes alone don't
 /// carry, so they're required parameters, not optional context.
+///
+/// Fase 118: `TcpSegmentInfo::header_len` is exactly the byte offset
+/// where `segment`'s own payload starts (`data_offset_words * 4`) - a
+/// real value now returned to the caller instead of forcing every
+/// caller that wants the payload to re-derive `segment[12] >> 4` a
+/// second time itself.
 pub fn parse_tcp_segment(
     source_ip: [u8; 4],
     dest_ip: [u8; 4],
@@ -153,5 +167,6 @@ pub fn parse_tcp_segment(
         ack_num: u32::from_be_bytes([segment[8], segment[9], segment[10], segment[11]]),
         flags: segment[13],
         window: u16::from_be_bytes([segment[14], segment[15]]),
+        header_len: (data_offset_words as usize) * 4,
     })
 }
