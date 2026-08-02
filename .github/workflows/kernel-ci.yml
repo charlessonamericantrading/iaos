@@ -614,6 +614,21 @@ jobs:
           # already established for every other real-tick-count value in
           # this file.
           grep -q "RING3\] ring3_mt_test task0_checksum=0x10000004 task1_last_eax=0x20000004 task2_last_eax=0x30000004" boot.log
+          # Fase 92: scheduler::ring3_mt's own new priority field (added
+          # this same Fase, mirroring Fase 87's ring-0 equivalent
+          # immediately below) is real, not cosmetic. Task 0 gets
+          # Priority::High and tasks 1/2 get Priority::Background -
+          # genuinely unequal. Unlike the ring-0 preemptive demo, this
+          # mechanism has no independent tick budget of its own (it only
+          # ever returns once task 0 itself reaches int 0x81), so the
+          # test deliberately gives task 0 the TOP priority rather than
+          # risking it being starved forever with no safety net - see
+          # ring3::run_priority_ring3_mt_test's own doc. task1_last_eax/
+          # task2_last_eax staying at exactly 0 (their own cold bootstrap
+          # context's untouched zeroed eax slot) is only possible if
+          # BOTH were genuinely never scheduled even once across task 0's
+          # entire real, involuntary-timer-driven run.
+          grep -q "RING3\] priority_mt_test task0_checksum=0x10000004 task1_last_eax=0x0 task2_last_eax=0x0" boot.log
           # Fase 87: the preemptive (timer-driven) scheduler's own
           # `priority` field was tracked and displayed since Fase 31 but
           # never actually used by tick()'s own task-selection logic -

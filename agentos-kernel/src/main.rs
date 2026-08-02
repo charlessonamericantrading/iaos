@@ -3072,6 +3072,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ring3_mt_switches
     );
 
+    // Fase 92: proves scheduler::ring3_mt's own new priority field
+    // (added this same Fase, mirroring Fase 87's ring-0 equivalent) is
+    // real, not cosmetic - see ring3::run_priority_ring3_mt_test's own
+    // doc for why task 0 must be the HIGH-priority one here (this
+    // module has no independent tick budget of its own; letting some
+    // OTHER task out-prioritize task 0 forever would hang the boot).
+    kprintln!(
+        "[KERNEL INIT] Testing REAL priority in ring3_mt (High vs Background, genuinely unequal)..."
+    );
+    let (priority_mt_task0, priority_mt_task1, priority_mt_task2, priority_mt_switches) =
+        ring3::run_priority_ring3_mt_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - priority_mt_test returned task0_checksum={:#x} task1_last_eax={:#x} task2_last_eax={:#x} switch_count={}",
+        priority_mt_task0,
+        priority_mt_task1,
+        priority_mt_task2,
+        priority_mt_switches
+    );
+
     // Fase 87: proves the preemptive scheduler's own priority field is
     // now genuinely used, not cosmetic - see scheduler::preemptive::
     // run_priority_preemptive_test's own doc. Deliberately placed as the

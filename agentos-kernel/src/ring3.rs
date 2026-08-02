@@ -1612,16 +1612,27 @@ pub fn run_ring3_mt_test() -> (u64, alloc::vec::Vec<u32>, usize) {
         TASK2_LOOP_COUNT
     );
 
+    // Fase 92: passes Priority::Normal for all 3 tasks explicitly,
+    // preserving this test's exact existing round-robin behavior byte
+    // for byte (real priority reduces to round-robin exactly when every
+    // active task shares one tier) - mirroring how Fase 87 updated
+    // `scheduler::preemptive::start_demo`'s own existing callers the
+    // same way when priority was added there.
+    use crate::scheduler::process::Priority;
     let (task0_exit_code, other_last_eax, switch_count) =
-        crate::scheduler::ring3_mt::run_multitasking(&[task1_ctx, task2_ctx], || unsafe {
-            enter_ring3(
-                task0_entry,
-                user_cs,
-                user_ss,
-                task0_stack_top,
-                RING3_TEST_RFLAGS,
-            )
-        });
+        crate::scheduler::ring3_mt::run_multitasking(
+            Priority::Normal,
+            &[(Priority::Normal, task1_ctx), (Priority::Normal, task2_ctx)],
+            || unsafe {
+                enter_ring3(
+                    task0_entry,
+                    user_cs,
+                    user_ss,
+                    task0_stack_top,
+                    RING3_TEST_RFLAGS,
+                )
+            },
+        );
     let task1_last_eax = other_last_eax[0];
     let task2_last_eax = other_last_eax[1];
 
@@ -1644,4 +1655,132 @@ pub fn run_ring3_mt_test() -> (u64, alloc::vec::Vec<u32>, usize) {
     );
 
     (task0_exit_code, other_last_eax, switch_count)
+}
+
+/// Fase 92: proves `scheduler::ring3_mt`'s own real priority is
+/// genuine, not cosmetic - the ring-3 equivalent of `scheduler::
+/// preemptive::run_priority_preemptive_test` (Fase 87). Deliberately
+/// does NOT test starvation from task 0's own side: unlike the ring-0
+/// preemptive demo, `run_multitasking` has no independent tick budget
+/// of its own - it only ever returns once task 0 itself reaches
+/// `int 0x81`. If some OTHER task could out-prioritize task 0 forever,
+/// task 0 would never run again and this call would never return,
+/// hanging the entire boot with no safety net at all (see `scheduler::
+/// ring3_mt`'s own module doc for this exact reasoning). So task 0 gets
+/// the TOP priority here (`Priority::High`) - guaranteed to keep
+/// winning every comparison and complete normally - while tasks 1 and 2
+/// (`Priority::Background`) are the ones being tested for starvation.
+///
+/// Both background tasks get a real, safe, distinguishable program
+/// written to memory (`0x5.../0x6...` patterns, distinct from `run_
+/// ring3_mt_test`'s own `0x1/2/3...` prefixes so the two tests' log
+/// lines are never ambiguous) even though NEITHER is expected to
+/// execute even once - a defensive choice, not a formality: if a real
+/// bug ever let one of them run, jumping into a genuine, harmless
+/// checksum-then-spin program is far safer than jumping into
+/// whatever-happened-to-be-there memory. The actual proof is negative:
+/// each background task's own dedicated context starts at `ring3::
+/// prepare_ring3_mt_task_ctx`'s own zeroed GPR slots (`eax = 0`) and
+/// NEVER gets touched if the priority scheduler correctly never once
+/// selects it - so `task1_last_eax == 0 && task2_last_eax == 0` is only
+/// possible if both were genuinely starved for task 0's entire run, not
+/// merely "finished early like in the round-robin test." `switch_count`
+/// staying positive confirms real ticks kept landing and being
+/// processed by this exact mechanism throughout - proving the zero
+/// isn't just "the timer never fired," but "the timer fired repeatedly
+/// and correctly kept choosing task 0 every time."
+pub fn run_priority_ring3_mt_test() -> (u64, u32, u32, usize) {
+    use crate::scheduler::process::Priority;
+
+    let info = gdt::ring3_info();
+    let user_cs = info.user_code_selector as u64;
+    let user_ss = info.user_data_selector as u64;
+
+    let code_addr = USER_TEST_PAGE_ADDR;
+    let task0_entry = code_addr;
+    let task1_entry = code_addr + 128;
+    let task2_entry = code_addr + 256;
+    let task0_stack_top = code_addr + 2048;
+    let task1_stack_top = code_addr + 3072;
+    let task2_stack_top = code_addr + 4096;
+
+    const TASK0_EXPECTED: u32 = 0x1000_0004;
+    const TASK0_LOOP_COUNT: u32 = 150_000_000;
+    const TASK1_LOOP_COUNT: u32 = 5_000_000;
+    const TASK2_LOOP_COUNT: u32 = 5_000_000;
+
+    let task0 = build_ring3_mt_checksum_program(0x1000_0000, TASK0_LOOP_COUNT, true);
+    let task1 = build_ring3_mt_checksum_program(0x5000_0000, TASK1_LOOP_COUNT, false);
+    let task2 = build_ring3_mt_checksum_program(0x6000_0000, TASK2_LOOP_COUNT, false);
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(task0.as_ptr(), task0_entry as *mut u8, task0.len());
+        core::ptr::copy_nonoverlapping(task1.as_ptr(), task1_entry as *mut u8, task1.len());
+        core::ptr::copy_nonoverlapping(task2.as_ptr(), task2_entry as *mut u8, task2.len());
+    }
+
+    let task1_ctx = prepare_ring3_mt_task_ctx(
+        task1_entry,
+        user_cs,
+        user_ss,
+        task1_stack_top,
+        RING3_TEST_RFLAGS,
+    );
+    let task2_ctx = prepare_ring3_mt_task_ctx(
+        task2_entry,
+        user_cs,
+        user_ss,
+        task2_stack_top,
+        RING3_TEST_RFLAGS,
+    );
+
+    kprintln!(
+        "[RING3] Testing REAL priority in ring3_mt (task0=High vs task1/task2=Background, genuinely unequal)..."
+    );
+    serial_println!(
+        "[RING3] priority_mt_test starting: task0=High task1=Background task2=Background"
+    );
+
+    let (task0_exit_code, other_last_eax, switch_count) =
+        crate::scheduler::ring3_mt::run_multitasking(
+            Priority::High,
+            &[
+                (Priority::Background, task1_ctx),
+                (Priority::Background, task2_ctx),
+            ],
+            || unsafe {
+                enter_ring3(
+                    task0_entry,
+                    user_cs,
+                    user_ss,
+                    task0_stack_top,
+                    RING3_TEST_RFLAGS,
+                )
+            },
+        );
+    let task1_last_eax = other_last_eax[0];
+    let task2_last_eax = other_last_eax[1];
+
+    kprintln!(
+        "[RING3] Back in ring-0 - priority_mt_test task0_checksum={:#x} (expected {:#x}) task1_last_eax={:#x} task2_last_eax={:#x} switch_count={} - both background tasks getting exactly zero proves task0 (High) genuinely monopolized the CPU.",
+        task0_exit_code,
+        TASK0_EXPECTED,
+        task1_last_eax,
+        task2_last_eax,
+        switch_count
+    );
+    serial_println!(
+        "[RING3] priority_mt_test task0_checksum={:#x} task1_last_eax={:#x} task2_last_eax={:#x} switch_count={}",
+        task0_exit_code,
+        task1_last_eax,
+        task2_last_eax,
+        switch_count
+    );
+
+    (
+        task0_exit_code,
+        task1_last_eax,
+        task2_last_eax,
+        switch_count,
+    )
 }

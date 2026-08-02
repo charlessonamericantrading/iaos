@@ -24,7 +24,26 @@
 //! size and `run_multitasking`'s signature (exactly one "other" task
 //! context, exactly one "other" task's reported checksum). Both are
 //! generalized here.
+//!
+//! **Fase 92 adds real priority, mirroring `scheduler::preemptive::
+//! tick`'s own top-priority-tier-then-round-robin algorithm exactly**
+//! (Fase 87's own ring-0 equivalent), generalized from a hardcoded pair
+//! to `active_tasks` slots the same way the round-robin arithmetic
+//! itself was generalized in Fase 91. One real difference from the
+//! ring-0 case shapes this module's OWN self-test design, not the
+//! mechanism here: `scheduler::preemptive`'s own demo has an
+//! INDEPENDENT, fixed tick budget (`DEMO_TICKS`) controlling when it
+//! returns, regardless of what its own tasks do - `run_multitasking`
+//! here has no such independent exit. It only ever returns when task 0
+//! itself voluntarily reaches `int 0x81`. A priority test that let ANY
+//! task other than task 0 out-prioritize task 0 forever would hang the
+//! ENTIRE BOOT with no safety net at all - so every real priority test
+//! built on this module MUST give task 0 the top priority, proving
+//! starvation from the OTHER side (a lower-priority task gets nothing)
+//! rather than risking task 0 itself never being scheduled. See
+//! `ring3::run_priority_ring3_mt_test`'s own doc for the actual test.
 
+use crate::scheduler::process::Priority;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Real, fixed headroom for how many ring-3 tasks this mechanism can
@@ -58,17 +77,35 @@ static RING3_MT_SWITCH_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// hypothetical).
 static mut RING3_MT_TASK_CTX: [u64; RING3_MT_MAX_TASKS] = [0; RING3_MT_MAX_TASKS];
 
+/// Each slot's own priority, as `Priority as u8` (lower value = actually
+/// higher priority, matching `scheduler::preemptive`'s own convention
+/// exactly - the two schedulers deliberately share one `Priority` enum
+/// rather than each defining its own). Set fresh by every `run_
+/// multitasking` call, read by `tick()`'s own priority comparison.
+static mut RING3_MT_TASK_PRIORITY: [u8; RING3_MT_MAX_TASKS] = [0; RING3_MT_MAX_TASKS];
+
 /// Called from `interrupts::handle_timer_tick` for every tick that
 /// interrupts ring-3 code, chained immediately after `ring3_preempt::
 /// tick` - a true no-op whenever THIS mechanism isn't the one currently
 /// enabled, so the various ring-3 self-tests can never interfere with
 /// each other even though all are reached via the same call site (only
 /// one is ever active at a time in practice). Saves the CURRENTLY
-/// scheduled task's full context into ITS OWN dedicated slot, advances
-/// to the next task round-robin (wrapping at the REAL active count for
-/// this run, not the fixed maximum), and returns the NEW task's own
-/// dedicated context - the one genuine mechanical difference from Fase
-/// 85's own `tick`, which always hands back the SAME task it just saved.
+/// scheduled task's full context into ITS OWN dedicated slot, then picks
+/// the NEXT task to resume and returns ITS dedicated context - the one
+/// genuine mechanical difference from Fase 85's own `tick`, which always
+/// hands back the SAME task it just saved.
+///
+/// Fase 92: the "next task" pick is now real priority selection, not
+/// blind round-robin - find the highest actual priority present among
+/// the active slots (lowest `Priority` enum value wins), then round-
+/// robin ONLY among slots at that top tier, starting right after
+/// `current` and wrapping. This is `scheduler::preemptive::tick`'s own
+/// algorithm, generalized from exactly 2 slots to `active_tasks` -
+/// reduces to the OLD blind alternation byte-for-byte whenever every
+/// active task shares one priority (Fase 91's own test still passes
+/// `Priority::Normal` for all 3, preserving its exact behavior), while a
+/// genuinely higher-priority task now wins every comparison and
+/// monopolizes the CPU completely.
 pub fn tick(saved_ctx_ptr: u64) -> u64 {
     if !RING3_MT_ENABLED.load(Ordering::Relaxed) {
         return saved_ctx_ptr;
@@ -83,7 +120,19 @@ pub fn tick(saved_ctx_ptr: u64) -> u64 {
         // real proof the NEXT resume below reads from the dedicated
         // copy, not a stale, about-to-be-reused transient location.
         core::ptr::write_bytes(saved_ctx_ptr as *mut u8, 0xAA, 160);
-        let next = (current + 1) % active_tasks;
+
+        let prios: &[u8; RING3_MT_MAX_TASKS] = &*core::ptr::addr_of!(RING3_MT_TASK_PRIORITY);
+        let mut top = prios[0];
+        for &p in &prios[1..active_tasks] {
+            if p < top {
+                top = p;
+            }
+        }
+        let mut next = (current + 1) % active_tasks;
+        while prios[next] != top {
+            next = (next + 1) % active_tasks;
+        }
+
         RING3_MT_CURRENT.store(next, Ordering::Relaxed);
         RING3_MT_SWITCH_COUNT.fetch_add(1, Ordering::Relaxed);
         (*slots)[next]
@@ -95,22 +144,34 @@ pub fn tick(saved_ctx_ptr: u64) -> u64 {
 /// ring3_mt_task_ctx`, since laying out that 160-byte shape is
 /// ring-3-program-specific and belongs with the rest of this codebase's
 /// ring-3 test-authoring logic, not the scheduling mechanism itself),
-/// then enables round-robin timer-driven switching across all of them
-/// for exactly the duration `f` runs - disabled again before returning,
-/// so this mechanism can never affect any OTHER ring-3 self-test
-/// elsewhere in the boot sequence, mirroring `ring3_preempt::run_
-/// intercepting`'s own enable-only-around-the-call discipline.
+/// records every task's own priority, then enables priority-aware
+/// timer-driven switching across all of them for exactly the duration
+/// `f` runs - disabled again before returning, so this mechanism can
+/// never affect any OTHER ring-3 self-test elsewhere in the boot
+/// sequence, mirroring `ring3_preempt::run_intercepting`'s own
+/// enable-only-around-the-call discipline.
 ///
-/// `other_task_ctxs` holds every task BESIDES task 0 (which is entered
-/// normally, by `f` itself calling `enter_ring3`) - `other_task_ctxs.
-/// len() + 1` must not exceed `RING3_MT_MAX_TASKS`, asserted explicitly
-/// since silently writing past the fixed slot array would otherwise
-/// corrupt adjacent static memory rather than fail cleanly.
+/// `task0_priority` is task 0's own priority (task 0 is entered
+/// normally, by `f` itself calling `enter_ring3`, never through this
+/// module's own scheduling). `other_tasks` holds every task BESIDES
+/// task 0 as `(priority, bootstrap_context)` pairs - counting task 0
+/// itself, the total active task count must not exceed `RING3_MT_MAX_
+/// TASKS`, asserted explicitly since silently writing past the fixed
+/// slot array would otherwise corrupt adjacent static memory rather
+/// than fail cleanly.
+///
+/// **Give task 0 the highest priority in any real test built on this** -
+/// see this module's own doc for why: unlike `scheduler::preemptive`'s
+/// own demo, there is no independent tick budget here, only task 0's
+/// own eventual `int 0x81`. If some OTHER task could out-prioritize task
+/// 0 forever, task 0 would never run again and this call would never
+/// return - hanging the entire boot with no safety net.
 pub fn run_multitasking<F: FnOnce() -> u64>(
-    other_task_ctxs: &[[u8; 160]],
+    task0_priority: Priority,
+    other_tasks: &[(Priority, [u8; 160])],
     f: F,
 ) -> (u64, alloc::vec::Vec<u32>, usize) {
-    let active_tasks = other_task_ctxs.len() + 1;
+    let active_tasks = other_tasks.len() + 1;
     assert!(
         active_tasks <= RING3_MT_MAX_TASKS,
         "run_multitasking: {active_tasks} tasks requested, only {RING3_MT_MAX_TASKS} slots exist"
@@ -119,13 +180,18 @@ pub fn run_multitasking<F: FnOnce() -> u64>(
     let mut bufs: alloc::vec::Vec<alloc::boxed::Box<[u8; 160]>> =
         alloc::vec::Vec::with_capacity(active_tasks);
     bufs.push(alloc::boxed::Box::new([0u8; 160]));
-    for ctx in other_task_ctxs {
+    for (_, ctx) in other_tasks {
         bufs.push(alloc::boxed::Box::new(*ctx));
     }
     unsafe {
         let slots = core::ptr::addr_of_mut!(RING3_MT_TASK_CTX);
         for (i, buf) in bufs.iter_mut().enumerate() {
             (*slots)[i] = buf.as_mut_ptr() as u64;
+        }
+        let prios = core::ptr::addr_of_mut!(RING3_MT_TASK_PRIORITY);
+        (*prios)[0] = task0_priority as u8;
+        for (i, (p, _)) in other_tasks.iter().enumerate() {
+            (*prios)[i + 1] = *p as u8;
         }
     }
     RING3_MT_ACTIVE_TASKS.store(active_tasks, Ordering::Relaxed);
@@ -143,7 +209,10 @@ pub fn run_multitasking<F: FnOnce() -> u64>(
     // preempt` already relies on) directly out of its dedicated buffer,
     // right here before it's dropped, is the only way to observe
     // whether it genuinely ran its own loop and reached its own
-    // post-loop checksum.
+    // post-loop checksum - or, under real priority starvation (Fase 92),
+    // whether it never ran at all, in which case this reads back
+    // whatever its own cold bootstrap context started with (0, per
+    // `ring3::prepare_ring3_mt_task_ctx`'s own zeroed GPR slots).
     let other_last_eax: alloc::vec::Vec<u32> = bufs[1..]
         .iter()
         .map(|buf| u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
