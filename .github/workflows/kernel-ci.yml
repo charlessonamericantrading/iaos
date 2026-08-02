@@ -59,6 +59,18 @@ jobs:
       # top of everything before it, especially on a possibly slower/
       # nested-virtualized CI runner than local dev hardware.
       #
+      # Fase 90: bumped 25s -> 35s. The RX-rearm fix made tcp_echo_test's
+      # own real network round trip (SYN/SYN-ACK/ACK/data/echo, each a
+      # real wait) actually succeed instead of silently failing fast -
+      # genuine progress, but real work that real hardware/network I/O
+      # takes real time for, and it lands late in the boot sequence,
+      # right before `priority_test`'s own ~2.7s real timer wait. One CI
+      # run (30733524477) confirmed the fix itself works (`tcp_echo_test
+      # ... echo_matches=true`) but then ran out of the old 25s budget
+      # mid-`priority_test`, cut off by wall-clock time, not a real
+      # regression - confirmed locally: 35s lets `priority_test` finish
+      # completely with room to spare, unlike 25s.
+      #
       # Fase 82: e1000 and virtio-net-pci now each get their own EXPLICIT
       # `-netdev user`, replacing the single bare `-device virtio-net-pci`
       # (which relied on QEMU's one implicit default netdev, always
@@ -83,7 +95,7 @@ jobs:
       # push-and-wait round trip just to add the capture back.
       - name: Boot-test in QEMU
         run: |
-          timeout 25 qemu-system-x86_64 \
+          timeout 35 qemu-system-x86_64 \
             -drive format=raw,file=agentos-kernel/target/disk-image/agentos-bios.img \
             -serial stdio -display none -no-reboot -no-shutdown \
             -netdev user,id=e1000net,guestfwd=tcp:10.0.2.100:9999-cmd:cat -device e1000,netdev=e1000net \
