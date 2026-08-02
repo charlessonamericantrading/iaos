@@ -1975,6 +1975,70 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // Fase 107: test real DNS answer-record parsing (net::dns) - closes
+    // the exact gap net::e1000::dns_query_test's own doc (Fase 106) left
+    // open: that test only ever confirmed a genuine reply exists
+    // (transaction ID + QR bit), never extracted a real value FROM it.
+    // Pure logic, no hardware dependency, the same "protocol layer
+    // first" order the ICMP/TCP self-tests right above already used -
+    // important since this kernel's own local dev environment observed
+    // zero answer records in Fase 106's own real run (only the real CI
+    // runner's own network path returned real records), so this pure
+    // self-test is the ONLY way to verify the parsing logic itself on
+    // this machine at all.
+    //
+    // a_record_parsed_ok round-trips a realistic, hand-built fake DNS
+    // reply (header + a 17-byte "example.com" question + one real,
+    // compressed-name A-record answer) through parse_first_a_record.
+    // The other three cases each mutate exactly ONE field of that same
+    // fixture and confirm parse_first_a_record now correctly REJECTS it -
+    // the actual proof this isn't a rubber stamp, the same discipline
+    // the ICMP/TCP self-tests above already established with their own
+    // corrupted-checksum cases.
+    kprintln!("[KERNEL INIT] Testing real DNS answer-record parsing...");
+    {
+        use net::dns;
+
+        const QUESTION_LEN: usize = 17;
+        #[rustfmt::skip]
+        const FAKE_REPLY: [u8; 45] = [
+            // header: transaction ID, flags, QDCOUNT=1, ANCOUNT=1, NSCOUNT=0, ARCOUNT=0
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // question: "example.com" A/IN (17 bytes)
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+            // answer: NAME=compression pointer to offset 12, TYPE=A, CLASS=IN,
+            // TTL=600, RDLENGTH=4, RDATA=192.0.2.1 (RFC 5737 TEST-NET-1)
+            0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x58, 0x00, 0x04, 192, 0, 2, 1,
+        ];
+        const EXPECTED_IP: [u8; 4] = [192, 0, 2, 1];
+
+        let a_record_parsed_ok =
+            dns::parse_first_a_record(&FAKE_REPLY, QUESTION_LEN) == Ok(EXPECTED_IP);
+
+        let mut zero_answers = FAKE_REPLY;
+        zero_answers[7] = 0x00; // ANCOUNT = 0
+        let zero_answers_rejected = dns::parse_first_a_record(&zero_answers, QUESTION_LEN).is_err();
+
+        let mut non_a_record = FAKE_REPLY;
+        non_a_record[31] = 0x05; // TYPE = 5 (CNAME), not 1 (A)
+        let non_a_record_rejected = dns::parse_first_a_record(&non_a_record, QUESTION_LEN).is_err();
+
+        let mut uncompressed_name = FAKE_REPLY;
+        uncompressed_name[29] = 0x00; // answer NAME's own top byte: not a 0xC0 pointer
+        let uncompressed_name_rejected =
+            dns::parse_first_a_record(&uncompressed_name, QUESTION_LEN).is_err();
+
+        kprintln!(
+            "[DNS] answer-parse self-test: a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} uncompressed_name_rejected={}",
+            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, uncompressed_name_rejected
+        );
+        serial_println!(
+            "[DNS] answer_parse_selftest a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} uncompressed_name_rejected={}",
+            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, uncompressed_name_rejected
+        );
+    }
+
     // 7b-7. Test real, generalized ARP resolution (Fase 48) - arp_resolve
     // sends a real ARP request for an arbitrary target IP and resolves its
     // MAC via the same TX+RX mechanics send_test_frame/receive_test_frame

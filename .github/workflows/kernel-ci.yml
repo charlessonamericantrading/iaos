@@ -1066,6 +1066,26 @@ jobs:
           # segment must now be rejected). All three checks must be true
           # for this exact line to appear.
           grep -q "TCP\] header_selftest pseudo_checksum_hand_computed_ok=true syn_fields_ok=true corrupted_checksum_rejected=true" boot.log
+          # Fase 107: DNS answer-record parsing (net::dns) - pure logic,
+          # no hardware dependency, closing the exact gap Fase 106's own
+          # dns_query_test doc left open (confirming a reply exists is
+          # not the same as extracting a real value FROM it). Verified
+          # against a realistic, hand-built fake reply (header + a
+          # 17-byte "example.com" question + one compressed-name A
+          # record). a_record_parsed_ok round-trips the happy path;
+          # the other three each mutate exactly ONE byte of the SAME
+          # fixture and confirm the parser correctly rejects it (zero
+          # answers, a non-A record type, an uncompressed answer NAME) -
+          # the same not-a-rubber-stamp discipline the ICMP/TCP
+          # self-tests above already established with their own
+          # corrupted-checksum cases. This is the ONLY way to verify
+          # this parsing logic at all on a real network path where no
+          # answer records ever arrive (confirmed happening on this
+          # kernel's own local dev machine in Fase 106) - dns_query_
+          # test's own live parsed_a_record field is deliberately NOT
+          # asserted on below, for the identical reason its own
+          # reply_received/qr_bit_set/answer_count fields aren't either.
+          grep -q "DNS\] answer_parse_selftest a_record_parsed_ok=true zero_answers_rejected=true non_a_record_rejected=true uncompressed_name_rejected=true" boot.log
           # Confirms generalized ARP resolution (Fase 48, net::e1000::
           # arp_resolve) - a new, independent function (does not touch
           # send_test_frame/receive_test_frame, whose exact log output is

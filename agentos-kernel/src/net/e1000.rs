@@ -1960,8 +1960,21 @@ pub fn tcp_echo_test(
 /// all; `reply_received`/`qr_bit_set`/`answer_count` are returned and
 /// logged honestly rather than assumed, to be read from real output
 /// rather than assumed correct.
-pub fn dns_query_test(target_ip: [u8; 4]) -> Result<(bool, bool, u16), &'static str> {
-    use crate::net::{icmp, udp};
+///
+/// Fase 107: when `answer_count > 0`, also attempts `net::dns::parse_
+/// first_a_record` on the reply - closing the gap this doc used to
+/// flag as future work (confirming a reply exists is not the same as
+/// extracting a real value FROM it). This kernel's own local dev
+/// environment observed `answer_count=0` for every real Fase 106 run
+/// (only the real CI runner's own network path returned actual
+/// records), so `parsed_a_record` is expected to stay `None` here on
+/// this machine - genuinely environment-dependent, logged honestly
+/// rather than assumed either way.
+/// `(reply_received, qr_bit_set, answer_count, parsed_a_record)`.
+pub type DnsQueryResult = Result<(bool, bool, u16, Option<[u8; 4]>), &'static str>;
+
+pub fn dns_query_test(target_ip: [u8; 4]) -> DnsQueryResult {
+    use crate::net::{dns, icmp, udp};
 
     // A hand-built, fixed DNS query: "A? example.com", transaction ID
     // 0x1234. Every offset hand-verified by sequential counting, the
@@ -2132,6 +2145,7 @@ pub fn dns_query_test(target_ip: [u8; 4]) -> Result<(bool, bool, u16), &'static 
     let mut reply_received = false;
     let mut qr_bit_set = false;
     let mut answer_count: u16 = 0;
+    let mut parsed_a_record: Option<[u8; 4]> = None;
     let rx_start_tick = crate::interrupts::timer_ticks();
     unsafe {
         loop {
@@ -2187,6 +2201,14 @@ pub fn dns_query_test(target_ip: [u8; 4]) -> Result<(bool, bool, u16), &'static 
                             qr_bit_set = data[dns_start + 2] & 0x80 != 0;
                             answer_count =
                                 u16::from_be_bytes([data[dns_start + 6], data[dns_start + 7]]);
+                            if answer_count > 0 {
+                                let question_len = DNS_QUERY.len() - dns::DNS_HEADER_LEN;
+                                parsed_a_record = dns::parse_first_a_record(
+                                    &data[dns_start..udp_end],
+                                    question_len,
+                                )
+                                .ok();
+                            }
                             break;
                         }
                     }
@@ -2215,19 +2237,21 @@ pub fn dns_query_test(target_ip: [u8; 4]) -> Result<(bool, bool, u16), &'static 
     }
 
     kprintln!(
-        "[E1000] dns_query_test to {:?}:53 - sent=true reply_received={} qr_bit_set={} answer_count={}",
+        "[E1000] dns_query_test to {:?}:53 - sent=true reply_received={} qr_bit_set={} answer_count={} parsed_a_record={:?}",
         target_ip,
         reply_received,
         qr_bit_set,
-        answer_count
+        answer_count,
+        parsed_a_record
     );
     serial_println!(
-        "[E1000] dns_query_test target={:?} port=53 sent=true reply_received={} qr_bit_set={} answer_count={}",
+        "[E1000] dns_query_test target={:?} port=53 sent=true reply_received={} qr_bit_set={} answer_count={} parsed_a_record={:?}",
         target_ip,
         reply_received,
         qr_bit_set,
-        answer_count
+        answer_count,
+        parsed_a_record
     );
 
-    Ok((reply_received, qr_bit_set, answer_count))
+    Ok((reply_received, qr_bit_set, answer_count, parsed_a_record))
 }
