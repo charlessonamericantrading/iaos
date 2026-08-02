@@ -499,6 +499,23 @@ jobs:
           # kernel hang here would have looked exactly like the CI
           # timeout that later self-tests are also checked against.
           grep -q "SYSCALL\] tensor_eval_invalid_ptr_test rejected_cleanly=true" boot.log
+          # Confirms SYS_TENSOR_EVAL now rejects in_dim/out_dim values
+          # inconsistent with the ALREADY-VALID weights_len/outputs_len
+          # (Fase 132) - distinct from the pointer check right above,
+          # since every pointer here is genuinely mapped and its own
+          # stated length is accurate; only the relationship between
+          # that length and in_dim/out_dim was never checked. Before
+          # this Fase, either case below would have panicked inside
+          # TensorEngine::matmul_layer on the first out-of-bounds slice
+          # index, hanging the kernel forever via its own panic handler -
+          # so, like the line above, this line appearing at all is part
+          # of the proof. weights_insufficient_rejected isolates the
+          # weights_len<out_dim*in_dim condition (outputs_len is
+          # generous); outputs_insufficient_rejected isolates the
+          # out_dim>outputs_len condition (weights_len is generous) -
+          # proving neither half of the check is a tautology that only
+          # passes because of the other.
+          grep -q "SYSCALL\] tensor_eval_dim_mismatch_test weights_insufficient_rejected=true outputs_insufficient_rejected=true" boot.log
           # Confirms SYS_TENSOR_EVAL's pointer check is now genuinely
           # CONDITIONAL on the real caller (Fase 76), not just "mapped or
           # not" (Fase 74) - a real ring-3 program calls it with a

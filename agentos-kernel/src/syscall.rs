@@ -153,6 +153,22 @@ pub fn dispatch_syscall(
             // page that byte range touches, not just its first one - a
             // slice starting on a valid page can still run off the end
             // into an unmapped or kernel-only one if `len` is wrong.
+            //
+            // Fase 132: pointer/length validity alone isn't sufficient -
+            // `in_dim`/`out_dim` are used below to INDEX `weights`/
+            // `outputs` inside `matmul_layer` (`weights[row_start..
+            // row_start + in_dim]` for `row` in `0..out_dim`, and
+            // `outputs[row]`), not merely to size a pointer range, and
+            // were never cross-checked against those buffers' own
+            // already-validated lengths. A caller could pass tiny,
+            // validly-mapped `weights`/`outputs` buffers alongside large
+            // `in_dim`/`out_dim` values - passing every check above -
+            // then panic on the first out-of-bounds slice index inside
+            // `matmul_layer`. This kernel's own panic handler turns any
+            // panic into a permanent hang (`loop { hlt() }`), not a
+            // clean, recoverable rejection like every check above - the
+            // exact failure mode Fase 74/76/77 closed for pointer
+            // validity but never closed for dimension consistency.
             const F32_SIZE: u64 = core::mem::size_of::<f32>() as u64;
             if !pointer_is_mapped_checked(
                 "args",
@@ -188,6 +204,23 @@ pub fn dispatch_syscall(
                 (args.outputs_len as u64).saturating_mul(F32_SIZE),
                 caller_is_ring3,
             ) {
+                return u64::MAX;
+            }
+            // Fase 132: `inputs` is deliberately NOT included in this
+            // check - `TensorEngine::dot_product`'s own
+            // `w.len().min(x.len())` guard already makes any
+            // `inputs_len` safe regardless of `in_dim`, by design (see
+            // the block comment above for the full reasoning on why
+            // `weights`/`outputs` need this and `inputs` doesn't).
+            let weights_needed = args.out_dim.saturating_mul(args.in_dim);
+            if weights_needed > args.weights_len || args.out_dim > args.outputs_len {
+                kprintln!(
+                    "[SYSCALL ERROR] SYS_TENSOR_EVAL: in_dim={} out_dim={} inconsistent with weights_len={} outputs_len={}",
+                    args.in_dim,
+                    args.out_dim,
+                    args.weights_len,
+                    args.outputs_len
+                );
                 return u64::MAX;
             }
             // SAFETY: every pointer above was just confirmed to point at

@@ -1615,6 +1615,88 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 7a-4. Test that SYS_TENSOR_EVAL rejects in_dim/out_dim values that
+    // are inconsistent with the ALREADY-VALID weights_len/outputs_len
+    // (Fase 132) - a distinct gap from 7a-3 above, since every pointer
+    // here is genuinely mapped and its own stated length is accurate; the
+    // buffers themselves are fine, only their relationship to in_dim/
+    // out_dim is not. Before this Fase, either case below would have
+    // panicked inside TensorEngine::matmul_layer on the first
+    // out-of-bounds slice index, hanging the kernel forever via its own
+    // panic handler - so, like 7a-3, this test's own success criterion is
+    // as much "the kernel is still running to print this line" as the
+    // printed value itself. Two independent cases, each isolating ONE of
+    // the check's two conditions (proving neither is a tautology that
+    // happens to pass only because of the other): weights too short for
+    // out_dim*in_dim (with outputs long enough), and outputs too short
+    // for out_dim (with weights long enough).
+    kprintln!("[KERNEL SYSCALL] Testing SYS_TENSOR_EVAL rejects inconsistent in_dim/out_dim...");
+    {
+        let weights: [f32; 4] = [0.0; 4];
+        let inputs: [f32; 2] = [0.0; 2];
+        let bias: [f32; 2] = [0.0; 2];
+        let mut outputs: [f32; 3] = [0.0; 3];
+        // out_dim=2, in_dim=3 needs weights_len>=6, but weights_len=4.
+        let args = syscall::TensorEvalArgs {
+            weights: weights.as_ptr(),
+            weights_len: weights.len(),
+            inputs: inputs.as_ptr(),
+            inputs_len: inputs.len(),
+            bias: bias.as_ptr(),
+            bias_len: bias.len(),
+            outputs: outputs.as_mut_ptr(),
+            outputs_len: outputs.len(),
+            in_dim: 3,
+            out_dim: 2,
+        };
+        let result = syscall::dispatch_syscall(
+            syscall::SYS_TENSOR_EVAL,
+            &args as *const _ as u64,
+            0,
+            0,
+            false,
+        );
+        let weights_insufficient_rejected = result == u64::MAX;
+
+        let weights2: [f32; 8] = [0.0; 8];
+        let inputs2: [f32; 2] = [0.0; 2];
+        let bias2: [f32; 3] = [0.0; 3];
+        let mut outputs2: [f32; 2] = [0.0; 2];
+        // out_dim=3, in_dim=2 needs weights_len>=6 (weights_len=8, fine),
+        // but out_dim=3 needs outputs_len>=3, while outputs_len=2.
+        let args2 = syscall::TensorEvalArgs {
+            weights: weights2.as_ptr(),
+            weights_len: weights2.len(),
+            inputs: inputs2.as_ptr(),
+            inputs_len: inputs2.len(),
+            bias: bias2.as_ptr(),
+            bias_len: bias2.len(),
+            outputs: outputs2.as_mut_ptr(),
+            outputs_len: outputs2.len(),
+            in_dim: 2,
+            out_dim: 3,
+        };
+        let result2 = syscall::dispatch_syscall(
+            syscall::SYS_TENSOR_EVAL,
+            &args2 as *const _ as u64,
+            0,
+            0,
+            false,
+        );
+        let outputs_insufficient_rejected = result2 == u64::MAX;
+
+        kprintln!(
+            "[SYSCALL] tensor_eval_dim_mismatch_test: weights_insufficient_rejected={} outputs_insufficient_rejected={}",
+            weights_insufficient_rejected,
+            outputs_insufficient_rejected
+        );
+        serial_println!(
+            "[SYSCALL] tensor_eval_dim_mismatch_test weights_insufficient_rejected={} outputs_insufficient_rejected={}",
+            weights_insufficient_rejected,
+            outputs_insufficient_rejected
+        );
+    }
+
     // 7b. Test the Shell Command Dispatcher (same parser the IRQ1 keyboard
     // handler calls once a real key press ends a line - this exercises it
     // without needing one, so it's provable from a headless serial capture.
