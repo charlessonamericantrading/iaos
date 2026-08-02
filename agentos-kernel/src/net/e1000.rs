@@ -1529,7 +1529,7 @@ pub fn tcp_echo_test(
     const SRC_IP: [u8; 4] = [10, 0, 2, 15]; // SLIRP guest default
     const SRC_PORT: u16 = 54322; // distinct from tcp_syn_test's own 54321, so a leftover half-open handshake from that test can never be confused with this one's fresh 4-tuple
     const INITIAL_SEQ: u32 = 0x3000_0000;
-    const NUM_RX_SLOTS: usize = 4; // this connection's own SYN-ACK, the stack's own immediate bare ACK, the real echo, plus one spare
+    const NUM_RX_SLOTS: usize = 7; // this connection's own SYN-ACK, the stack's own immediate bare ACK, the real echo, and (Fase 102) the peer's own ACK-of-our-FIN and/or its own FIN, plus spares - bumped from 4 since the graceful close below needs real headroom beyond the handshake+echo NUM_RX_DESCRIPTORS is 8 (module-level), so 7 leaves the ring's own last slot genuinely unarmed rather than cutting it exactly at the cap
     const RX_SLOT_STRIDE: u64 = 256;
 
     let syn_header = tcp::build_tcp_header(
@@ -1770,6 +1770,7 @@ pub fn tcp_echo_test(
     // a later slot may already be ready too.
     let echo_start_tick = crate::interrupts::timer_ticks();
     let mut slot = 1usize;
+    let mut echo_result: Option<(alloc::vec::Vec<u8>, u32)> = None;
     unsafe {
         loop {
             if slot >= NUM_RX_SLOTS {
@@ -1800,7 +1801,17 @@ pub fn tcp_echo_test(
                             echoed.len(),
                             echoed == payload
                         );
-                        return Ok(echoed.to_vec());
+                        // Fase 102: capture what the close sequence below
+                        // needs (the echoed bytes to still return, and
+                        // the peer's own sequence number advanced past
+                        // this segment) instead of returning immediately -
+                        // every TCP test before this Fase left the
+                        // connection dangling from this kernel's own side
+                        // the moment the echo arrived.
+                        let peer_seq_after_echo = info.seq_num.wrapping_add(echoed.len() as u32);
+                        echo_result = Some((echoed.to_vec(), peer_seq_after_echo));
+                        slot += 1;
+                        break;
                     }
                 }
                 slot += 1;
@@ -1812,5 +1823,102 @@ pub fn tcp_echo_test(
             x86_64::instructions::hlt();
         }
     }
-    Err("tcp_echo_test: timed out waiting for the real echoed data")
+    let (echoed_vec, peer_seq_after_echo) =
+        echo_result.ok_or("tcp_echo_test: timed out waiting for the real echoed data")?;
+
+    // Phase 5 (Fase 102): a graceful close. Sends our own FIN|ACK,
+    // consuming one sequence number past the data we already sent (RFC
+    // 793's own convention: FIN occupies a sequence number like a data
+    // byte would). `our_seq_after_data` is `expected_ack` - the same
+    // value phase 4's own `is_echo` check already used to recognize the
+    // peer's ACK of our data segment, since nothing between then and now
+    // sends anything new on our side.
+    let our_seq_after_data = expected_ack;
+    let fin_header = tcp::build_tcp_header(
+        SRC_IP,
+        target_ip,
+        SRC_PORT,
+        target_port,
+        our_seq_after_data,
+        peer_seq_after_echo,
+        tcp::TCP_FLAG_FIN | tcp::TCP_FLAG_ACK,
+        65535,
+        &[],
+    );
+    let fin_frame = build_tcp_frame(dest_mac, src_mac, SRC_IP, target_ip, fin_header, &[]);
+    send_and_wait(3, &fin_frame)?;
+
+    // Phase 6: poll whatever RX slots remain (continuing from `slot`,
+    // wherever phase 4 left it - each slot's buffer is real and never
+    // reused, so nothing earlier needs re-checking) for the peer's own
+    // FIN. SLIRP's `cmd:cat` process sees EOF on its own stdin once our
+    // FIN arrives, finishes copying, and exits - its own socket close
+    // should emit a FIN back, but genuinely uncertain going in whether
+    // that arrives combined with the ACK of our own FIN in one segment
+    // or as a separate one, so this checks the FIN bit on whatever
+    // segment shows up rather than assuming a specific flag combination.
+    // If it arrives within the same generous timeout the rest of this
+    // function already uses, completes the close with a final ACK.
+    let mut peer_fin_received = false;
+    let close_start_tick = crate::interrupts::timer_ticks();
+    unsafe {
+        loop {
+            if slot >= NUM_RX_SLOTS {
+                break;
+            }
+            let status =
+                core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt.add(slot)).status));
+            if status & RXD_STAT_DD != 0 {
+                let length =
+                    core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt.add(slot)).length))
+                        as usize;
+                let buf_virt = rx_buf_virt.add(slot * RX_SLOT_STRIDE as usize);
+                let data = core::slice::from_raw_parts(buf_virt, length);
+                if let Some((info, _)) = parse_reply_frame(data, target_ip, SRC_IP) {
+                    let is_peer_fin = info.source_port == target_port
+                        && info.dest_port == SRC_PORT
+                        && info.flags & tcp::TCP_FLAG_FIN != 0;
+                    if is_peer_fin {
+                        peer_fin_received = true;
+                        let final_ack_header = tcp::build_tcp_header(
+                            SRC_IP,
+                            target_ip,
+                            SRC_PORT,
+                            target_port,
+                            our_seq_after_data.wrapping_add(1),
+                            info.seq_num.wrapping_add(1),
+                            tcp::TCP_FLAG_ACK,
+                            65535,
+                            &[],
+                        );
+                        let final_ack_frame = build_tcp_frame(
+                            dest_mac,
+                            src_mac,
+                            SRC_IP,
+                            target_ip,
+                            final_ack_header,
+                            &[],
+                        );
+                        send_and_wait(4, &final_ack_frame)?;
+                        break;
+                    }
+                }
+                slot += 1;
+                continue;
+            }
+            if crate::interrupts::timer_ticks() - close_start_tick > 90 {
+                break;
+            }
+            x86_64::instructions::hlt();
+        }
+    }
+
+    serial_println!(
+        "[E1000] tcp_close_test target={:?} port={} fin_sent=true peer_fin_received={}",
+        target_ip,
+        target_port,
+        peer_fin_received
+    );
+
+    Ok(echoed_vec)
 }

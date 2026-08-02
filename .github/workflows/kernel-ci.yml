@@ -1093,6 +1093,19 @@ jobs:
           # this is the first real environment where the full round
           # trip - including the echo - can actually complete.
           grep -q "E1000\] tcp_echo_test target=\[10, 0, 2, 100\] port=9999 handshake_complete=true echo_len=24 echo_matches=true" boot.log
+          # Fase 102: every TCP test before this one left its own
+          # connection dangling the moment the echo arrived - never
+          # actually closing it. tcp_echo_test now sends a real FIN|ACK
+          # afterward (fin_sent=true is deterministic: reaching this line
+          # at all means it was sent) and, if the peer's own FIN arrives
+          # back within the same timeout budget the rest of the function
+          # already uses, completes the close with a final ACK. Only
+          # asserting the deterministic half here - whether SLIRP's
+          # `cmd:cat` target actually replies with a distinguishable FIN
+          # once its own stdin sees EOF is genuinely unverified until a
+          # real run confirms it, so peer_fin_received's specific value
+          # is observed and recorded, not gated on.
+          grep -q "E1000\] tcp_close_test target=\[10, 0, 2, 100\] port=9999 fin_sent=true" boot.log
           # Confirms the new ATA write path (Fase 23) genuinely wrote and
           # read back matching bytes - not just that write_sector()
           # returned without erroring. Deliberately NOT asserting the
