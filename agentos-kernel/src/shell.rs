@@ -20,10 +20,10 @@ pub fn dispatch_command(line: &str) {
     match cmd {
         "help" => {
             kprintln!(
-                "Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, netcheck, ping, clear"
+                "Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, netcheck, ping, dns, tcpecho, clear"
             );
             serial_println!(
-                "[SHELL] help -> Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, netcheck, ping, clear"
+                "[SHELL] help -> Commands: help, ps, mem, uptime, date, lspci, disk, ls, cat, touch, rm, mkdir, rmdir, netcheck, ping, dns, tcpecho, clear"
             );
         }
         "ps" => {
@@ -357,6 +357,123 @@ pub fn dispatch_command(line: &str) {
                 None => {
                     kprintln!("ping: usage: ping A.B.C.D");
                     serial_println!("[SHELL] ping -> invalid or missing IP: '{}'", ip_str);
+                }
+            }
+        }
+        "dns" => {
+            // Fase 109: exposes net::e1000::dns_query_test (Fase 106,
+            // extended with real answer-record parsing in Fase 107)
+            // interactively, on demand, rather than only ever at boot -
+            // the same "prove the API first, then expose it via shell"
+            // pattern netcheck/ping themselves already established back
+            // in Fase 46/49. Zero changes to net::e1000/net::dns
+            // themselves - both are already fully proven, reused here
+            // as a black box, unlike netcheck/ping this always queries
+            // port 53 (DNS is a fixed-port protocol, not a caller
+            // choice) and always sends the SAME fixed "A? example.com"
+            // query the boot self-test itself already sends - this
+            // command's only real job is letting a user pick a
+            // DIFFERENT target DNS server interactively.
+            let ip_str = parts.next().unwrap_or("");
+            match parse_ipv4(ip_str) {
+                Some(target_ip) => match crate::net::e1000::dns_query_test(target_ip) {
+                    Ok((reply_received, qr_bit_set, answer_count, parsed_a_record)) => {
+                        kprintln!(
+                            "DNS query to {}:53 - reply_received={} qr_bit_set={} answer_count={} parsed_a_record={:?}",
+                            ip_str,
+                            reply_received,
+                            qr_bit_set,
+                            answer_count,
+                            parsed_a_record
+                        );
+                        serial_println!(
+                            "[SHELL] dns {} -> reply_received={} qr_bit_set={} answer_count={} parsed_a_record={:?}",
+                            ip_str,
+                            reply_received,
+                            qr_bit_set,
+                            answer_count,
+                            parsed_a_record
+                        );
+                    }
+                    Err(e) => {
+                        kprintln!("dns: {}", e);
+                        serial_println!("[SHELL] dns {} -> FAILED: {}", ip_str, e);
+                    }
+                },
+                None => {
+                    kprintln!("dns: usage: dns A.B.C.D  (queries that DNS server's own port 53)");
+                    serial_println!("[SHELL] dns -> invalid or missing IP: '{}'", ip_str);
+                }
+            }
+        }
+        "tcpecho" => {
+            // Fase 109: exposes net::e1000::tcp_echo_test (Fase 90,
+            // extended with a graceful close in Fase 102 and proven
+            // reusable for a second sequential connection in Fase 108)
+            // interactively - the same reasoning as the new "dns"
+            // command right above. Zero changes to tcp_echo_test
+            // itself; the ONE real new consideration is a length check
+            // that function's own doc already flags as a real, existing
+            // limitation (not a general-purpose send API - it assumes
+            // a short payload sharing a fixed 256-byte TX slot stride
+            // with no bounds check of its own) - genuinely a user-input
+            // boundary this command must guard, since tcp_echo_test
+            // itself trusts its caller not to violate it.
+            let ip_str = parts.next().unwrap_or("");
+            let port_str = parts.next().unwrap_or("");
+            let message = parts.collect::<alloc::vec::Vec<&str>>().join(" ");
+            const MAX_TCPECHO_PAYLOAD: usize = 100;
+            match (parse_ipv4(ip_str), port_str.parse::<u16>()) {
+                (Some(target_ip), Ok(target_port)) if message.len() <= MAX_TCPECHO_PAYLOAD => {
+                    let mut payload = message.into_bytes();
+                    payload.push(b'\n');
+                    match crate::net::e1000::tcp_echo_test(target_ip, target_port, &payload) {
+                        Ok(echoed) => {
+                            let matches = echoed == payload;
+                            kprintln!(
+                                "TCP echo to {}:{} - echo_len={} matches_sent={}",
+                                ip_str,
+                                target_port,
+                                echoed.len(),
+                                matches
+                            );
+                            serial_println!(
+                                "[SHELL] tcpecho {} {} -> echo_len={} matches_sent={}",
+                                ip_str,
+                                target_port,
+                                echoed.len(),
+                                matches
+                            );
+                        }
+                        Err(e) => {
+                            kprintln!("tcpecho: {}", e);
+                            serial_println!(
+                                "[SHELL] tcpecho {} {} -> FAILED: {}",
+                                ip_str,
+                                target_port,
+                                e
+                            );
+                        }
+                    }
+                }
+                (Some(_), Ok(_)) => {
+                    kprintln!(
+                        "tcpecho: message too long ({} bytes, max {})",
+                        message.len(),
+                        MAX_TCPECHO_PAYLOAD
+                    );
+                    serial_println!(
+                        "[SHELL] tcpecho -> message too long: {} bytes",
+                        message.len()
+                    );
+                }
+                _ => {
+                    kprintln!("tcpecho: usage: tcpecho A.B.C.D PORT message...");
+                    serial_println!(
+                        "[SHELL] tcpecho -> invalid usage: ip='{}' port='{}'",
+                        ip_str,
+                        port_str
+                    );
                 }
             }
         }
