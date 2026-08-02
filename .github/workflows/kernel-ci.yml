@@ -71,17 +71,37 @@ jobs:
       # boots under this exact dual-netdev config, full 110-assertion
       # regression suite unchanged, e1000's own PCI slot/MAC/every
       # existing e1000 test untouched) before trusting this change here.
-      - name: Boot-test in QEMU and verify the serial trace
+      # Fase 90 investigation (temporary): a real packet capture on the
+      # e1000 netdev, the same `-object filter-dump` technique that
+      # resolved the VirtIO RX mystery and Fase 89's own MSS/padding
+      # bug - this time to see, on THIS Linux runner specifically,
+      # whether tcp_echo_test's real echo genuinely never arrives or
+      # whether something else is going on. Uploaded unconditionally
+      # (`if: always()` on the next step) so it's available even though
+      # this step itself is expected to keep failing until diagnosed.
+      - name: Boot-test in QEMU
         run: |
           timeout 25 qemu-system-x86_64 \
             -drive format=raw,file=agentos-kernel/target/disk-image/agentos-bios.img \
             -serial stdio -display none -no-reboot -no-shutdown \
             -netdev user,id=e1000net,guestfwd=tcp:10.0.2.100:9999-cmd:cat -device e1000,netdev=e1000net \
+            -object filter-dump,id=e1000dump,netdev=e1000net,file=e1000.pcap \
             -netdev user,id=virtionet -device virtio-net-pci,netdev=virtionet \
             | tee boot.log || true
           echo "----- full boot.log -----"
           cat boot.log
           echo "--------------------------"
+
+      - name: Upload packet capture (Fase 90 investigation)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e1000-pcap
+          path: e1000.pcap
+          retention-days: 5
+
+      - name: Verify the serial trace
+        run: |
           grep -q "AgentOS Native Bare-Metal Kernel Initialized" boot.log
           # Confirms the ring-3 GDT/TSS foundation (Fase 68, the first
           # step of a real usermode transition arc) - real ring-3 code/
