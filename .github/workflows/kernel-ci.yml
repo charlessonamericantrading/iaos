@@ -582,6 +582,23 @@ jobs:
           # round-robin, the same generalization Fase 91 already did for
           # the OTHER, involuntary-timer-driven ring-3 scheduler.
           grep -q "RING3\] ring3_cooperative_test exit_code=42 signature=\[41, 42, 43, 58\]" boot.log
+          # Fase 95: the cooperative-yield mechanism's own new priority
+          # field is real, not cosmetic - the voluntary-yield equivalent
+          # of Fase 92's own ring3_mt priority test, but with a genuinely
+          # different safety argument since nothing here is timer-driven:
+          # only a task's OWN explicit int 0x83 ever transfers control,
+          # so if task 0 (High) alone holds the top priority tier, its
+          # own yield finds no OTHER slot at that tier and round-robins
+          # all the way back around to task 0 ITSELF - a safe, immediate
+          # self-resume, not a hang. Reuses the EXACT SAME program the
+          # round-robin test above already uses (priority is a
+          # scheduling-setup concern, not a program-construction one).
+          # `signature=[41, 00, 00, 58]`: task 0 wrote 'A', yielded,
+          # immediately resumed itself, wrote its own completion marker
+          # (`0x58`) and exited - `sig[1]`/`sig[2]` (where tasks 1/2,
+          # Background, would write 'B'/'C') staying at their own
+          # zero-fill is direct proof those tasks never ran even once.
+          grep -q "RING3\] priority_cooperative_test exit_code=42 signature=\[41, 00, 00, 58\]" boot.log
           # Fase 85: the first genuine, INVOLUNTARY (timer-driven) ring-3
           # preemption this kernel has ever attempted - a real hardware
           # tick, landing at an arbitrary point this ring-3 program did

@@ -3040,6 +3040,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ring3_coop_sig
     );
 
+    // Fase 95: proves ring3_coop_yield_helper's own new priority field is
+    // real, not cosmetic - the cooperative-yield equivalent of Fase 92's
+    // own ring3_mt priority test, but with a genuinely different safety
+    // argument since this mechanism is voluntary, not timer-driven - see
+    // ring3::run_priority_cooperative_test's own doc.
+    kprintln!(
+        "[KERNEL INIT] Testing REAL priority in the cooperative-yield mechanism (task0=High vs task1/task2=Background)..."
+    );
+    let (priority_coop_code, priority_coop_sig) = ring3::run_priority_cooperative_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - priority_cooperative_test returned exit_code={} signature={:02x?}",
+        priority_coop_code,
+        priority_coop_sig
+    );
+
     // Fase 85: the first genuine, INVOLUNTARY (timer-driven) ring-3
     // preemption this kernel has ever attempted - a real hardware tick
     // saves this ring-3 program's COMPLETE register state and correctly
