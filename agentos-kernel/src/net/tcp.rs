@@ -2,13 +2,11 @@
 //! checksum - pure byte-buffer logic with no hardware dependency at all,
 //! mirroring `net::icmp`'s own "protocol layer first, wire to real
 //! device I/O later" order (Fase 47 before Fase 48-49's real ARP/ping
-//! round trips). Reuses `net::icmp::internet_checksum` directly for the
-//! actual summing arithmetic (already proven correct there, verified
-//! against RFC 1071 - no reason to re-derive it) - the only genuinely
-//! NEW logic here is assembling TCP's own pseudo-header (source IP,
-//! dest IP, a zero byte, protocol number 6, and the TCP length) ahead
-//! of the real header+payload before handing the combined buffer to
-//! that same summing function, per RFC 793 section 3.1.
+//! round trips). The pseudo-header assembly (source IP, dest IP, a zero
+//! byte, protocol number, length) and the actual summing arithmetic both
+//! live in `icmp::pseudo_header_checksum` (Fase 119) - shared with
+//! `net::udp`, whose own pseudo-header is byte-for-byte the same shape,
+//! just over `IP_PROTOCOL_UDP` instead of `IP_PROTOCOL_TCP`.
 //!
 //! Deliberately NOT wired to any real connection state machine (SYN/
 //! SYN-ACK/ACK handshake, sequence tracking, retransmission) or device
@@ -17,7 +15,7 @@
 //! this kernel has followed (Fase 21's frame allocator, Fase 37/38's
 //! VFAT entry-building, Fase 47's own ICMP header/checksum work).
 
-use crate::net::icmp::internet_checksum;
+use crate::net::icmp::pseudo_header_checksum;
 use alloc::vec::Vec;
 
 pub const TCP_HEADER_LEN: usize = 20; // no options
@@ -30,32 +28,18 @@ pub const TCP_FLAG_PSH: u8 = 0x08;
 pub const TCP_FLAG_ACK: u8 = 0x10;
 pub const TCP_FLAG_URG: u8 = 0x20;
 
-/// RFC 793's pseudo-header checksum: source IP (4) + dest IP (4) + a
-/// zero byte + protocol number (6 for TCP) + TCP length (u16), followed
-/// by `segment` itself (header, with its own checksum field however the
-/// caller left it, plus payload) - all summed via `net::icmp`'s already-
-/// proven RFC 1071 algorithm. Used both to COMPUTE a checksum (caller
-/// passes a segment with the checksum field still zeroed) and to VERIFY
-/// one (caller passes the real, already-checksummed segment - a valid
-/// one sums to exactly 0, the same convention `icmp::checksum_is_valid`
-/// already established for the analogous ICMP case).
-fn tcp_pseudo_checksum(source_ip: [u8; 4], dest_ip: [u8; 4], segment: &[u8]) -> u16 {
-    let tcp_len = segment.len() as u16;
-    let mut buf = Vec::with_capacity(12 + segment.len());
-    buf.extend_from_slice(&source_ip);
-    buf.extend_from_slice(&dest_ip);
-    buf.push(0);
-    buf.push(IP_PROTOCOL_TCP);
-    buf.extend_from_slice(&tcp_len.to_be_bytes());
-    buf.extend_from_slice(segment);
-    internet_checksum(&buf)
-}
-
 /// Returns true if `segment` (header + payload, checksum field as
 /// actually received) is internally consistent against the given
-/// source/dest IPs.
+/// source/dest IPs. Used both to COMPUTE a checksum (caller passes a
+/// segment with the checksum field still zeroed) and to VERIFY one
+/// (caller passes the real, already-checksummed segment - a valid one
+/// sums to exactly 0, the same convention `icmp::checksum_is_valid`
+/// already established for the analogous ICMP case). The pseudo-header
+/// arithmetic itself lives in `icmp::pseudo_header_checksum` (Fase 119),
+/// shared with `net::udp`, whose own pseudo-header is byte-for-byte
+/// identical bar the protocol number.
 pub fn tcp_checksum_is_valid(source_ip: [u8; 4], dest_ip: [u8; 4], segment: &[u8]) -> bool {
-    tcp_pseudo_checksum(source_ip, dest_ip, segment) == 0
+    pseudo_header_checksum(source_ip, dest_ip, IP_PROTOCOL_TCP, segment) == 0
 }
 
 /// Builds a 20-byte TCP header (no options, `data_offset = 5`) with a
@@ -90,7 +74,7 @@ pub fn build_tcp_header(
     let mut segment = Vec::with_capacity(TCP_HEADER_LEN + payload.len());
     segment.extend_from_slice(&header);
     segment.extend_from_slice(payload);
-    let checksum = tcp_pseudo_checksum(source_ip, dest_ip, &segment);
+    let checksum = pseudo_header_checksum(source_ip, dest_ip, IP_PROTOCOL_TCP, &segment);
     header[16..18].copy_from_slice(&checksum.to_be_bytes());
     header
 }

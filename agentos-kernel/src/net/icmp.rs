@@ -57,6 +57,34 @@ pub fn internet_checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// RFC 793 (TCP)/RFC 768 (UDP) pseudo-header checksum: source IP (4) +
+/// dest IP (4) + a zero byte + `protocol` + segment/datagram length
+/// (u16), followed by `segment` itself (header, with its own checksum
+/// field however the caller left it, plus payload) - summed via
+/// [`internet_checksum`] above. `net::tcp`'s own `tcp_pseudo_checksum`
+/// and `net::udp`'s own `udp_pseudo_checksum` (Fase 88/106) started as
+/// two byte-for-byte identical private functions, differing only in
+/// `protocol` (6 vs 17) - both RFCs inherited the same pseudo-header
+/// idea from the same original IP-checksum design, so this was real,
+/// not coincidental, duplication (Fase 119 unifies it here, the same
+/// place both modules already share `internet_checksum` itself).
+pub fn pseudo_header_checksum(
+    source_ip: [u8; 4],
+    dest_ip: [u8; 4],
+    protocol: u8,
+    segment: &[u8],
+) -> u16 {
+    let seg_len = segment.len() as u16;
+    let mut buf = Vec::with_capacity(12 + segment.len());
+    buf.extend_from_slice(&source_ip);
+    buf.extend_from_slice(&dest_ip);
+    buf.push(0);
+    buf.push(protocol);
+    buf.extend_from_slice(&seg_len.to_be_bytes());
+    buf.extend_from_slice(segment);
+    internet_checksum(&buf)
+}
+
 /// Returns true if `data` - a buffer that already includes its own
 /// checksum field - is internally consistent (correctly checksummed, not
 /// corrupted since).
