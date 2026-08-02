@@ -44,6 +44,11 @@
 //! (PML4 index 238, distinct from all three above) - a dedicated stack
 //! page for the same disk-loaded program, so its code and stack no
 //! longer share a page's tail the way every ring-3 test before it did.
+//!
+//! **Fase 103 adds a FIFTH mapped address, `USER_DISK_PROGRAM_DATA_ADDR`**
+//! (PML4 index 102, distinct from all four above) - a real DATA segment
+//! for the same disk-loaded program, so it can write and be verified to
+//! have written somewhere that is neither its own code nor its own stack.
 
 use x86_64::structures::paging::mapper::{MapToError, TranslateResult};
 use x86_64::structures::paging::{
@@ -74,6 +79,22 @@ pub const USER_DISK_PROGRAM_PAGE_ADDR: u64 = 0x6666_6666_0000;
 /// been proven to work when code and stack live on genuinely separate,
 /// non-adjacent pages.
 pub const USER_DISK_PROGRAM_STACK_ADDR: u64 = 0x7777_7777_0000;
+
+/// A FOURTH independent page - Fase 103 - a real DATA segment for the
+/// disk-loaded program, distinct from its own code and stack pages
+/// above. PML4 index 102: distinct from the heap's 136, `USER_TEST_
+/// PAGE_ADDR`'s 170, `USER_DISK_PROGRAM_PAGE_ADDR`'s 204, and `USER_
+/// DISK_PROGRAM_STACK_ADDR`'s 238. Deliberately a SMALLER address than
+/// all four: `0x3333_3333_0000` continues this module's own established
+/// "one repeated hex digit, times four" naming, but the naive next step
+/// in that sequence (`0x8888_8888_0000`) turns out non-canonical
+/// (`>= 2^47`, so `VirtAddr::new` would panic on it) - checked this
+/// before picking a candidate, not after. Exists because every ring-3
+/// program in this kernel's history has only ever had code and (since
+/// Fase 100) a stack, never a THIRD region to read or write - the
+/// "multiple segments" half of the general-loader gap `run_ring3_disk_
+/// loaded_test`'s own doc has named since Fase 98.
+pub const USER_DISK_PROGRAM_DATA_ADDR: u64 = 0x3333_3333_0000;
 
 /// Maps one 4KiB page at `addr` with `PRESENT | WRITABLE |
 /// USER_ACCESSIBLE` - the shared implementation behind both

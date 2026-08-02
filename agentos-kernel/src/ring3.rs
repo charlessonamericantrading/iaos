@@ -58,7 +58,8 @@
 //! command needed. See that section's own doc for the mechanism.
 
 use crate::memory::user_page::{
-    USER_DISK_PROGRAM_PAGE_ADDR, USER_DISK_PROGRAM_STACK_ADDR, USER_TEST_PAGE_ADDR,
+    USER_DISK_PROGRAM_DATA_ADDR, USER_DISK_PROGRAM_PAGE_ADDR, USER_DISK_PROGRAM_STACK_ADDR,
+    USER_TEST_PAGE_ADDR,
 };
 use crate::{fat12, gdt, kprintln, serial_println, shell};
 use core::arch::naked_asm;
@@ -2638,12 +2639,11 @@ pub fn run_early_exit_ring3_mt_test() -> (u64, u32, bool, u32, bool, usize) {
 // Fases ago).
 //
 // Deliberately does NOT attempt to build any kind of general program
-// loader (parsing an executable format, choosing where to place
-// multiple segments, ...) - that remains real, substantially larger,
-// separate follow-on work. This Fase only proves the one new fact
-// everything else would depend on: bytes read back from a real file
-// are byte-for-byte what was written, and the CPU treats them as valid
-// ring-3 code when copied into an executable page.
+// loader (parsing an executable format, ...) - that remains real,
+// substantially larger, separate follow-on work. This Fase only proves
+// the one new fact everything else would depend on: bytes read back
+// from a real file are byte-for-byte what was written, and the CPU
+// treats them as valid ring-3 code when copied into an executable page.
 //
 // Fase 99 update: runs on USER_DISK_PROGRAM_PAGE_ADDR, a SECOND,
 // independent page (see memory::user_page's own doc for its
@@ -2660,15 +2660,59 @@ pub fn run_early_exit_ring3_mt_test() -> (u64, u32, bool, u32, bool, usize) {
 // ring-3 test in this kernel's history before this one. enter_ring3
 // needed no changes: user_rsp was already an independent parameter,
 // never assumed adjacent to entry.
-pub fn run_ring3_disk_loaded_test() -> (bool, u64) {
-    const PROGRAM: [u8; 15] = [
-        0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xCD, 0x81, 0xFA,
-    ];
+//
+// Fase 103 update: the program now also writes a real signature byte to
+// USER_DISK_PROGRAM_DATA_ADDR (a FOURTH independent page) - a genuine
+// DATA segment, not just code and stack. Uses the exact `mov r12, imm64`
+// + register-relative-write encoding `build_coop_task_prologue`/
+// `build_cooperative_test_program` already proved correct for feeding a
+// hand-assembled ring-3 program a runtime address, rather than inventing
+// a new addressing pattern.
+
+/// Builds the disk-loaded test's own program bytes, parameterized on
+/// `data_addr` so the SAME 8-byte absolute address `USER_DISK_PROGRAM_
+/// DATA_ADDR` resolves to gets embedded directly in the machine code
+/// (`mov r12, imm64`), the identical technique `build_coop_task_prologue`
+/// already uses to hand a hand-assembled ring-3 program a runtime
+/// address. Body: syscall test (unchanged since Fase 73's own program),
+/// `mov al, 0x99` + `mov [r12], al` (writes the signature byte to the
+/// data page), exit syscall, `cli`.
+fn build_disk_loaded_program(data_addr: u64) -> [u8; 31] {
+    let mut p = [0u8; 31];
+    p[0] = 0x49;
+    p[1] = 0xBC; // mov r12, imm64
+    p[2..10].copy_from_slice(&data_addr.to_le_bytes());
+    p[10] = 0xB8;
+    p[11] = 0x01;
+    p[12] = 0x00;
+    p[13] = 0x00;
+    p[14] = 0x00; // mov eax, 1
+    p[15] = 0xCD;
+    p[16] = 0x80; // int 0x80 (syscall test)
+    p[17] = 0xB0;
+    p[18] = 0x99; // mov al, 0x99 (signature byte)
+    p[19] = 0x41;
+    p[20] = 0x88;
+    p[21] = 0x04;
+    p[22] = 0x24; // mov [r12], al
+    p[23] = 0xB8;
+    p[24] = 0x2A;
+    p[25] = 0x00;
+    p[26] = 0x00;
+    p[27] = 0x00; // mov eax, 42
+    p[28] = 0xCD;
+    p[29] = 0x81; // int 0x81 (exit)
+    p[30] = 0xFA; // cli
+    p
+}
+
+pub fn run_ring3_disk_loaded_test() -> (bool, u64, bool) {
+    let program = build_disk_loaded_program(USER_DISK_PROGRAM_DATA_ADDR);
 
     let loaded = match shell::find_fat_partition() {
         Ok(partition) => match fat12::read_bpb(&partition) {
             Ok(mut fs) => {
-                let write_ok = fs.create_file("RING3.BIN", &PROGRAM).is_ok();
+                let write_ok = fs.create_file("RING3.BIN", &program).is_ok();
                 let read_back = fs.read_file("RING3.BIN").ok();
                 let _ = fs.delete_file("RING3.BIN");
                 if write_ok {
@@ -2682,7 +2726,7 @@ pub fn run_ring3_disk_loaded_test() -> (bool, u64) {
         Err(_) => None,
     };
 
-    let roundtrip_ok = loaded.as_deref() == Some(PROGRAM.as_slice());
+    let roundtrip_ok = loaded.as_deref() == Some(program.as_slice());
     if !roundtrip_ok {
         // No real destination address to distrust here - simply never
         // enter ring-3 at all rather than execute whatever stale bytes
@@ -2690,7 +2734,7 @@ pub fn run_ring3_disk_loaded_test() -> (bool, u64) {
         serial_println!(
             "[RING3] ring3_disk_loaded_test roundtrip_ok=false - skipping ring-3 entry"
         );
-        return (false, 0);
+        return (false, 0, false);
     }
     let loaded = loaded.unwrap();
 
@@ -2710,10 +2754,21 @@ pub fn run_ring3_disk_loaded_test() -> (bool, u64) {
     let exit_code =
         unsafe { enter_ring3(code_addr, user_cs, user_ss, stack_top, RING3_TEST_RFLAGS) };
 
+    // The program just wrote a real signature byte to a genuinely
+    // separate DATA page. Ring-0 can read it back regardless of
+    // USER_ACCESSIBLE - that bit only ever restricts ring-3, never
+    // ring-0, the same reasoning memory::user_page's own doc already
+    // established for the first such page back in Fase 70.
+    const DATA_SIGNATURE: u8 = 0x99;
+    let data_write_verified =
+        unsafe { core::ptr::read_volatile(USER_DISK_PROGRAM_DATA_ADDR as *const u8) }
+            == DATA_SIGNATURE;
+
     serial_println!(
-        "[RING3] ring3_disk_loaded_test roundtrip_ok=true exit_code={}",
-        exit_code
+        "[RING3] ring3_disk_loaded_test roundtrip_ok=true exit_code={} data_write_verified={}",
+        exit_code,
+        data_write_verified
     );
 
-    (true, exit_code)
+    (true, exit_code, data_write_verified)
 }

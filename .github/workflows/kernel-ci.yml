@@ -214,6 +214,19 @@ jobs:
           # unchanged proves enter_ring3's iretq frame works correctly
           # even when code and stack live on genuinely separate pages.
           grep -q "MEMORY\] disk_program_stack present=true writable=true user_accessible=true write_read_back_ok=true" boot.log
+          # Fase 103: a FOURTH independent page (USER_DISK_PROGRAM_DATA_
+          # ADDR, PML4 index 102 - distinct from the heap's 136, the
+          # test page's 170, the disk program page's own 204, and the
+          # disk program stack's own 238). A real DATA segment for the
+          # same disk-loaded program - every ring-3 program in this
+          # kernel's history has only ever had code and (since Fase 100)
+          # a stack, never a third region to read or write. See the
+          # disk_loaded_test assertion below: data_write_verified=true
+          # proves the disk-loaded program's own `mov r12, imm64` +
+          # `mov [r12], al` (the same encoding build_coop_task_prologue
+          # already proved correct) genuinely wrote to this page, not
+          # just that the mapping itself looks right in isolation.
+          grep -q "MEMORY\] disk_program_data present=true writable=true user_accessible=true write_read_back_ok=true" boot.log
           # Confirms a SAFE ring-3 -> ring-0 return (Fase 73) - unlike
           # ring3test/ring3syscall above (both deliberately opt-in, not
           # asserted here, since both end in a permanent halt by
@@ -726,7 +739,13 @@ jobs:
           # instead of sharing the tail of the code page - exit_code=42
           # still unchanged proves the transition works with code and
           # stack on genuinely separate, non-adjacent pages.
-          grep -q "RING3\] ring3_disk_loaded_test roundtrip_ok=true exit_code=42" boot.log
+          # Fase 103 update: the program now also writes a real
+          # signature byte to USER_DISK_PROGRAM_DATA_ADDR (see the
+          # disk_program_data assertion above) - data_write_verified=true
+          # is read back from ring-0 after the program exits, real proof
+          # the write actually reached that page, not just that the
+          # program ran and exited correctly.
+          grep -q "RING3\] ring3_disk_loaded_test roundtrip_ok=true exit_code=42 data_write_verified=true" boot.log
           # Fase 87: the preemptive (timer-driven) scheduler's own
           # `priority` field was tracked and displayed since Fase 31 but
           # never actually used by tick()'s own task-selection logic -

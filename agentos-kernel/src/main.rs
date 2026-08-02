@@ -315,6 +315,43 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // Fase 103: a FOURTH, independent user page - a real DATA segment
+    // for the same disk-loaded program, distinct from its code and
+    // stack pages above. See ring3::run_ring3_disk_loaded_test, whose
+    // program now writes a real signature byte here instead of only
+    // ever touching its own code/stack.
+    kprintln!("[KERNEL INIT] Mapping a fourth, independent user page as a real data segment...");
+    memory::paging::with_mapper(|mapper| {
+        memory::user_page::map_user_page_at(
+            mapper,
+            &mut frame_allocator,
+            memory::user_page::USER_DISK_PROGRAM_DATA_ADDR,
+        )
+    })
+    .expect("disk program data page mapping failed");
+    {
+        let info = memory::paging::with_mapper(|mapper| {
+            memory::user_page::inspect_user_page_at(
+                mapper,
+                memory::user_page::USER_DISK_PROGRAM_DATA_ADDR,
+            )
+        });
+        kprintln!(
+            "[MEMORY] disk_program_data present={} writable={} user_accessible={} write_read_back_ok={}",
+            info.present,
+            info.writable,
+            info.user_accessible,
+            info.write_read_back_ok
+        );
+        serial_println!(
+            "[MEMORY] disk_program_data present={} writable={} user_accessible={} write_read_back_ok={}",
+            info.present,
+            info.writable,
+            info.user_accessible,
+            info.write_read_back_ok
+        );
+    }
+
     // Fase 73: closes the ring-3 arc's own last remaining gap - a SAFE
     // ring-3 -> ring-0 return, unlike every earlier ring-3 test (Fase 71/
     // 72's ring3test/ring3syscall, both deliberately-opt-in shell
@@ -3243,11 +3280,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // entry (a synchronous enter_ring3 call, same as Fase 73's own exit
     // test), so it's safe to run here, before the PID-sensitive test
     // below.
-    let (disk_loaded_roundtrip_ok, disk_loaded_exit_code) = ring3::run_ring3_disk_loaded_test();
+    let (disk_loaded_roundtrip_ok, disk_loaded_exit_code, disk_loaded_data_write_verified) =
+        ring3::run_ring3_disk_loaded_test();
     kprintln!(
-        "[KERNEL INIT] Back from ring-3 - disk_loaded_test roundtrip_ok={} exit_code={}",
+        "[KERNEL INIT] Back from ring-3 - disk_loaded_test roundtrip_ok={} exit_code={} data_write_verified={}",
         disk_loaded_roundtrip_ok,
-        disk_loaded_exit_code
+        disk_loaded_exit_code,
+        disk_loaded_data_write_verified
     );
 
     // Fase 87: proves the preemptive scheduler's own priority field is
