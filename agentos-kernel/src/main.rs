@@ -3060,13 +3060,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // preempted one leaves behind, not just resuming the SAME one. See
     // scheduler::ring3_mt's own module doc for the round-robin
     // mechanism and ring3::run_ring3_mt_test's own doc for the full
-    // two-task test design.
-    kprintln!("[KERNEL INIT] Testing genuine multi-task ring-3 scheduling (two DIFFERENT programs alternating via the timer)...");
-    let (ring3_mt_task0, ring3_mt_task1, ring3_mt_switches) = ring3::run_ring3_mt_test();
+    // 3-task test design (Fase 91 generalized this from a hardcoded
+    // pair).
+    kprintln!("[KERNEL INIT] Testing genuine multi-task ring-3 scheduling (3 DIFFERENT programs alternating via the timer)...");
+    let (ring3_mt_task0, ring3_mt_others, ring3_mt_switches) = ring3::run_ring3_mt_test();
     kprintln!(
-        "[KERNEL INIT] Back from ring-3 - multi-task test returned task0_checksum={:#x} task1_last_eax={:#x} switch_count={}",
+        "[KERNEL INIT] Back from ring-3 - multi-task test returned task0_checksum={:#x} task1_last_eax={:#x} task2_last_eax={:#x} switch_count={}",
         ring3_mt_task0,
-        ring3_mt_task1,
+        ring3_mt_others[0],
+        ring3_mt_others[1],
         ring3_mt_switches
     );
 

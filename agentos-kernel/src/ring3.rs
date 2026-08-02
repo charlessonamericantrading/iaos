@@ -1467,48 +1467,94 @@ fn prepare_ring3_mt_task_ctx(
     ctx
 }
 
-/// Fase 86: the real, larger step `ring3_preempt`'s own module doc
-/// (Fase 85) named as the necessary follow-on - actually running a
-/// DIFFERENT ring-3 program in the gap a preempted one leaves behind,
-/// not just resuming the SAME one. See `scheduler::ring3_mt`'s own
-/// module doc for the round-robin mechanism; this function builds the
-/// two ring-3 programs and drives the experiment end to end.
+/// Builds one of `run_ring3_mt_test`'s own tiny, self-checking ring-3
+/// programs: load 5 "caller-saved" registers with a distinct, checkable
+/// pattern, spin `loop_count` times, XOR them into `eax`, then either
+/// exit via `int 0x81` (task 0 only) or spin forever (`jmp $`, harmless
+/// and critically non-destructive of `eax` - every other task). Shared
+/// here (Fase 91) instead of hand-copied per task now that there are
+/// more than 2 of them.
+fn build_ring3_mt_checksum_program(register_prefix: u32, loop_count: u32, exits: bool) -> [u8; 46] {
+    let mut program = [0u8; 46];
+    program[0] = 0xB8;
+    program[1..5].copy_from_slice(&register_prefix.to_le_bytes());
+    program[5] = 0xB9;
+    program[6..10].copy_from_slice(&(register_prefix + 1).to_le_bytes());
+    program[10] = 0xBA;
+    program[11..15].copy_from_slice(&(register_prefix + 2).to_le_bytes());
+    program[15] = 0xBE;
+    program[16..20].copy_from_slice(&(register_prefix + 3).to_le_bytes());
+    program[20] = 0xBF;
+    program[21..25].copy_from_slice(&(register_prefix + 4).to_le_bytes());
+    program[25] = 0x41;
+    program[26] = 0xB8;
+    program[27..31].copy_from_slice(&loop_count.to_le_bytes());
+    program[31] = 0x41;
+    program[32] = 0xFF;
+    program[33] = 0xC8; // dec r8d
+    program[34] = 0x75;
+    program[35] = 0xFB; // jnz -5 (back to `dec r8d`)
+    program[36] = 0x31;
+    program[37] = 0xC8; // xor eax, ecx
+    program[38] = 0x31;
+    program[39] = 0xD0; // xor eax, edx
+    program[40] = 0x31;
+    program[41] = 0xF0; // xor eax, esi
+    program[42] = 0x31;
+    program[43] = 0xF8; // xor eax, edi
+    if exits {
+        program[44] = 0xCD;
+        program[45] = 0x81; // int 0x81 (Fase 73's own exit vector)
+    } else {
+        program[44] = 0xEB;
+        program[45] = 0xFE; // jmp $ (never exits - see this fn's own doc)
+    }
+    program
+}
+
+/// Fase 86 proved genuine involuntary multi-task ring-3 scheduling
+/// works AT ALL (`ring3_preempt`'s own module doc named this the
+/// necessary follow-on), deliberately hardcoded to exactly 2 tasks.
+/// **Fase 91 generalizes it to 3** - not an arbitrary bigger number, but
+/// the smallest scale that actually proves the mechanism isn't secretly
+/// still a hardcoded pair, the same "one more than 2, not an arbitrary
+/// large N" reasoning this session's own GGUF/quantization Fases
+/// already applied one variant at a time. See `scheduler::ring3_mt`'s
+/// own module doc for the now-generalized round-robin mechanism; this
+/// function builds all 3 ring-3 programs and drives the experiment end
+/// to end.
 ///
 /// **Task 0** (entered normally via the existing, unmodified
 /// `enter_ring3`/`int 0x81` exit mechanism - EXACTLY Fase 85's own test
-/// program, reused verbatim except for its 5 immediate constants,
-/// chosen with a `0x1...` prefix so a wrong-task-resumed bug would show
-/// up as an immediately wrong, distinguishable value): loads 5
-/// "caller-saved" registers, spins Fase 79/85's own already-proven
-/// `LOOP_COUNT=150_000_000` (reliably spanning multiple real tick
-/// periods), XORs them into `eax`, exits via `int 0x81`.
+/// program, register pattern prefixed `0x1...` so a wrong-task-resumed
+/// bug would show up as an immediately wrong, distinguishable value):
+/// spins Fase 79/85's own already-proven `LOOP_COUNT=150_000_000`
+/// (reliably spanning multiple real tick periods) before exiting.
 ///
-/// **Task 1** (entered ONLY by `scheduler::ring3_mt`'s own round-robin
-/// switching, cold, via `prepare_ring3_mt_task_ctx` above - it never
-/// runs via `enter_ring3` at all): the IDENTICAL shape with a `0x2...`
-/// prefix instead, and a MUCH smaller loop count, so it reliably
-/// finishes its own checksum early and spends the rest of the
-/// experiment just spinning (`jmp $`, harmless, and critically
-/// non-destructive of its own `eax`) rather than racing task 0's own
-/// much larger loop. Task 1 deliberately never exits on its own - there
-/// is no way for it to signal completion the way task 0 does, since two
-/// tasks both racing for the single existing `int 0x81`/
-/// `RING3_RETURN_RSP` slot would break the "the kernel regains control
-/// exactly once, when task 0 itself decides to" invariant every earlier
-/// ring3 test already relies on. Instead, verification reads task 1's
-/// own LAST-saved `eax` directly out of its dedicated context buffer
-/// (`scheduler::ring3_mt::run_multitasking`'s own return value) - valid
-/// precisely because `jmp $` never touches `eax`, so whatever value is
-/// sitting there the LAST time task 1 happens to be preempted (virtually
+/// **Tasks 1 and 2** (entered ONLY by `scheduler::ring3_mt`'s own
+/// round-robin switching, cold, via `prepare_ring3_mt_task_ctx` below -
+/// neither ever runs via `enter_ring3` at all): the IDENTICAL shape with
+/// `0x2...`/`0x3...` prefixes instead, and MUCH smaller loop counts, so
+/// each reliably finishes its own checksum early and spends the rest of
+/// the experiment just spinning rather than racing task 0's own much
+/// larger loop. Neither ever exits on its own - there is no way for
+/// either to signal completion the way task 0 does, since more than one
+/// task racing for the single existing `int 0x81`/`RING3_RETURN_RSP`
+/// slot would break the "the kernel regains control exactly once, when
+/// task 0 itself decides to" invariant every earlier ring3 test already
+/// relies on. Instead, verification reads each one's own LAST-saved
+/// `eax` directly out of its dedicated context buffer (`scheduler::
+/// ring3_mt::run_multitasking`'s own return value) - valid precisely
+/// because `jmp $` never touches `eax`, so whatever value is sitting
+/// there the LAST time a task happens to be preempted (virtually
 /// certain to be well after it finished its own tiny loop, given how
-/// much smaller it is than task 0's) is its real, final checksum.
+/// much smaller both are than task 0's) is its real, final checksum.
 ///
-/// Deliberately does NOT prove a general N-task scheduler, priorities,
-/// or independent per-task exit - exactly like Fase 83's own
-/// cooperative test, this hardcodes 2 tasks and one one-directional
-/// completion signal (task 0's alone). A fully general ring-3 scheduler
-/// remains real, separate, larger follow-on work.
-pub fn run_ring3_mt_test() -> (u64, u32, usize) {
+/// Deliberately does NOT prove priorities or independent per-task exit -
+/// every task here is treated identically by the scheduler (plain
+/// round-robin, no priority tiers) and only task 0 can ever signal
+/// completion. Both remain real, separate, further follow-on work.
+pub fn run_ring3_mt_test() -> (u64, alloc::vec::Vec<u32>, usize) {
     let info = gdt::ring3_info();
     let user_cs = info.user_code_selector as u64;
     let user_ss = info.user_data_selector as u64;
@@ -1516,77 +1562,26 @@ pub fn run_ring3_mt_test() -> (u64, u32, usize) {
     let code_addr = USER_TEST_PAGE_ADDR;
     let task0_entry = code_addr;
     let task1_entry = code_addr + 128;
+    let task2_entry = code_addr + 256;
     let task0_stack_top = code_addr + 2048;
     let task1_stack_top = code_addr + 3072;
+    let task2_stack_top = code_addr + 4096;
 
     const TASK0_EXPECTED: u32 = 0x1000_0004;
     const TASK1_EXPECTED: u32 = 0x2000_0004;
+    const TASK2_EXPECTED: u32 = 0x3000_0004;
     const TASK0_LOOP_COUNT: u32 = 150_000_000;
     const TASK1_LOOP_COUNT: u32 = 10_000_000;
+    const TASK2_LOOP_COUNT: u32 = 5_000_000;
 
-    let mut task0 = [0u8; 46];
-    task0[0] = 0xB8;
-    task0[1..5].copy_from_slice(&0x1000_0000u32.to_le_bytes());
-    task0[5] = 0xB9;
-    task0[6..10].copy_from_slice(&0x1000_0001u32.to_le_bytes());
-    task0[10] = 0xBA;
-    task0[11..15].copy_from_slice(&0x1000_0002u32.to_le_bytes());
-    task0[15] = 0xBE;
-    task0[16..20].copy_from_slice(&0x1000_0003u32.to_le_bytes());
-    task0[20] = 0xBF;
-    task0[21..25].copy_from_slice(&0x1000_0004u32.to_le_bytes());
-    task0[25] = 0x41;
-    task0[26] = 0xB8;
-    task0[27..31].copy_from_slice(&TASK0_LOOP_COUNT.to_le_bytes());
-    task0[31] = 0x41;
-    task0[32] = 0xFF;
-    task0[33] = 0xC8; // dec r8d
-    task0[34] = 0x75;
-    task0[35] = 0xFB; // jnz -5 (back to `dec r8d`)
-    task0[36] = 0x31;
-    task0[37] = 0xC8; // xor eax, ecx
-    task0[38] = 0x31;
-    task0[39] = 0xD0; // xor eax, edx
-    task0[40] = 0x31;
-    task0[41] = 0xF0; // xor eax, esi
-    task0[42] = 0x31;
-    task0[43] = 0xF8; // xor eax, edi
-    task0[44] = 0xCD;
-    task0[45] = 0x81; // int 0x81 (Fase 73's own exit vector)
-
-    let mut task1 = [0u8; 46];
-    task1[0] = 0xB8;
-    task1[1..5].copy_from_slice(&0x2000_0000u32.to_le_bytes());
-    task1[5] = 0xB9;
-    task1[6..10].copy_from_slice(&0x2000_0001u32.to_le_bytes());
-    task1[10] = 0xBA;
-    task1[11..15].copy_from_slice(&0x2000_0002u32.to_le_bytes());
-    task1[15] = 0xBE;
-    task1[16..20].copy_from_slice(&0x2000_0003u32.to_le_bytes());
-    task1[20] = 0xBF;
-    task1[21..25].copy_from_slice(&0x2000_0004u32.to_le_bytes());
-    task1[25] = 0x41;
-    task1[26] = 0xB8;
-    task1[27..31].copy_from_slice(&TASK1_LOOP_COUNT.to_le_bytes());
-    task1[31] = 0x41;
-    task1[32] = 0xFF;
-    task1[33] = 0xC8; // dec r8d
-    task1[34] = 0x75;
-    task1[35] = 0xFB; // jnz -5 (back to `dec r8d`)
-    task1[36] = 0x31;
-    task1[37] = 0xC8; // xor eax, ecx
-    task1[38] = 0x31;
-    task1[39] = 0xD0; // xor eax, edx
-    task1[40] = 0x31;
-    task1[41] = 0xF0; // xor eax, esi
-    task1[42] = 0x31;
-    task1[43] = 0xF8; // xor eax, edi
-    task1[44] = 0xEB;
-    task1[45] = 0xFE; // jmp $ (never exits - see this fn's own doc)
+    let task0 = build_ring3_mt_checksum_program(0x1000_0000, TASK0_LOOP_COUNT, true);
+    let task1 = build_ring3_mt_checksum_program(0x2000_0000, TASK1_LOOP_COUNT, false);
+    let task2 = build_ring3_mt_checksum_program(0x3000_0000, TASK2_LOOP_COUNT, false);
 
     unsafe {
         core::ptr::copy_nonoverlapping(task0.as_ptr(), task0_entry as *mut u8, task0.len());
         core::ptr::copy_nonoverlapping(task1.as_ptr(), task1_entry as *mut u8, task1.len());
+        core::ptr::copy_nonoverlapping(task2.as_ptr(), task2_entry as *mut u8, task2.len());
     }
 
     let task1_ctx = prepare_ring3_mt_task_ctx(
@@ -1596,20 +1591,29 @@ pub fn run_ring3_mt_test() -> (u64, u32, usize) {
         task1_stack_top,
         RING3_TEST_RFLAGS,
     );
+    let task2_ctx = prepare_ring3_mt_task_ctx(
+        task2_entry,
+        user_cs,
+        user_ss,
+        task2_stack_top,
+        RING3_TEST_RFLAGS,
+    );
 
     kprintln!(
-        "[RING3] Attempting genuine multi-task ring-3 scheduling - two DIFFERENT programs alternating via involuntary timer ticks..."
+        "[RING3] Attempting genuine multi-task ring-3 scheduling - 3 DIFFERENT programs alternating via involuntary timer ticks..."
     );
     serial_println!(
-        "[RING3] ring3_mt_test task0_entry={:#x} task1_entry={:#x} task0_loop={} task1_loop={}",
+        "[RING3] ring3_mt_test task0_entry={:#x} task1_entry={:#x} task2_entry={:#x} task0_loop={} task1_loop={} task2_loop={}",
         task0_entry,
         task1_entry,
+        task2_entry,
         TASK0_LOOP_COUNT,
-        TASK1_LOOP_COUNT
+        TASK1_LOOP_COUNT,
+        TASK2_LOOP_COUNT
     );
 
-    let (task0_exit_code, task1_last_eax, switch_count) =
-        crate::scheduler::ring3_mt::run_multitasking(task1_ctx, || unsafe {
+    let (task0_exit_code, other_last_eax, switch_count) =
+        crate::scheduler::ring3_mt::run_multitasking(&[task1_ctx, task2_ctx], || unsafe {
             enter_ring3(
                 task0_entry,
                 user_cs,
@@ -1618,21 +1622,26 @@ pub fn run_ring3_mt_test() -> (u64, u32, usize) {
                 RING3_TEST_RFLAGS,
             )
         });
+    let task1_last_eax = other_last_eax[0];
+    let task2_last_eax = other_last_eax[1];
 
     kprintln!(
-        "[RING3] Back in ring-0 - mt_test task0_checksum={:#x} (expected {:#x}) task1_last_eax={:#x} (expected {:#x}) switch_count={}",
+        "[RING3] Back in ring-0 - mt_test task0_checksum={:#x} (expected {:#x}) task1_last_eax={:#x} (expected {:#x}) task2_last_eax={:#x} (expected {:#x}) switch_count={}",
         task0_exit_code,
         TASK0_EXPECTED,
         task1_last_eax,
         TASK1_EXPECTED,
+        task2_last_eax,
+        TASK2_EXPECTED,
         switch_count
     );
     serial_println!(
-        "[RING3] ring3_mt_test task0_checksum={:#x} task1_last_eax={:#x} switch_count={}",
+        "[RING3] ring3_mt_test task0_checksum={:#x} task1_last_eax={:#x} task2_last_eax={:#x} switch_count={}",
         task0_exit_code,
         task1_last_eax,
+        task2_last_eax,
         switch_count
     );
 
-    (task0_exit_code, task1_last_eax, switch_count)
+    (task0_exit_code, other_last_eax, switch_count)
 }

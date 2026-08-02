@@ -599,19 +599,21 @@ jobs:
           # the gap a preempted one leaves behind, not just resuming the
           # SAME one. Task 0 (entered normally via enter_ring3/int 0x81,
           # exactly Fase 85's own test program with a 0x1... register
-          # pattern) and task 1 (entered ONLY by scheduler::ring3_mt's
+          # pattern) and tasks 1/2 (entered ONLY by scheduler::ring3_mt's
           # own round-robin switching, cold, via a fresh bootstrap
-          # context - a 0x2... pattern, a much smaller loop, then an
-          # infinite non-destructive spin since it never exits on its
-          # own) alternate on every real timer tick. task0_checksum and
-          # task1_last_eax are both fixed, deterministic constants (each
-          # task's own 5-register XOR checksum) - only reproducible if
-          # BOTH programs genuinely ran to their own correct state
-          # across real, involuntary interruptions; switch_count (how
-          # many real switches actually happened) is deliberately NOT
-          # pinned here, the same reasoning already established for
-          # every other real-tick-count value in this file.
-          grep -q "RING3\] ring3_mt_test task0_checksum=0x10000004 task1_last_eax=0x20000004" boot.log
+          # context each - 0x2.../0x3... patterns, much smaller loops,
+          # then an infinite non-destructive spin since neither exits on
+          # its own) alternate on every real timer tick. Fase 91
+          # generalized this from a hardcoded pair to 3 tasks - task0_
+          # checksum/task1_last_eax/task2_last_eax are all fixed,
+          # deterministic constants (each task's own 5-register XOR
+          # checksum) - only reproducible if all 3 programs genuinely ran
+          # to their own correct state across real, involuntary
+          # interruptions; switch_count (how many real switches actually
+          # happened) is deliberately NOT pinned here, the same reasoning
+          # already established for every other real-tick-count value in
+          # this file.
+          grep -q "RING3\] ring3_mt_test task0_checksum=0x10000004 task1_last_eax=0x20000004 task2_last_eax=0x30000004" boot.log
           # Fase 87: the preemptive (timer-driven) scheduler's own
           # `priority` field was tracked and displayed since Fase 31 but
           # never actually used by tick()'s own task-selection logic -
