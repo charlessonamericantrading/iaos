@@ -2158,6 +2158,55 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // Fase 108: a SECOND, sequential call to the same, completely
+    // unchanged tcp_echo_test (Fase 90/102) - zero risk to that already-
+    // proven, CI-asserted function, since nothing about it changes here.
+    // tcp_echo_test's own SRC_PORT (54322) and INITIAL_SEQ (0x30000000)
+    // are hardcoded internal constants, not parameters - calling it
+    // again reuses the EXACT SAME local port and initial sequence
+    // number for a genuinely NEW connection, immediately after the
+    // first call's own full close. This is a real, previously-untested
+    // scenario against SLIRP's real TCP stack (does it allow immediate
+    // same-4-tuple reuse, or does some TIME_WAIT-like state reject a
+    // second SYN too soon?) - the smallest safe step toward the "more
+    // than one connection" item the TCP-connection-abstraction thread
+    // has flagged open since Fase 102, without building any new
+    // abstraction machinery at all.
+    //
+    // tcp_echo_test's own success line is IDENTICAL text on both calls
+    // (same target/port baked into its own format string) - only
+    // echo_len would differ, since this call's own payload is a
+    // different length. Explicitly logs second_connection_ok=true in
+    // the Ok(_) branch (new code here, not a change to tcp_echo_test
+    // itself) so a genuine second success is unambiguous in the log,
+    // not merely inferred from counting repeated identical lines.
+    //
+    // Genuinely uncertain going in, the same honest posture Fase 89/90/
+    // 102/106/107 themselves used: cannot be verified locally at all
+    // (the same fork()-on-Windows limitation already blocks the FIRST
+    // call from ever reaching a real handshake on this machine) - only
+    // the real CI runner can show whether SLIRP genuinely allows this.
+    kprintln!(
+        "[KERNEL INIT] Testing a SECOND TCP connection reusing the same local port right after the first one's own close (net::e1000::tcp_echo_test again)..."
+    );
+    serial_println!("[E1000] tcp_reconnect_test attempting=true target=[10, 0, 2, 100] port=9999");
+    match net::e1000::tcp_echo_test(
+        [10, 0, 2, 100],
+        9999,
+        b"AgentOS Fase108 second connection reusing the same port\n",
+    ) {
+        Ok(_) => {
+            kprintln!("[E1000] tcp_reconnect_test: second connection succeeded");
+            serial_println!(
+                "[E1000] tcp_reconnect_test target=[10, 0, 2, 100] port=9999 second_connection_ok=true"
+            );
+        }
+        Err(e) => {
+            kprintln!("[E1000] tcp_reconnect_test(10.0.2.100:9999): {}", e);
+            serial_println!("[E1000] tcp_reconnect_test_result -> FAILED: {}", e);
+        }
+    }
+
     shell::dispatch_command("disk");
     shell::dispatch_command("ls");
     shell::dispatch_command("cat KERNEL~1");
