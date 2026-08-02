@@ -241,6 +241,44 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // Fase 99: a SECOND, independent user page - reserved for ring-3
+    // programs that need their own memory instead of sharing the one
+    // page above with every other ring-3 test (see
+    // ring3::run_ring3_disk_loaded_test, repointed at this address
+    // below). Verified the same two independent ways as the page above:
+    // structurally (real PTE flags) and functionally (write+read-back).
+    kprintln!("[KERNEL INIT] Mapping a second, independent user page for disk-loaded programs...");
+    memory::paging::with_mapper(|mapper| {
+        memory::user_page::map_user_page_at(
+            mapper,
+            &mut frame_allocator,
+            memory::user_page::USER_DISK_PROGRAM_PAGE_ADDR,
+        )
+    })
+    .expect("disk program page mapping failed");
+    {
+        let info = memory::paging::with_mapper(|mapper| {
+            memory::user_page::inspect_user_page_at(
+                mapper,
+                memory::user_page::USER_DISK_PROGRAM_PAGE_ADDR,
+            )
+        });
+        kprintln!(
+            "[MEMORY] disk_program_page present={} writable={} user_accessible={} write_read_back_ok={}",
+            info.present,
+            info.writable,
+            info.user_accessible,
+            info.write_read_back_ok
+        );
+        serial_println!(
+            "[MEMORY] disk_program_page present={} writable={} user_accessible={} write_read_back_ok={}",
+            info.present,
+            info.writable,
+            info.user_accessible,
+            info.write_read_back_ok
+        );
+    }
+
     // Fase 73: closes the ring-3 arc's own last remaining gap - a SAFE
     // ring-3 -> ring-0 return, unlike every earlier ring-3 test (Fase 71/
     // 72's ring3test/ring3syscall, both deliberately-opt-in shell

@@ -57,7 +57,7 @@
 //! IS asserted in CI like any other Fase, no special opt-in shell
 //! command needed. See that section's own doc for the mechanism.
 
-use crate::memory::user_page::USER_TEST_PAGE_ADDR;
+use crate::memory::user_page::{USER_DISK_PROGRAM_PAGE_ADDR, USER_TEST_PAGE_ADDR};
 use crate::{fat12, gdt, kprintln, serial_println, shell};
 use core::arch::naked_asm;
 
@@ -2637,12 +2637,20 @@ pub fn run_early_exit_ring3_mt_test() -> (u64, u32, bool, u32, bool, usize) {
 //
 // Deliberately does NOT attempt to build any kind of general program
 // loader (parsing an executable format, choosing where to place
-// multiple segments, allocating a fresh page per program instead of
-// reusing the one dedicated test page, ...) - that remains real,
-// substantially larger, separate follow-on work. This Fase only proves
-// the one new fact everything else would depend on: bytes read back
-// from a real file are byte-for-byte what was written, and the CPU
-// treats them as valid ring-3 code when copied into an executable page.
+// multiple segments, ...) - that remains real, substantially larger,
+// separate follow-on work. This Fase only proves the one new fact
+// everything else would depend on: bytes read back from a real file
+// are byte-for-byte what was written, and the CPU treats them as valid
+// ring-3 code when copied into an executable page.
+//
+// Fase 99 update: runs on USER_DISK_PROGRAM_PAGE_ADDR, a SECOND,
+// independent page (see memory::user_page's own doc for its
+// PML4-distinctness proof) - not USER_TEST_PAGE_ADDR, which every
+// OTHER ring-3 test in this file still shares. This is real, if modest,
+// proof that entering ring-3 was never implicitly hardwired to the one
+// historical shared address: the exact same enter_ring3 mechanism, the
+// exact same GDT/TSS setup, now runs a program from a completely
+// different address and still produces the identical exit_code=42.
 pub fn run_ring3_disk_loaded_test() -> (bool, u64) {
     const PROGRAM: [u8; 15] = [
         0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xCD, 0x81, 0xFA,
@@ -2680,8 +2688,8 @@ pub fn run_ring3_disk_loaded_test() -> (bool, u64) {
     let info = gdt::ring3_info();
     let user_cs = info.user_code_selector as u64;
     let user_ss = info.user_data_selector as u64;
-    let code_addr = USER_TEST_PAGE_ADDR;
-    let stack_top = USER_TEST_PAGE_ADDR + 4096;
+    let code_addr = USER_DISK_PROGRAM_PAGE_ADDR;
+    let stack_top = USER_DISK_PROGRAM_PAGE_ADDR + 4096;
 
     unsafe {
         core::ptr::copy_nonoverlapping(loaded.as_ptr(), code_addr as *mut u8, loaded.len());

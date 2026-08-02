@@ -195,6 +195,15 @@ jobs:
           # nothing runs in ring-3 yet to prove the bit makes an actual
           # difference, that's separate, substantial follow-on work.
           grep -q "MEMORY\] user_page_test present=true writable=true user_accessible=true write_read_back_ok=true" boot.log
+          # Fase 99: a SECOND, independent user page (USER_DISK_PROGRAM_
+          # PAGE_ADDR, PML4 index 204 - distinct from both the heap's
+          # 136 and the test page's own 170 above, checked the same way
+          # before writing any code). Verified the same two independent
+          # ways as the page above. Exists so a ring-3 program can run
+          # on its own memory instead of sharing the one page every
+          # other ring-3 test also uses - see the disk_loaded_test
+          # assertion below, now repointed at this address.
+          grep -q "MEMORY\] disk_program_page present=true writable=true user_accessible=true write_read_back_ok=true" boot.log
           # Confirms a SAFE ring-3 -> ring-0 return (Fase 73) - unlike
           # ring3test/ring3syscall above (both deliberately opt-in, not
           # asserted here, since both end in a permanent halt by
@@ -697,7 +706,11 @@ jobs:
           # exit_code=42 (the same value ring3_exit_test's own embedded
           # copy already produces) proves the disk-loaded bytes are
           # genuinely valid, executable ring-3 code, not just a matching
-          # byte count.
+          # byte count. Fase 99 update: now runs on USER_DISK_PROGRAM_
+          # PAGE_ADDR, a second page independent from every other ring-3
+          # test's shared USER_TEST_PAGE_ADDR (see the disk_program_page
+          # assertion above) - exit_code=42 unchanged proves entering
+          # ring-3 was never implicitly hardwired to that one address.
           grep -q "RING3\] ring3_disk_loaded_test roundtrip_ok=true exit_code=42" boot.log
           # Fase 87: the preemptive (timer-driven) scheduler's own
           # `priority` field was tracked and displayed since Fase 31 but

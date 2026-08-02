@@ -28,6 +28,17 @@
 //! own (which would otherwise keep its original, non-user-accessible
 //! flags unchanged, silently defeating this page's own USER_ACCESSIBLE
 //! bit).
+//!
+//! **Fase 99 generalizes the mapping/inspection logic to an arbitrary
+//! address** (`map_user_page_at`/`inspect_user_page_at`), with
+//! `map_user_test_page`/`inspect_user_test_page` becoming thin wrappers
+//! over `USER_TEST_PAGE_ADDR` so every existing call site (every ring-3
+//! test since Fase 70) stays byte-identical. This exists to give
+//! `USER_DISK_PROGRAM_PAGE_ADDR` (`0x6666_6666_0000`) - the page Fase
+//! 98's disk-loaded ring-3 program now runs on instead of sharing
+//! `USER_TEST_PAGE_ADDR` with every other test - the same PML4-distinctness
+//! guarantee: index 204, vs. the heap's 136 and the test page's own 170,
+//! so it shares no intermediate table with either existing mapping.
 
 use x86_64::structures::paging::mapper::{MapToError, TranslateResult};
 use x86_64::structures::paging::{
@@ -37,14 +48,27 @@ use x86_64::VirtAddr;
 
 pub const USER_TEST_PAGE_ADDR: u64 = 0x5555_5555_0000;
 
-/// Deliberately distinct from the heap's own `HEAP_START` (`0x4444_
-/// 4444_0000`) - see this module's own doc for why the specific choice
-/// matters (no shared intermediate page-table entries).
-pub fn map_user_test_page(
+/// A second, independent user page - Fase 99 - reserved for ring-3
+/// programs that need their own memory instead of sharing
+/// `USER_TEST_PAGE_ADDR` with every other test. PML4 index 204 (checked
+/// the same way this module's own doc checks `USER_TEST_PAGE_ADDR`
+/// against the heap): distinct from both the heap's 136 and
+/// `USER_TEST_PAGE_ADDR`'s own 170, so mapping this address creates
+/// entirely fresh intermediate page-table levels, never reusing (and
+/// thus never risking silently inheriting the flags of) either existing
+/// mapping's tables.
+pub const USER_DISK_PROGRAM_PAGE_ADDR: u64 = 0x6666_6666_0000;
+
+/// Maps one 4KiB page at `addr` with `PRESENT | WRITABLE |
+/// USER_ACCESSIBLE` - the shared implementation behind both
+/// `map_user_test_page` (Fase 70) and any later caller needing its own
+/// independent user page (Fase 99).
+pub fn map_user_page_at(
     mapper: &mut OffsetPageTable<'static>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    addr: u64,
 ) -> Result<(), MapToError<Size4KiB>> {
-    let page = Page::containing_address(VirtAddr::new(USER_TEST_PAGE_ADDR));
+    let page = Page::containing_address(VirtAddr::new(addr));
     let frame = frame_allocator
         .allocate_frame()
         .ok_or(MapToError::FrameAllocationFailed)?;
@@ -56,6 +80,16 @@ pub fn map_user_test_page(
     Ok(())
 }
 
+/// Deliberately distinct from the heap's own `HEAP_START` (`0x4444_
+/// 4444_0000`) - see this module's own doc for why the specific choice
+/// matters (no shared intermediate page-table entries).
+pub fn map_user_test_page(
+    mapper: &mut OffsetPageTable<'static>,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Result<(), MapToError<Size4KiB>> {
+    map_user_page_at(mapper, frame_allocator, USER_TEST_PAGE_ADDR)
+}
+
 pub struct UserPageInfo {
     pub present: bool,
     pub writable: bool,
@@ -63,7 +97,7 @@ pub struct UserPageInfo {
     pub write_read_back_ok: bool,
 }
 
-/// Verifies the mapping two independent ways, not just one. First, a
+/// Verifies a mapping two independent ways, not just one. First, a
 /// structural check: reads the REAL leaf PTE's own flags back through
 /// the page tables (via `Translate`, not trusting `map_to`'s own
 /// `Ok(())` return value alone). Second, a functional check: writes a
@@ -71,9 +105,10 @@ pub struct UserPageInfo {
 /// ring-0 can access this page freely, since `USER_ACCESSIBLE` only
 /// ever restricts ring-3, never ring-0 - proving the mapping backs
 /// genuinely usable memory, not just that its flags look right in
-/// isolation.
-pub fn inspect_user_test_page(mapper: &OffsetPageTable<'static>) -> UserPageInfo {
-    let addr = VirtAddr::new(USER_TEST_PAGE_ADDR);
+/// isolation. Shared by `inspect_user_test_page` (Fase 70) and any
+/// later caller inspecting its own independent page (Fase 99).
+pub fn inspect_user_page_at(mapper: &OffsetPageTable<'static>, addr: u64) -> UserPageInfo {
+    let addr = VirtAddr::new(addr);
 
     let (present, writable, user_accessible) = match mapper.translate(addr) {
         TranslateResult::Mapped { flags, .. } => (
@@ -97,4 +132,8 @@ pub fn inspect_user_test_page(mapper: &OffsetPageTable<'static>) -> UserPageInfo
         user_accessible,
         write_read_back_ok,
     }
+}
+
+pub fn inspect_user_test_page(mapper: &OffsetPageTable<'static>) -> UserPageInfo {
+    inspect_user_page_at(mapper, USER_TEST_PAGE_ADDR)
 }
