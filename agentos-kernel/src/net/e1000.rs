@@ -1307,69 +1307,32 @@ pub fn tcp_syn_test(
                 let buf_virt = (phys_offset + rx_buf_frame.start_address().as_u64()) as *const u8;
                 let data = core::slice::from_raw_parts(buf_virt, length);
 
-                // Ethernet: EtherType IPv4. IPv4: protocol TCP, header
-                // checksum valid, source address is the guestfwd target
-                // (its reply, addressed back to us) - the same
-                // independent-checks shape ping's own is_our_reply
-                // check already established, just for TCP instead of
-                // ICMP.
-                let ip_start = icmp::ETHERNET_HEADER_LEN;
-                let tcp_start = ip_start + icmp::IPV4_HEADER_LEN;
-                let is_our_reply = data.len() > tcp_start
-                    && data[12] == 0x08
-                    && data[13] == 0x00
-                    && data[ip_start + 9] == tcp::IP_PROTOCOL_TCP
-                    && icmp::checksum_is_valid(&data[ip_start..tcp_start])
-                    && data[ip_start + 12..ip_start + 16] == target_ip;
-
-                // Fase 89's own real-world bug, caught by this exact
-                // test's first boot (confirmed via a real packet
-                // capture, not guessed): the received buffer's own
-                // length is NOT the same as the real TCP segment's own
-                // length - a real reply is very likely padded up to
-                // Ethernet's 60-byte minimum frame size, and a real TCP
-                // stack's own SYN-ACK almost always carries the
-                // standard MSS option too, both adding real, extra
-                // bytes beyond a bare 20-byte header that must NOT be
-                // fed into the checksum sum (the ORIGINAL sender never
-                // included them in its own tcp_len calculation). The
-                // IPv4 header's own Total Length field is the one
-                // authoritative source for how many bytes past the IP
-                // header genuinely belong to this packet - trimming to
-                // exactly that, not "everything left in the receive
-                // buffer", is what let parse_tcp_segment's own checksum
-                // verification agree with the real sender's.
-                let ip_total_len = if is_our_reply {
-                    u16::from_be_bytes([data[ip_start + 2], data[ip_start + 3]]) as usize
-                } else {
-                    0
-                };
-                let real_tcp_len = ip_total_len.saturating_sub(icmp::IPV4_HEADER_LEN);
-                let tcp_end = (tcp_start + real_tcp_len).min(data.len());
-
-                if is_our_reply {
-                    if let Ok(info) =
-                        tcp::parse_tcp_segment(target_ip, SRC_IP, &data[tcp_start..tcp_end])
-                    {
-                        let is_syn_ack = info.flags == (tcp::TCP_FLAG_SYN | tcp::TCP_FLAG_ACK)
-                            && info.source_port == target_port
-                            && info.dest_port == SRC_PORT
-                            && info.ack_num == INITIAL_SEQ.wrapping_add(1);
-                        if is_syn_ack {
-                            kprintln!(
-                                "[E1000] tcp_syn_test to {:?}:{}: real SYN-ACK received (seq={:#x} ack={:#x})",
-                                target_ip,
-                                target_port,
-                                info.seq_num,
-                                info.ack_num
-                            );
-                            serial_println!(
-                                "[E1000] tcp_syn_test target={:?} port={} syn_ack_received=true ack_matches=true",
-                                target_ip,
-                                target_port
-                            );
-                            return Ok(info);
-                        }
+                // Fase 125: reuses parse_reply_frame (Fase 90) - the
+                // exact same EtherType/protocol/checksum/source-IP/
+                // parse_tcp_segment checks this test itself originated
+                // (see that function's own doc), predating parse_reply_
+                // frame's own extraction and never revisited since. This
+                // test never needs the payload half of its own returned
+                // tuple, since a bare SYN-ACK carries none.
+                if let Some((info, _payload)) = parse_reply_frame(data, target_ip, SRC_IP) {
+                    let is_syn_ack = info.flags == (tcp::TCP_FLAG_SYN | tcp::TCP_FLAG_ACK)
+                        && info.source_port == target_port
+                        && info.dest_port == SRC_PORT
+                        && info.ack_num == INITIAL_SEQ.wrapping_add(1);
+                    if is_syn_ack {
+                        kprintln!(
+                            "[E1000] tcp_syn_test to {:?}:{}: real SYN-ACK received (seq={:#x} ack={:#x})",
+                            target_ip,
+                            target_port,
+                            info.seq_num,
+                            info.ack_num
+                        );
+                        serial_println!(
+                            "[E1000] tcp_syn_test target={:?} port={} syn_ack_received=true ack_matches=true",
+                            target_ip,
+                            target_port
+                        );
+                        return Ok(info);
                     }
                 }
 
@@ -1438,7 +1401,11 @@ fn build_tcp_frame(
 /// IP header checksum, source IP matches, and `net::tcp::parse_tcp_
 /// segment`'s own TCP-level checksum) - the shared filtering logic
 /// `tcp_echo_test`'s own multi-slot polling phases both need, factored
-/// out once rather than hand-copied per phase.
+/// out once rather than hand-copied per phase. Fase 125: `tcp_syn_test`
+/// (Fase 89, predating this function's own Fase 90 extraction) now
+/// reuses it too, rather than keeping its own byte-for-byte-identical
+/// inline copy of this exact same check - it simply ignores the
+/// returned payload slice, since a bare SYN-ACK carries none.
 fn parse_reply_frame(
     data: &[u8],
     target_ip: [u8; 4],
