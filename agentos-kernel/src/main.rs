@@ -1990,11 +1990,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // a_record_parsed_ok round-trips a realistic, hand-built fake DNS
     // reply (header + a 17-byte "example.com" question + one real,
     // compressed-name A-record answer) through parse_first_a_record.
-    // The other three cases each mutate exactly ONE field of that same
-    // fixture and confirm parse_first_a_record now correctly REJECTS it -
-    // the actual proof this isn't a rubber stamp, the same discipline
-    // the ICMP/TCP self-tests above already established with their own
-    // corrupted-checksum cases.
+    // zero_answers_rejected/non_a_record_rejected/malformed_name_rejected
+    // each mutate exactly ONE field of that same fixture and confirm
+    // parse_first_a_record now correctly REJECTS it - the actual proof
+    // this isn't a rubber stamp, the same discipline the ICMP/TCP
+    // self-tests above already established with their own
+    // corrupted-checksum cases. multi_answer_ok (Fase 115) and
+    // uncompressed_name_parsed_ok (Fase 117) are separate, dedicated
+    // fixtures each proving one further real capability.
     kprintln!("[KERNEL INIT] Testing real DNS answer-record parsing...");
     {
         use net::dns;
@@ -2024,10 +2027,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         non_a_record[31] = 0x05; // TYPE = 5 (CNAME), not 1 (A)
         let non_a_record_rejected = dns::parse_first_a_record(&non_a_record, QUESTION_LEN).is_err();
 
-        let mut uncompressed_name = FAKE_REPLY;
-        uncompressed_name[29] = 0x00; // answer NAME's own top byte: not a 0xC0 pointer
-        let uncompressed_name_rejected =
-            dns::parse_first_a_record(&uncompressed_name, QUESTION_LEN).is_err();
+        // Fase 117: `parse_first_a_record` no longer rejects EVERY
+        // non-pointer NAME byte outright - an uncompressed label
+        // sequence is now a real, supported shape (see below). This
+        // case now proves a genuinely MALFORMED one is still rejected:
+        // a label-length byte (63, the max single-label length) that
+        // claims far more bytes than remain in the 45-byte fixture.
+        let mut malformed_name = FAKE_REPLY;
+        malformed_name[29] = 0x3F; // label length 63 - runs off the end of FAKE_REPLY
+        let malformed_name_rejected =
+            dns::parse_first_a_record(&malformed_name, QUESTION_LEN).is_err();
 
         // Fase 115: the real, previously-unexamined case - this kernel's
         // own real CI runs have observed answer_count=2 for "example.com"
@@ -2060,13 +2069,37 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let multi_answer_ok =
             dns::parse_first_a_record(&MULTI_ANSWER_REPLY, QUESTION_LEN) == Ok(EXPECTED_MULTI_IP);
 
+        // Fase 117: the real positive case - an answer record whose own
+        // NAME is fully spelled out ("example.com", the same 13 wire
+        // bytes `encode_qname` would build) rather than a compression
+        // pointer. Same question section as FAKE_REPLY/MULTI_ANSWER_REPLY;
+        // a deliberately distinct RDATA (203.0.113.5, RFC 5737 TEST-NET-3)
+        // so this fixture's own IP is unmistakable in the log line.
+        #[rustfmt::skip]
+        const UNCOMPRESSED_NAME_REPLY: [u8; 56] = [
+            // header: transaction ID, flags, QDCOUNT=1, ANCOUNT=1, NSCOUNT=0, ARCOUNT=0
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // question: "example.com" A/IN (17 bytes)
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+            // answer: NAME=fully spelled out "example.com" (13 bytes, NOT
+            // a compression pointer), TYPE=A, CLASS=IN, TTL=600,
+            // RDLENGTH=4, RDATA=203.0.113.5
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x58, 0x00, 0x04, 203, 0, 113, 5,
+        ];
+        const EXPECTED_UNCOMPRESSED_IP: [u8; 4] = [203, 0, 113, 5];
+        let uncompressed_name_parsed_ok =
+            dns::parse_first_a_record(&UNCOMPRESSED_NAME_REPLY, QUESTION_LEN)
+                == Ok(EXPECTED_UNCOMPRESSED_IP);
+
         kprintln!(
-            "[DNS] answer-parse self-test: a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} uncompressed_name_rejected={} multi_answer_ok={}",
-            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, uncompressed_name_rejected, multi_answer_ok
+            "[DNS] answer-parse self-test: a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} malformed_name_rejected={} multi_answer_ok={} uncompressed_name_parsed_ok={}",
+            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, malformed_name_rejected, multi_answer_ok, uncompressed_name_parsed_ok
         );
         serial_println!(
-            "[DNS] answer_parse_selftest a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} uncompressed_name_rejected={} multi_answer_ok={}",
-            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, uncompressed_name_rejected, multi_answer_ok
+            "[DNS] answer_parse_selftest a_record_parsed_ok={} zero_answers_rejected={} non_a_record_rejected={} malformed_name_rejected={} multi_answer_ok={} uncompressed_name_parsed_ok={}",
+            a_record_parsed_ok, zero_answers_rejected, non_a_record_rejected, malformed_name_rejected, multi_answer_ok, uncompressed_name_parsed_ok
         );
     }
 

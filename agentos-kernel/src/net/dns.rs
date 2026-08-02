@@ -11,10 +11,10 @@
 //! this module closes the one piece that test's own doc explicitly left
 //! open: actually extracting a real, useful value (an IPv4 address) from
 //! the reply's answer section, rather than only confirming a reply
-//! exists. It still does NOT implement general name compression
-//! (multiple pointers, pointer chains), multiple QUESTIONS, or decoding
-//! any record type besides A - real, separate, substantially larger
-//! DNS-client work if ever needed.
+//! exists. It still does NOT follow a compression pointer chain
+//! (partial compression, or a pointer pointing at another pointer),
+//! handle multiple QUESTIONS, or decode any record type besides A -
+//! real, separate, substantially larger DNS-client work if ever needed.
 //!
 //! Fase 115: `parse_first_a_record` now genuinely searches THROUGH
 //! multiple answer records (skipping any non-A ones via their own
@@ -24,6 +24,13 @@
 //! reply for "example.com" observed on CI since Fase 106 reports
 //! `answer_count=2`, and this function had never actually been proven
 //! correct for anything beyond a single answer.
+//!
+//! Fase 117: an answer record's own NAME field no longer has to be a
+//! compression pointer - `name_field_len` also walks a fully spelled-out
+//! (uncompressed) sequence of labels, the same wire shape `encode_qname`
+//! itself builds. Real servers overwhelmingly compress an answer name
+//! that repeats the question, but an uncompressed one is perfectly
+//! legal RFC 1035 wire format, previously hard-rejected outright.
 //!
 //! Fase 110 adds the encoding-side mirror of the same idea: `build_query`
 //! builds a real question section for ANY caller-supplied hostname,
@@ -67,21 +74,28 @@ pub const MAX_LABEL_LEN: usize = 63;
 /// after it without this function needing to walk the question's own
 /// QNAME labels itself.
 ///
-/// **Handles exactly one real-world shape per record, not general
-/// DNS**: each answer record's own NAME field is assumed to be a 2-byte
-/// compression pointer (RFC 1035 section 4.1.4's `11` top-bit-pair
-/// marker) rather than a literal repeated name - what every real DNS
-/// server actually sends for an answer that repeats the question's own
-/// name, since spelling it out again in full would be pure waste. An
-/// uncompressed literal name STOPS the search and is reported as an
-/// error rather than parsed or skipped past - genuinely rare in
-/// practice for an answer record, and out of this module's own
-/// deliberately narrow scope (walking a real label sequence to skip
-/// past one would be real, separate, general-purpose DNS parsing work).
-/// A non-A record is skipped using its OWN declared RDLENGTH to find
-/// the next record - real, necessary work now that more than one
-/// record is actually being looked at, not previously needed when only
-/// the first one was ever inspected.
+/// **Handles two real-world shapes per record, not general DNS**: each
+/// answer record's own NAME field is either a 2-byte compression
+/// pointer (RFC 1035 section 4.1.4's `11` top-bit-pair marker) - what
+/// most real DNS servers send for an answer that repeats the
+/// question's own name, since spelling it out again in full would be
+/// pure waste - or (Fase 117) a fully spelled-out sequence of
+/// length-prefixed labels terminated by a zero byte, the same wire
+/// shape `encode_qname` itself builds, for the less common but
+/// perfectly legal case of a server that does not compress the
+/// answer's own name. A label sequence that itself ends in a
+/// compression pointer instead of a zero byte (RFC 1035 4.1.4's
+/// "partial compression", labels followed by a pointer rather than a
+/// pointer alone or a full literal name) STOPS the search and is
+/// reported as an error rather than followed - genuinely rare in
+/// practice, and out of this module's own deliberately narrow scope
+/// (following a pointer chain, partial or otherwise, would be real,
+/// separate, general-purpose DNS parsing work). See `name_field_len`
+/// for exactly which shapes are accepted. A non-A record is skipped
+/// using its OWN declared RDLENGTH to find the next record - real,
+/// necessary work now that more than one record is actually being
+/// looked at, not previously needed when only the first one was ever
+/// inspected.
 pub fn parse_first_a_record(message: &[u8], question_len: usize) -> Result<[u8; 4], &'static str> {
     if message.len() < DNS_HEADER_LEN {
         return Err("DNS message shorter than the 12-byte header");
@@ -93,18 +107,11 @@ pub fn parse_first_a_record(message: &[u8], question_len: usize) -> Result<[u8; 
 
     let mut offset = DNS_HEADER_LEN + question_len;
     for _ in 0..ancount {
-        if message.len() < offset + 2 {
-            return Err("DNS message too short to contain an answer record NAME");
-        }
-        if message[offset] & 0xC0 != 0xC0 {
-            return Err(
-                "answer record NAME is not a compression pointer - uncompressed names aren't parsed",
-            );
-        }
+        let name_len = name_field_len(message, offset)?;
 
-        // Past the 2-byte NAME pointer: TYPE(2) + CLASS(2) + TTL(4) +
-        // RDLENGTH(2) = 10 fixed bytes, then RDATA.
-        let fixed_start = offset + 2;
+        // Past the NAME field: TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2)
+        // = 10 fixed bytes, then RDATA.
+        let fixed_start = offset + name_len;
         if message.len() < fixed_start + 10 {
             return Err("DNS message too short to contain the answer record's fixed fields");
         }
@@ -130,6 +137,59 @@ pub fn parse_first_a_record(message: &[u8], question_len: usize) -> Result<[u8; 
         offset = rdata_start + rdlength;
     }
     Err("no A record found among this reply's own answer records")
+}
+
+/// Returns the byte length of the NAME field starting at `offset` -
+/// either a 2-byte compression pointer (the common case, unchanged
+/// since Fase 107), or (Fase 117) a fully spelled-out sequence of
+/// length-prefixed labels terminated by a zero byte, the mirror image
+/// of what `encode_qname` itself builds. Does NOT follow a compression
+/// pointer to verify what it points to - `parse_first_a_record` never
+/// needed that (the caller already knows the question section it sent,
+/// and a real server virtually always points back at exactly that), so
+/// this only needs to know how many bytes the NAME field itself
+/// occupies, not what it names.
+///
+/// Rejects a label sequence that ends in a compression pointer instead
+/// of a zero byte ("partial compression", RFC 1035 4.1.4) - real,
+/// separate, more general parsing work this module deliberately
+/// doesn't take on, matching `parse_first_a_record`'s own doc. Also
+/// rejects a label over 63 bytes (`MAX_LABEL_LEN`, the same limit
+/// `encode_qname` enforces on the way in) and a label sequence that
+/// runs past the end of the message - both real malformed-input cases,
+/// not something to guess around.
+fn name_field_len(message: &[u8], offset: usize) -> Result<usize, &'static str> {
+    if offset >= message.len() {
+        return Err("answer record NAME starts past the end of the message");
+    }
+    if message[offset] & 0xC0 == 0xC0 {
+        if offset + 1 >= message.len() {
+            return Err("answer record NAME's own compression pointer is missing its second byte");
+        }
+        return Ok(2);
+    }
+
+    let mut pos = offset;
+    loop {
+        if pos >= message.len() {
+            return Err("answer record NAME runs past the end of the message");
+        }
+        let label_len = message[pos] as usize;
+        if label_len & 0xC0 == 0xC0 {
+            return Err(
+                "answer record NAME is a label sequence ending in a compression pointer - partial compression isn't parsed",
+            );
+        }
+        if label_len == 0 {
+            pos += 1;
+            break;
+        }
+        if label_len > MAX_LABEL_LEN {
+            return Err("answer record NAME has a label over 63 bytes");
+        }
+        pos += 1 + label_len;
+    }
+    Ok(pos - offset)
 }
 
 /// Encodes `hostname` (a plain dotted name, e.g. `"example.com"`) into

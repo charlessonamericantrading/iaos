@@ -1107,7 +1107,18 @@ jobs:
           # own declared RDLENGTH), a real A record second - proves the
           # function genuinely walks past a non-A record instead of
           # just assuming the first answer already is the one it wants.
-          grep -q "DNS\] answer_parse_selftest a_record_parsed_ok=true zero_answers_rejected=true non_a_record_rejected=true uncompressed_name_rejected=true multi_answer_ok=true" boot.log
+          #
+          # Fase 117: an answer record's own NAME field no longer has to
+          # be a compression pointer - a fully spelled-out (uncompressed)
+          # label sequence is now a real, supported shape too.
+          # uncompressed_name_rejected (which asserted every non-pointer
+          # NAME byte was rejected outright) is renamed
+          # malformed_name_rejected and now asserts a genuinely
+          # malformed label (one claiming more bytes than the message
+          # has left) is still rejected. uncompressed_name_parsed_ok is
+          # the new positive case: a real, valid, fully spelled-out
+          # "example.com" answer NAME parses to the correct IP.
+          grep -q "DNS\] answer_parse_selftest a_record_parsed_ok=true zero_answers_rejected=true non_a_record_rejected=true malformed_name_rejected=true multi_answer_ok=true uncompressed_name_parsed_ok=true" boot.log
           # Fase 110: DNS query building (net::dns::build_query /
           # encode_qname) - pure logic, no hardware dependency, the
           # encoding-side mirror of the answer-parsing self-test right
