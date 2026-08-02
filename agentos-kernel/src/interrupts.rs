@@ -246,18 +246,27 @@ pub fn init_pics() {
 /// extra RSP/SS fields a cross-privilege entry adds sit ABOVE RFLAGS,
 /// never between RIP and CS) applies identically to the timer IRQ.
 ///
-/// **Deliberately a PURE, behavior-preserving refactor - this Fase adds
-/// no new capability and changes no CI assertion.** The only thing that
-/// changes is HOW MANY registers are actually captured at the moment a
-/// tick lands (all 15, not just whatever LLVM happened to need) - a
-/// real, necessary prerequisite for genuine mid-flight ring-3 preemption
-/// (which needs the FULL register state of whatever was interrupted, not
-/// just the 6 callee-saved ones `switch_to`/Fase 83's own cooperative
-/// yield already handle), but this Fase does not yet USE those extra
-/// registers for anything - `handle_timer_tick`'s own body is BYTE-FOR-
-/// BYTE the same logic `timer_interrupt_handler`'s old body already had.
-/// Verified via the complete pre-existing CI assertion suite passing
-/// unchanged, not a new self-test - there is nothing new to observe yet.
+/// **Fase 84 was a PURE, behavior-preserving refactor - no new
+/// capability, no new CI assertion.** The only thing it changed was HOW
+/// MANY registers get captured at the moment a tick lands (all 15, not
+/// just whatever LLVM happened to need) - the necessary prerequisite for
+/// genuine mid-flight ring-3 preemption (which needs the FULL register
+/// state of whatever was interrupted, not just the 6 callee-saved ones
+/// `switch_to`/Fase 83's own cooperative yield already handle).
+///
+/// **Fase 85 is the first Fase to actually USE those captured
+/// registers.** `mov rsi, rsp` (right after the 15 pushes) passes the
+/// base of this whole 15-GPR block to `handle_timer_tick` as a second
+/// argument - the CPU's own 5-field iretq frame sits directly above it,
+/// so this single pointer covers all 20 quadwords (160 bytes) of a ring-
+/// 3 task's ENTIRE resumable state. `handle_timer_tick` now returns a
+/// `u64` - the RSP to actually resume from - and `mov rsp, rax` (right
+/// after the call, before any pops) adopts it. For every case except the
+/// new one (`scheduler::ring3_preempt`'s own interception, gated behind
+/// its own explicit enable flag - see that module's own doc), this
+/// returned value is `saved_ctx_ptr` UNCHANGED, making `mov rsp, rax` a
+/// genuine no-op and keeping this byte-identical to Fase 84's own
+/// already-verified behavior for every EXISTING self-test.
 #[unsafe(naked)]
 extern "C" fn timer_interrupt_entry_asm() {
     core::arch::naked_asm!(
@@ -278,7 +287,9 @@ extern "C" fn timer_interrupt_entry_asm() {
         "push rax",
         "mov rdi, [rsp + 128]",
         "and rdi, 3",
+        "mov rsi, rsp",
         "call {handler}",
+        "mov rsp, rax",
         "pop rax",
         "pop rdi",
         "pop rsi",
@@ -300,15 +311,26 @@ extern "C" fn timer_interrupt_entry_asm() {
 }
 
 /// Called by `timer_interrupt_entry_asm` with the interrupted context's
-/// own CS.RPL (0 or 3) already isolated to its low 2 bits - a normal,
-/// non-naked `extern "C" fn`, so this is exactly as safe to write as any
-/// other Rust code in this codebase, the same reasoning `handle_real_
-/// syscall` (Fase 72) already established for the identical "raw
-/// register work stays in the naked stub, ordinary logic lives here"
-/// split. Byte-for-byte the same body `timer_interrupt_handler`'s old
-/// `extern "x86-interrupt"` fn already had - see this section's own
-/// module doc for why this Fase deliberately changes nothing observable.
-extern "C" fn handle_timer_tick(caller_rpl: u64) {
+/// own CS.RPL (0 or 3) already isolated to its low 2 bits, plus (Fase
+/// 85) `saved_ctx_ptr`, the base of that stub's own 15-GPR save block -
+/// a normal, non-naked `extern "C" fn`, so this is exactly as safe to
+/// write as any other Rust code in this codebase, the same reasoning
+/// `handle_real_syscall` (Fase 72) already established for the identical
+/// "raw register work stays in the naked stub, ordinary logic lives
+/// here" split.
+///
+/// Returns the RSP the naked stub's own epilogue should actually resume
+/// from. `preemptive::tick(interrupted_ring3)` still runs FIRST,
+/// completely unchanged from Fase 80/84 - it already skips ring-0
+/// task-switching entirely whenever the interrupted context was ring-3,
+/// so this new return-value plumbing never interferes with it either
+/// way. `ring3_preempt::tick(saved_ctx_ptr)` runs ONLY for the ring-3
+/// case, strictly layered on top: it returns `saved_ctx_ptr` UNCHANGED
+/// (a genuine no-op) unless `scheduler::ring3_preempt`'s own explicit
+/// interception is armed - see that module's own doc - keeping this
+/// byte-identical to Fase 84's own already-verified behavior for every
+/// EXISTING self-test, none of which ever arms it.
+extern "C" fn handle_timer_tick(caller_rpl: u64, saved_ctx_ptr: u64) -> u64 {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
     let interrupted_ring3 = caller_rpl == 3;
     if interrupted_ring3 {
@@ -330,6 +352,12 @@ extern "C" fn handle_timer_tick(caller_rpl: u64) {
     // interrupted context was ring-3, not just log it like the counter
     // above does.
     crate::scheduler::preemptive::tick(interrupted_ring3);
+
+    if interrupted_ring3 {
+        crate::scheduler::ring3_preempt::tick(saved_ctx_ptr)
+    } else {
+        saved_ctx_ptr
+    }
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {

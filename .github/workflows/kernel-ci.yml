@@ -539,6 +539,26 @@ jobs:
           # per-task memory instead of just remembering where it
           # transiently sat.
           grep -q "RING3\] ring3_cooperative_test exit_code=42 signature=\[41, 42, 43\]" boot.log
+          # Fase 85: the first genuine, INVOLUNTARY (timer-driven) ring-3
+          # preemption this kernel has ever attempted - a real hardware
+          # tick, landing at an arbitrary point this ring-3 program did
+          # NOT choose, saves its COMPLETE register state (all 15 GPRs
+          # Fase 84's own naked timer stub now saves, not just the 6
+          # switch_to/Fase 83's own voluntary yield already protect) and
+          # correctly restores it. The program loads 5 deliberately
+          # "caller-saved" registers (eax/ecx/edx/esi/edi - none of
+          # switch_to's own preserved set) with distinct patterns, spins
+          # long enough for a real tick to land (Fase 79's own proven
+          # LOOP_COUNT=150_000_000), then XORs them into eax.
+          # `exit_code=0x11111111` is the exact expected checksum - only
+          # possible if all 5 registers survived a genuine, real
+          # interruption correctly; `intercepted=true` confirms the new
+          # mechanism (scheduler::ring3_preempt) genuinely claimed a real
+          # tick, not that none happened to land. Deliberately the
+          # simplest possible proof (save+restore round trip only, no
+          # "run something else while preempted" yet) - see ring3.rs's
+          # own module doc for the full mechanism.
+          grep -q "RING3\] ring3_full_preempt_test exit_code=0x11111111 intercepted=true" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -

@@ -1315,3 +1315,116 @@ pub fn run_ring3_cooperative_test() -> (u64, [u8; 3]) {
 
     (exit_code, sig)
 }
+
+/// Fase 85: proves genuine, INVOLUNTARY (timer-driven) ring-3 preemption.
+/// A real hardware tick, landing at an arbitrary point this program did
+/// NOT choose, saves this program's COMPLETE register state and
+/// correctly restores it - not just the 6 registers `switch_to`/Fase
+/// 83's own cooperative yield already protect. See `scheduler::ring3_
+/// preempt`'s own module doc for the actual mechanism (the timer stub's
+/// full 15-GPR save, Fase 84, now genuinely used for the first time).
+///
+/// The ring-3 program loads 5 DELIBERATELY "caller-saved" registers
+/// (`eax`/`ecx`/`edx`/`esi`/`edi` - none of `switch_to`'s own preserved
+/// set of `rbp`/`rbx`/`r12`-`r15`, so this test is only meaningful if
+/// the NEW full-context mechanism is what preserved them, not an
+/// incidental side effect of an already-proven, unrelated one) with
+/// distinct patterns, spins long enough for a real tick to land
+/// (reusing Fase 79's own `LOOP_COUNT=150_000_000`, already
+/// empirically proven to reliably span multiple real tick periods - see
+/// that Fase's own doc for the reliability bug that established this
+/// exact value), then XORs all 5 together into `eax` and exits via the
+/// existing Fase 73 mechanism. `r8d` (not one of the 5 checked
+/// registers, and not in `switch_to`'s own preserved set either) is
+/// purely the loop counter, deliberately distinct from all 5 checked
+/// registers so the loop itself never touches what's being verified.
+///
+///   mov eax, 0x11111111 -> B8 11 11 11 11
+///   mov ecx, 0x22222222 -> B9 22 22 22 22
+///   mov edx, 0x33333333 -> BA 33 33 33 33
+///   mov esi, 0x44444444 -> BE 44 44 44 44
+///   mov edi, 0x55555555 -> BF 55 55 55 55
+///   mov r8d, 150000000  -> 41 B8 + imm32        (loop target, offset 31)
+///   dec r8d             -> 41 FF C8
+///   jnz <dec r8d>        -> 75 FB (rel8 = -5)
+///   xor eax, ecx         -> 31 C8
+///   xor eax, edx         -> 31 D0
+///   xor eax, esi         -> 31 F0
+///   xor eax, edi         -> 31 F8                (checksum: 0x11111111)
+///   int 0x81             -> CD 81 (Fase 73's own exit vector)
+pub fn run_ring3_full_preempt_test() -> (u64, bool) {
+    let info = gdt::ring3_info();
+    let user_cs = info.user_code_selector as u64;
+    let user_ss = info.user_data_selector as u64;
+
+    let code_addr = USER_TEST_PAGE_ADDR;
+    let stack_top = USER_TEST_PAGE_ADDR + 4096;
+
+    const EXPECTED_CHECKSUM: u64 = 0x1111_1111;
+    const LOOP_COUNT: u32 = 150_000_000;
+
+    let mut program = [0u8; 46];
+    program[0] = 0xB8;
+    program[1..5].copy_from_slice(&0x1111_1111u32.to_le_bytes());
+    program[5] = 0xB9;
+    program[6..10].copy_from_slice(&0x2222_2222u32.to_le_bytes());
+    program[10] = 0xBA;
+    program[11..15].copy_from_slice(&0x3333_3333u32.to_le_bytes());
+    program[15] = 0xBE;
+    program[16..20].copy_from_slice(&0x4444_4444u32.to_le_bytes());
+    program[20] = 0xBF;
+    program[21..25].copy_from_slice(&0x5555_5555u32.to_le_bytes());
+    program[25] = 0x41;
+    program[26] = 0xB8;
+    program[27..31].copy_from_slice(&LOOP_COUNT.to_le_bytes());
+    program[31] = 0x41;
+    program[32] = 0xFF;
+    program[33] = 0xC8; // dec r8d
+    program[34] = 0x75;
+    program[35] = 0xFB; // jnz -5 (back to `dec r8d`)
+    program[36] = 0x31;
+    program[37] = 0xC8; // xor eax, ecx
+    program[38] = 0x31;
+    program[39] = 0xD0; // xor eax, edx
+    program[40] = 0x31;
+    program[41] = 0xF0; // xor eax, esi
+    program[42] = 0x31;
+    program[43] = 0xF8; // xor eax, edi
+    program[44] = 0xCD;
+    program[45] = 0x81; // int 0x81
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(program.as_ptr(), code_addr as *mut u8, program.len());
+    }
+
+    kprintln!(
+        "[RING3] Attempting genuine timer-driven full-register preemption for the first time..."
+    );
+    serial_println!(
+        "[RING3] ring3_full_preempt_test entering rip={:#x} cs={:#06x} ss={:#06x} rsp={:#x} rflags={:#x} loop_count={}",
+        code_addr,
+        user_cs,
+        user_ss,
+        stack_top,
+        RING3_TEST_RFLAGS,
+        LOOP_COUNT
+    );
+
+    let (exit_code, intercepted) = crate::scheduler::ring3_preempt::run_intercepting(|| unsafe {
+        enter_ring3(code_addr, user_cs, user_ss, stack_top, RING3_TEST_RFLAGS)
+    });
+
+    kprintln!(
+        "[RING3] Back in ring-0 - full_preempt_test exit_code={:#x} (expected {:#x}) intercepted={}",
+        exit_code,
+        EXPECTED_CHECKSUM,
+        intercepted
+    );
+    serial_println!(
+        "[RING3] ring3_full_preempt_test exit_code={:#x} intercepted={}",
+        exit_code,
+        intercepted
+    );
+
+    (exit_code, intercepted)
+}

@@ -2910,6 +2910,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ring3_coop_sig
     );
 
+    // Fase 85: the first genuine, INVOLUNTARY (timer-driven) ring-3
+    // preemption this kernel has ever attempted - a real hardware tick
+    // saves this ring-3 program's COMPLETE register state and correctly
+    // restores it, not just the 6 registers switch_to/Fase 83's own
+    // cooperative yield already protect. Deliberately the simplest
+    // possible proof (save+restore round trip only, no "run something
+    // else while preempted" yet) - see scheduler::ring3_preempt's own
+    // module doc for the full mechanism and why it's scoped this way.
+    kprintln!("[KERNEL INIT] Testing genuine timer-driven full-register ring-3 preemption...");
+    let (ring3_full_preempt_code, ring3_full_preempt_hit) = ring3::run_ring3_full_preempt_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - full-register preemption test returned exit_code={:#x} intercepted={}",
+        ring3_full_preempt_code,
+        ring3_full_preempt_hit
+    );
+
     kprintln!("==================================================");
     kprintln!("  [SUCCESS] AgentOS Native Kernel Boot Sequence Complete ");
     kprintln!("  [SHELL] AgentOS Native Console Ready. Type commands: ");
