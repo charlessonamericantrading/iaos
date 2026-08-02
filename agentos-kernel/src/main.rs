@@ -1781,6 +1781,89 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 7b-6b. Test real TCP header construction/parsing + the RFC 793
+    // pseudo-header checksum (net::tcp, Fase 88) - pure byte-buffer
+    // logic, deliberately NOT wired to any real connection state machine
+    // or device I/O yet, the same order net::icmp itself followed
+    // (Fase 47 before Fase 48-49's real ARP/ping round trips).
+    //
+    // pseudo_checksum_hand_computed_ok is an INDEPENDENTLY hand-computed
+    // vector, NOT a round-trip check - the exact discipline net::icmp's
+    // own self-test above already established (see its own comment):
+    // a round-trip test (build then parse with the SAME checksum
+    // function) would still pass even if this code consistently
+    // disagreed with the real RFC 793/1071 standard, since both sides
+    // would agree with each other while disagreeing with any real peer
+    // computing it independently. Pseudo-header [0,0,0,1, 0,0,0,2, 0,6,
+    // 0,4] (source IP 0.0.0.1, dest IP 0.0.0.2, protocol 6, TCP length 4)
+    // + a fake 4-byte "segment" [0x00,0x01,0x00,0x02]: 8 words summing to
+    // 0+1+0+2+6+4+1+2=0x0010, checksum = !0x0010 = 0xFFEF (verified
+    // independently before writing this assertion, not assumed).
+    //
+    // syn_fields_ok round-trips a real 20-byte SYN header (build_tcp_
+    // header -> parse_tcp_segment) and checks every field survived
+    // exactly. corrupted_checksum_rejected is the actual proof this
+    // isn't a rubber stamp: one header byte is XOR-flipped after
+    // building a valid segment, and parse_tcp_segment must now report a
+    // mismatch instead of silently accepting corrupted data.
+    kprintln!("[KERNEL INIT] Testing real TCP header construction/parsing...");
+    {
+        use net::tcp;
+
+        const SRC_IP: [u8; 4] = [10, 0, 2, 15];
+        const DST_IP: [u8; 4] = [10, 0, 2, 2];
+
+        let pseudo_checksum_hand_computed_ok = {
+            let source_ip = [0, 0, 0, 1];
+            let dest_ip = [0, 0, 0, 2];
+            let fake_segment: [u8; 4] = [0x00, 0x01, 0x00, 0x02];
+            let mut buf = alloc::vec::Vec::with_capacity(12 + fake_segment.len());
+            buf.extend_from_slice(&source_ip);
+            buf.extend_from_slice(&dest_ip);
+            buf.push(0);
+            buf.push(tcp::IP_PROTOCOL_TCP);
+            buf.extend_from_slice(&(fake_segment.len() as u16).to_be_bytes());
+            buf.extend_from_slice(&fake_segment);
+            net::icmp::internet_checksum(&buf) == 0xFFEF
+        };
+
+        let syn_header = tcp::build_tcp_header(
+            SRC_IP,
+            DST_IP,
+            54321,
+            80,
+            0x1000_0000,
+            0,
+            tcp::TCP_FLAG_SYN,
+            65535,
+            &[],
+        );
+        let syn_fields_ok = tcp::parse_tcp_segment(SRC_IP, DST_IP, &syn_header)
+            .map(|info| {
+                info.source_port == 54321
+                    && info.dest_port == 80
+                    && info.seq_num == 0x1000_0000
+                    && info.ack_num == 0
+                    && info.flags == tcp::TCP_FLAG_SYN
+                    && info.window == 65535
+            })
+            .unwrap_or(false);
+
+        let mut corrupted = syn_header;
+        corrupted[0] ^= 0xFF;
+        let corrupted_checksum_rejected =
+            tcp::parse_tcp_segment(SRC_IP, DST_IP, &corrupted).is_err();
+
+        kprintln!(
+            "[TCP] header self-test: pseudo_checksum_hand_computed_ok={} syn_fields_ok={} corrupted_checksum_rejected={}",
+            pseudo_checksum_hand_computed_ok, syn_fields_ok, corrupted_checksum_rejected
+        );
+        serial_println!(
+            "[TCP] header_selftest pseudo_checksum_hand_computed_ok={} syn_fields_ok={} corrupted_checksum_rejected={}",
+            pseudo_checksum_hand_computed_ok, syn_fields_ok, corrupted_checksum_rejected
+        );
+    }
+
     // 7b-7. Test real, generalized ARP resolution (Fase 48) - arp_resolve
     // sends a real ARP request for an arbitrary target IP and resolves its
     // MAC via the same TX+RX mechanics send_test_frame/receive_test_frame

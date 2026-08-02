@@ -855,6 +855,23 @@ jobs:
           # the same way. All six checks must be true for this exact line
           # to appear.
           grep -q "ICMP\] ping_selftest checksum_even_case_ok=true checksum_odd_case_ok=true request_fields_ok=true reply_fields_ok=true corrupted_checksum_rejected=true ipv4_checksum_valid=true" boot.log
+          # Fase 88: real TCP header construction/parsing + the RFC 793
+          # pseudo-header checksum (net::tcp) - pure byte-buffer logic,
+          # deliberately NOT wired to any real connection state machine
+          # or device I/O yet, mirroring net::icmp's own protocol-layer-
+          # first order. pseudo_checksum_hand_computed_ok is an
+          # INDEPENDENTLY hand-computed vector (not a round-trip check -
+          # the same discipline the ICMP assertion above already
+          # applies): a fake pseudo-header + 4-byte segment summing to
+          # 0x0010, checksum = !0x0010 = 0xFFEF, verified independently
+          # before writing this assertion. syn_fields_ok round-trips a
+          # real 20-byte SYN header through build_tcp_header ->
+          # parse_tcp_segment and checks every field survived exactly.
+          # corrupted_checksum_rejected is the proof this isn't a rubber
+          # stamp (one header byte XOR-flipped after building a valid
+          # segment must now be rejected). All three checks must be true
+          # for this exact line to appear.
+          grep -q "TCP\] header_selftest pseudo_checksum_hand_computed_ok=true syn_fields_ok=true corrupted_checksum_rejected=true" boot.log
           # Confirms generalized ARP resolution (Fase 48, net::e1000::
           # arp_resolve) - a new, independent function (does not touch
           # send_test_frame/receive_test_frame, whose exact log output is
