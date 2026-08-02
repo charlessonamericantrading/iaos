@@ -1126,7 +1126,15 @@ jobs:
           # has left) is still rejected. uncompressed_name_parsed_ok is
           # the new positive case: a real, valid, fully spelled-out
           # "example.com" answer NAME parses to the correct IP.
-          grep -q "DNS\] answer_parse_selftest a_record_parsed_ok=true zero_answers_rejected=true non_a_record_rejected=true malformed_name_rejected=true multi_answer_ok=true uncompressed_name_parsed_ok=true" boot.log
+          #
+          # Fase 120: "partial compression" (RFC 1035 4.1.4 - one or
+          # more real labels, then a compression pointer) is now
+          # accepted too, the same way a bare pointer already was.
+          # partial_compression_parsed_ok proves a real "www" + pointer
+          # NAME parses to the correct IP; truncated_partial_pointer_
+          # rejected proves the new bounds check rejects a pointer
+          # missing its own second byte.
+          grep -q "DNS\] answer_parse_selftest a_record_parsed_ok=true zero_answers_rejected=true non_a_record_rejected=true malformed_name_rejected=true multi_answer_ok=true uncompressed_name_parsed_ok=true partial_compression_parsed_ok=true truncated_partial_pointer_rejected=true" boot.log
           # Fase 110: DNS query building (net::dns::build_query /
           # encode_qname) - pure logic, no hardware dependency, the
           # encoding-side mirror of the answer-parsing self-test right

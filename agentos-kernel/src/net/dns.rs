@@ -11,10 +11,12 @@
 //! this module closes the one piece that test's own doc explicitly left
 //! open: actually extracting a real, useful value (an IPv4 address) from
 //! the reply's answer section, rather than only confirming a reply
-//! exists. It still does NOT follow a compression pointer chain
-//! (partial compression, or a pointer pointing at another pointer),
-//! handle multiple QUESTIONS, or decode any record type besides A -
-//! real, separate, substantially larger DNS-client work if ever needed.
+//! exists. It still does NOT actually RESOLVE any compression pointer
+//! (bare or trailing a label sequence) to find out what name it points
+//! at - only ever how many bytes it occupies, real but strictly
+//! narrower than general name decompression - nor does it handle
+//! multiple QUESTIONS, or decode any record type besides A - real,
+//! separate, substantially larger DNS-client work if ever needed.
 //!
 //! Fase 115: `parse_first_a_record` now genuinely searches THROUGH
 //! multiple answer records (skipping any non-A ones via their own
@@ -31,6 +33,15 @@
 //! itself builds. Real servers overwhelmingly compress an answer name
 //! that repeats the question, but an uncompressed one is perfectly
 //! legal RFC 1035 wire format, previously hard-rejected outright.
+//!
+//! Fase 120: a label sequence ending in a compression pointer instead
+//! of a zero byte ("partial compression", RFC 1035 4.1.4) is now
+//! accepted too, the same way a bare pointer already was - counted as a
+//! 2-byte terminator, never followed. Since `name_field_len` never
+//! resolves what a pointer points at (only how many bytes the NAME
+//! field itself occupies), there was no chain-following or
+//! loop-prevention work needed to close this gap, unlike a real
+//! name-decompression routine would need.
 //!
 //! Fase 110 adds the encoding-side mirror of the same idea: `build_query`
 //! builds a real question section for ANY caller-supplied hostname,
@@ -74,28 +85,25 @@ pub const MAX_LABEL_LEN: usize = 63;
 /// after it without this function needing to walk the question's own
 /// QNAME labels itself.
 ///
-/// **Handles two real-world shapes per record, not general DNS**: each
-/// answer record's own NAME field is either a 2-byte compression
-/// pointer (RFC 1035 section 4.1.4's `11` top-bit-pair marker) - what
-/// most real DNS servers send for an answer that repeats the
-/// question's own name, since spelling it out again in full would be
-/// pure waste - or (Fase 117) a fully spelled-out sequence of
-/// length-prefixed labels terminated by a zero byte, the same wire
-/// shape `encode_qname` itself builds, for the less common but
-/// perfectly legal case of a server that does not compress the
-/// answer's own name. A label sequence that itself ends in a
-/// compression pointer instead of a zero byte (RFC 1035 4.1.4's
-/// "partial compression", labels followed by a pointer rather than a
-/// pointer alone or a full literal name) STOPS the search and is
-/// reported as an error rather than followed - genuinely rare in
-/// practice, and out of this module's own deliberately narrow scope
-/// (following a pointer chain, partial or otherwise, would be real,
-/// separate, general-purpose DNS parsing work). See `name_field_len`
-/// for exactly which shapes are accepted. A non-A record is skipped
-/// using its OWN declared RDLENGTH to find the next record - real,
-/// necessary work now that more than one record is actually being
-/// looked at, not previously needed when only the first one was ever
-/// inspected.
+/// **Handles every real-world shape of a record's own NAME field, not
+/// general DNS**: a 2-byte compression pointer (RFC 1035 section
+/// 4.1.4's `11` top-bit-pair marker) - what most real DNS servers send
+/// for an answer that repeats the question's own name - a fully
+/// spelled-out sequence of length-prefixed labels terminated by a zero
+/// byte (Fase 117, the same wire shape `encode_qname` itself builds),
+/// and a label sequence that ends in a compression pointer instead of a
+/// zero byte (Fase 120, RFC 1035 4.1.4's "partial compression" - one or
+/// more real labels, then a pointer to where the name continues). None
+/// of these NAME shapes is ever actually resolved to find out what the
+/// name says - this function only ever needs to know how many bytes
+/// each one occupies, to find where the record's own fixed fields
+/// start, so a compression pointer (bare or trailing a label sequence)
+/// is simply counted as 2 bytes and never followed. See
+/// `name_field_len` for exactly how each shape's length is computed. A
+/// non-A record is skipped using its OWN declared RDLENGTH to find the
+/// next record - real, necessary work now that more than one record is
+/// actually being looked at, not previously needed when only the first
+/// one was ever inspected.
 pub fn parse_first_a_record(message: &[u8], question_len: usize) -> Result<[u8; 4], &'static str> {
     if message.len() < DNS_HEADER_LEN {
         return Err("DNS message shorter than the 12-byte header");
@@ -150,11 +158,15 @@ pub fn parse_first_a_record(message: &[u8], question_len: usize) -> Result<[u8; 
 /// this only needs to know how many bytes the NAME field itself
 /// occupies, not what it names.
 ///
-/// Rejects a label sequence that ends in a compression pointer instead
-/// of a zero byte ("partial compression", RFC 1035 4.1.4) - real,
-/// separate, more general parsing work this module deliberately
-/// doesn't take on, matching `parse_first_a_record`'s own doc. Also
-/// rejects a label over 63 bytes (`MAX_LABEL_LEN`, the same limit
+/// A label sequence that ends in a compression pointer instead of a
+/// zero byte ("partial compression", RFC 1035 4.1.4 - one or more real
+/// labels, then a pointer to where the name continues) is accepted the
+/// same way a bare pointer is: as a 2-byte terminator, counted and
+/// returned, never FOLLOWED (Fase 120 - this function has never needed
+/// to resolve what a NAME says, only how many bytes it occupies, so
+/// there is no pointer chain to walk and no loop-prevention invariant
+/// needed here, unlike a real name-decompression routine would need).
+/// Also rejects a label over 63 bytes (`MAX_LABEL_LEN`, the same limit
 /// `encode_qname` enforces on the way in) and a label sequence that
 /// runs past the end of the message - both real malformed-input cases,
 /// not something to guess around.
@@ -176,9 +188,13 @@ fn name_field_len(message: &[u8], offset: usize) -> Result<usize, &'static str> 
         }
         let label_len = message[pos] as usize;
         if label_len & 0xC0 == 0xC0 {
-            return Err(
-                "answer record NAME is a label sequence ending in a compression pointer - partial compression isn't parsed",
-            );
+            if pos + 1 >= message.len() {
+                return Err(
+                    "answer record NAME's own compression pointer is missing its second byte",
+                );
+            }
+            pos += 2;
+            break;
         }
         if label_len == 0 {
             pos += 1;
