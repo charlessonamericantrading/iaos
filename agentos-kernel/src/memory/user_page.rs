@@ -39,6 +39,11 @@
 //! `USER_TEST_PAGE_ADDR` with every other test - the same PML4-distinctness
 //! guarantee: index 204, vs. the heap's 136 and the test page's own 170,
 //! so it shares no intermediate table with either existing mapping.
+//!
+//! **Fase 100 adds a FOURTH mapped address, `USER_DISK_PROGRAM_STACK_ADDR`**
+//! (PML4 index 238, distinct from all three above) - a dedicated stack
+//! page for the same disk-loaded program, so its code and stack no
+//! longer share a page's tail the way every ring-3 test before it did.
 
 use x86_64::structures::paging::mapper::{MapToError, TranslateResult};
 use x86_64::structures::paging::{
@@ -58,6 +63,17 @@ pub const USER_TEST_PAGE_ADDR: u64 = 0x5555_5555_0000;
 /// thus never risking silently inheriting the flags of) either existing
 /// mapping's tables.
 pub const USER_DISK_PROGRAM_PAGE_ADDR: u64 = 0x6666_6666_0000;
+
+/// A THIRD independent page - Fase 100 - a dedicated stack for the
+/// disk-loaded program, separate from its own code page above. PML4
+/// index 238: distinct from the heap's 136, `USER_TEST_PAGE_ADDR`'s 170,
+/// and `USER_DISK_PROGRAM_PAGE_ADDR`'s own 204. Exists because every
+/// ring-3 test in this kernel's entire history (Fase 71 through 99) has
+/// set `stack_top` to `code_addr + 4096` - the tail of the SAME page as
+/// the code - so the `iretq`-based ring-3 transition has never actually
+/// been proven to work when code and stack live on genuinely separate,
+/// non-adjacent pages.
+pub const USER_DISK_PROGRAM_STACK_ADDR: u64 = 0x7777_7777_0000;
 
 /// Maps one 4KiB page at `addr` with `PRESENT | WRITABLE |
 /// USER_ACCESSIBLE` - the shared implementation behind both

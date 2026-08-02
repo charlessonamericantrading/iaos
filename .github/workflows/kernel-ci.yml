@@ -204,6 +204,16 @@ jobs:
           # other ring-3 test also uses - see the disk_loaded_test
           # assertion below, now repointed at this address.
           grep -q "MEMORY\] disk_program_page present=true writable=true user_accessible=true write_read_back_ok=true" boot.log
+          # Fase 100: a THIRD independent page (USER_DISK_PROGRAM_STACK_
+          # ADDR, PML4 index 238 - distinct from the heap's 136, the
+          # test page's 170, and the disk program page's own 204).
+          # A dedicated stack for the same disk-loaded program, so its
+          # code and stack no longer share a page's tail - every ring-3
+          # test before this one kept stack_top at code_addr + 4096.
+          # See the disk_loaded_test assertion below: exit_code=42
+          # unchanged proves enter_ring3's iretq frame works correctly
+          # even when code and stack live on genuinely separate pages.
+          grep -q "MEMORY\] disk_program_stack present=true writable=true user_accessible=true write_read_back_ok=true" boot.log
           # Confirms a SAFE ring-3 -> ring-0 return (Fase 73) - unlike
           # ring3test/ring3syscall above (both deliberately opt-in, not
           # asserted here, since both end in a permanent halt by
@@ -711,6 +721,11 @@ jobs:
           # test's shared USER_TEST_PAGE_ADDR (see the disk_program_page
           # assertion above) - exit_code=42 unchanged proves entering
           # ring-3 was never implicitly hardwired to that one address.
+          # Fase 100 update: stack_top now points at USER_DISK_PROGRAM_
+          # STACK_ADDR (see the disk_program_stack assertion above)
+          # instead of sharing the tail of the code page - exit_code=42
+          # still unchanged proves the transition works with code and
+          # stack on genuinely separate, non-adjacent pages.
           grep -q "RING3\] ring3_disk_loaded_test roundtrip_ok=true exit_code=42" boot.log
           # Fase 87: the preemptive (timer-driven) scheduler's own
           # `priority` field was tracked and displayed since Fase 31 but

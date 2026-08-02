@@ -57,7 +57,9 @@
 //! IS asserted in CI like any other Fase, no special opt-in shell
 //! command needed. See that section's own doc for the mechanism.
 
-use crate::memory::user_page::{USER_DISK_PROGRAM_PAGE_ADDR, USER_TEST_PAGE_ADDR};
+use crate::memory::user_page::{
+    USER_DISK_PROGRAM_PAGE_ADDR, USER_DISK_PROGRAM_STACK_ADDR, USER_TEST_PAGE_ADDR,
+};
 use crate::{fat12, gdt, kprintln, serial_println, shell};
 use core::arch::naked_asm;
 
@@ -2651,6 +2653,13 @@ pub fn run_early_exit_ring3_mt_test() -> (u64, u32, bool, u32, bool, usize) {
 // historical shared address: the exact same enter_ring3 mechanism, the
 // exact same GDT/TSS setup, now runs a program from a completely
 // different address and still produces the identical exit_code=42.
+//
+// Fase 100 update: stack_top now points at USER_DISK_PROGRAM_STACK_ADDR
+// (a THIRD independent page) instead of USER_DISK_PROGRAM_PAGE_ADDR +
+// 4096 - code and stack no longer share a page's tail, unlike every
+// ring-3 test in this kernel's history before this one. enter_ring3
+// needed no changes: user_rsp was already an independent parameter,
+// never assumed adjacent to entry.
 pub fn run_ring3_disk_loaded_test() -> (bool, u64) {
     const PROGRAM: [u8; 15] = [
         0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xCD, 0x81, 0xFA,
@@ -2689,7 +2698,7 @@ pub fn run_ring3_disk_loaded_test() -> (bool, u64) {
     let user_cs = info.user_code_selector as u64;
     let user_ss = info.user_data_selector as u64;
     let code_addr = USER_DISK_PROGRAM_PAGE_ADDR;
-    let stack_top = USER_DISK_PROGRAM_PAGE_ADDR + 4096;
+    let stack_top = USER_DISK_PROGRAM_STACK_ADDR + 4096;
 
     unsafe {
         core::ptr::copy_nonoverlapping(loaded.as_ptr(), code_addr as *mut u8, loaded.len());

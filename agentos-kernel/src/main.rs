@@ -279,6 +279,42 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // Fase 100: a THIRD, independent user page - a dedicated stack for
+    // the same disk-loaded program, separate from its code page above.
+    // See ring3::run_ring3_disk_loaded_test, now using this address for
+    // stack_top instead of sharing the tail of its own code page.
+    kprintln!("[KERNEL INIT] Mapping a third, independent user page as a dedicated stack...");
+    memory::paging::with_mapper(|mapper| {
+        memory::user_page::map_user_page_at(
+            mapper,
+            &mut frame_allocator,
+            memory::user_page::USER_DISK_PROGRAM_STACK_ADDR,
+        )
+    })
+    .expect("disk program stack page mapping failed");
+    {
+        let info = memory::paging::with_mapper(|mapper| {
+            memory::user_page::inspect_user_page_at(
+                mapper,
+                memory::user_page::USER_DISK_PROGRAM_STACK_ADDR,
+            )
+        });
+        kprintln!(
+            "[MEMORY] disk_program_stack present={} writable={} user_accessible={} write_read_back_ok={}",
+            info.present,
+            info.writable,
+            info.user_accessible,
+            info.write_read_back_ok
+        );
+        serial_println!(
+            "[MEMORY] disk_program_stack present={} writable={} user_accessible={} write_read_back_ok={}",
+            info.present,
+            info.writable,
+            info.user_accessible,
+            info.write_read_back_ok
+        );
+    }
+
     // Fase 73: closes the ring-3 arc's own last remaining gap - a SAFE
     // ring-3 -> ring-0 return, unlike every earlier ring-3 test (Fase 71/
     // 72's ring3test/ring3syscall, both deliberately-opt-in shell
