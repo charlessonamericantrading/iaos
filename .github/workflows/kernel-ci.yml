@@ -629,6 +629,22 @@ jobs:
           # BOTH were genuinely never scheduled even once across task 0's
           # entire real, involuntary-timer-driven run.
           grep -q "RING3\] priority_mt_test task0_checksum=0x10000004 task1_last_eax=0x0 task2_last_eax=0x0" boot.log
+          # Fase 93: a NON-task-0 ring3_mt task can now voluntarily retire
+          # early (a new dedicated vector, int 0x84) instead of spinning
+          # forever being the only alternative to task 0's own int 0x81
+          # exit - a gap Fase 86 and 91 both explicitly left open. Task 1
+          # here uses the new ProgramEnding::RetireViaInt84 after its own
+          # small loop; task 2 keeps the OLD SpinForever ending unchanged,
+          # a direct control. task1_last_eax/task2_last_eax match their
+          # own expected checksums exactly (both genuinely ran), but the
+          # real new proof is task1_done=true task2_done=false - read
+          # straight out of scheduler::ring3_mt's own done-mask via run_
+          # multitasking's new return field, independent evidence the new
+          # vector actually fired and was recognized (not merely inferred
+          # from a correct checksum, which a bug leaving task 1 un-resumed
+          # after one last correct tick could also produce) - and that the
+          # unrelated control task's own old behavior is untouched.
+          grep -q "RING3\] early_exit_mt_test task0_checksum=0x10000004 task1_last_eax=0x20000004 task1_done=true task2_last_eax=0x30000004 task2_done=false" boot.log
           # Fase 87: the preemptive (timer-driven) scheduler's own
           # `priority` field was tracked and displayed since Fase 31 but
           # never actually used by tick()'s own task-selection logic -

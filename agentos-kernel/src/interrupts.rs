@@ -121,6 +121,25 @@ pub const RING3_TASK_EXIT_INT_VECTOR: u8 = 0x82;
 /// justified keeping 0x81/0x82 apart from 0x80 and from each other.
 pub const RING3_COOP_YIELD_INT_VECTOR: u8 = 0x83;
 
+/// A FIFTH DPL=3 vector (Fase 93) - a `scheduler::ring3_mt`-scheduled
+/// NON-task-0 task's voluntary "I'm done, stop scheduling me" signal, as
+/// opposed to `RING3_COOP_YIELD_INT_VECTOR`'s own voluntary YIELD (which
+/// resumes the SAME task again later) or `RING3_EXIT_INT_VECTOR`'s own
+/// task-0-only completion signal (which ends the whole `run_multitasking`
+/// session). Structurally closest to the TIMER tick's own handling of a
+/// ring-3 context (`scheduler::ring3_mt::tick` operates on the identical
+/// 160-byte full-15-GPR context this vector's own asm stub captures,
+/// unlike `RING3_TASK_EXIT_INT_VECTOR`'s smaller `switch_to`-convention
+/// snapshot or `RING3_COOP_YIELD_INT_VECTOR`'s own cooperative one) - so
+/// its entry stub reuses `timer_interrupt_entry_asm`'s exact shape
+/// verbatim, just reached voluntarily via `int 0x84` rather than by
+/// hardware, and calls `scheduler::ring3_mt::task_done` instead of
+/// `handle_timer_tick`. Kept as its own dedicated vector rather than
+/// folded into any vector above for the same "one dedicated vector per
+/// structurally-different behavior" reasoning that already justified
+/// keeping 0x81/0x82/0x83 apart.
+pub const RING3_MT_TASK_DONE_INT_VECTOR: u8 = 0x84;
+
 /// Counts real invocations of the DPL=3 syscall gate - lets a self-test
 /// verify the gate genuinely fired (not just "the CPU didn't crash"),
 /// the same reasoning `TIMER_TICKS` already established for verifying
@@ -200,6 +219,16 @@ lazy_static! {
             idt[RING3_COOP_YIELD_INT_VECTOR]
                 .set_handler_addr(VirtAddr::new(
                     crate::ring3::ring3_coop_yield_entry_asm as *const () as u64,
+                ))
+                .set_privilege_level(PrivilegeLevel::Ring3);
+        }
+        // Same reasoning (DPL=3, raw set_handler_addr) - see
+        // RING3_MT_TASK_DONE_INT_VECTOR's own doc for why this is a
+        // FIFTH, dedicated vector.
+        unsafe {
+            idt[RING3_MT_TASK_DONE_INT_VECTOR]
+                .set_handler_addr(VirtAddr::new(
+                    crate::ring3::ring3_mt_task_done_entry_asm as *const () as u64,
                 ))
                 .set_privilege_level(PrivilegeLevel::Ring3);
         }

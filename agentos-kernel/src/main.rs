@@ -3091,6 +3091,35 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         priority_mt_switches
     );
 
+    // Fase 93: proves a NON-task-0 ring3_mt task can voluntarily retire
+    // early (int 0x84) instead of spinning forever being the only
+    // alternative to task 0's own int 0x81 exit - see ring3::run_early_
+    // exit_ring3_mt_test's own doc. Safe to place here (not touching the
+    // ps-visible PCB table at all, same reasoning that let Fase 92's own
+    // test go here too) - only the Fase 87 ring-0 priority test below
+    // must stay absolutely last, since it's the one that spawns new PCB
+    // entries.
+    kprintln!(
+        "[KERNEL INIT] Testing voluntary early exit in ring3_mt (task1 retires via int 0x84 instead of spinning forever)..."
+    );
+    let (
+        early_exit_task0,
+        early_exit_task1_eax,
+        early_exit_task1_done,
+        early_exit_task2_eax,
+        early_exit_task2_done,
+        early_exit_switches,
+    ) = ring3::run_early_exit_ring3_mt_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - early_exit_mt_test returned task0_checksum={:#x} task1_last_eax={:#x} task1_done={} task2_last_eax={:#x} task2_done={} switch_count={}",
+        early_exit_task0,
+        early_exit_task1_eax,
+        early_exit_task1_done,
+        early_exit_task2_eax,
+        early_exit_task2_done,
+        early_exit_switches
+    );
+
     // Fase 87: proves the preemptive scheduler's own priority field is
     // now genuinely used, not cosmetic - see scheduler::preemptive::
     // run_priority_preemptive_test's own doc. Deliberately placed as the

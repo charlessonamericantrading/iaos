@@ -42,6 +42,17 @@
 //! starvation from the OTHER side (a lower-priority task gets nothing)
 //! rather than risking task 0 itself never being scheduled. See
 //! `ring3::run_priority_ring3_mt_test`'s own doc for the actual test.
+//!
+//! **Fase 93 lets a NON-task-0 task voluntarily retire early** instead of
+//! spinning forever, via a new dedicated vector (`interrupts::RING3_MT_
+//! TASK_DONE_INT_VECTOR`, 0x84) calling `task_done` below. `RING3_MT_
+//! TASK_DONE` tracks which slots have retired; both `tick` and `task_
+//! done` share one selection helper (`select_next`) that skips done
+//! slots the same way it already skips lower-priority ones. Task 0
+//! itself NEVER uses this new path - it still exits exclusively via the
+//! original, unmodified `RING3_EXIT_INT_VECTOR` mechanism (see `run_
+//! multitasking`'s own doc for why this is what keeps the selection
+//! search from ever coming up empty).
 
 use crate::scheduler::process::Priority;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -84,6 +95,41 @@ static mut RING3_MT_TASK_CTX: [u64; RING3_MT_MAX_TASKS] = [0; RING3_MT_MAX_TASKS
 /// multitasking` call, read by `tick()`'s own priority comparison.
 static mut RING3_MT_TASK_PRIORITY: [u8; RING3_MT_MAX_TASKS] = [0; RING3_MT_MAX_TASKS];
 
+/// Fase 93: which slots have voluntarily retired via `task_done` below -
+/// task 0's own slot (index 0) is NEVER set here, since task 0 always
+/// exits through the separate, unmodified `RING3_EXIT_INT_VECTOR` path
+/// instead. Reset to all-`false` by every `run_multitasking` call.
+static mut RING3_MT_TASK_DONE: [bool; RING3_MT_MAX_TASKS] = [false; RING3_MT_MAX_TASKS];
+
+/// Shared by `tick` and `task_done` (Fase 93): finds the highest actual
+/// priority among ACTIVE, NOT-YET-DONE slots (lowest `Priority` enum
+/// value wins, matching `scheduler::preemptive`'s own convention), then
+/// round-robins only within that top tier, starting right after
+/// `current` and wrapping - identical to the tier search Fase 92
+/// introduced, just now also skipping any slot `done` already marks
+/// retired. Guaranteed to terminate having found a real candidate:
+/// task 0's own slot is never marked done (see `RING3_MT_TASK_DONE`'s
+/// own doc), so at least one non-done slot always exists as long as
+/// this mechanism is still enabled at all.
+fn select_next(
+    active_tasks: usize,
+    current: usize,
+    prios: &[u8; RING3_MT_MAX_TASKS],
+    done: &[bool; RING3_MT_MAX_TASKS],
+) -> usize {
+    let mut top = u8::MAX;
+    for i in 0..active_tasks {
+        if !done[i] && prios[i] < top {
+            top = prios[i];
+        }
+    }
+    let mut next = (current + 1) % active_tasks;
+    while done[next] || prios[next] != top {
+        next = (next + 1) % active_tasks;
+    }
+    next
+}
+
 /// Called from `interrupts::handle_timer_tick` for every tick that
 /// interrupts ring-3 code, chained immediately after `ring3_preempt::
 /// tick` - a true no-op whenever THIS mechanism isn't the one currently
@@ -122,16 +168,46 @@ pub fn tick(saved_ctx_ptr: u64) -> u64 {
         core::ptr::write_bytes(saved_ctx_ptr as *mut u8, 0xAA, 160);
 
         let prios: &[u8; RING3_MT_MAX_TASKS] = &*core::ptr::addr_of!(RING3_MT_TASK_PRIORITY);
-        let mut top = prios[0];
-        for &p in &prios[1..active_tasks] {
-            if p < top {
-                top = p;
-            }
-        }
-        let mut next = (current + 1) % active_tasks;
-        while prios[next] != top {
-            next = (next + 1) % active_tasks;
-        }
+        let done: &[bool; RING3_MT_MAX_TASKS] = &*core::ptr::addr_of!(RING3_MT_TASK_DONE);
+        let next = select_next(active_tasks, current, prios, done);
+
+        RING3_MT_CURRENT.store(next, Ordering::Relaxed);
+        RING3_MT_SWITCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        (*slots)[next]
+    }
+}
+
+/// Fase 93: called from `ring3_mt_task_done_entry_asm` (`ring3.rs`) when
+/// a NON-task-0 ring-3 task voluntarily retires via `int 0x84` instead of
+/// spinning forever - the same full-15-GPR-context shape `tick` already
+/// handles (this vector's own asm stub is timer_interrupt_entry_asm's
+/// shape verbatim, just reached voluntarily rather than by the timer),
+/// so the save/poison step is identical to `tick`'s own. The one genuine
+/// difference: the CURRENT task is marked `done` before selecting the
+/// next one, so neither `tick` nor a later `task_done` call will ever
+/// resume it again - it voluntarily forfeits the rest of its slot for
+/// good, rather than merely losing this one turn.
+///
+/// Never called for task 0 (see this module's own doc for why task 0's
+/// slot must never be marked done) - by construction, only a ring-3
+/// PROGRAM built to execute `int 0x84` can ever reach this at all, and
+/// no test in this codebase puts that instruction into task 0's own
+/// program.
+pub fn task_done(saved_ctx_ptr: u64) -> u64 {
+    let active_tasks = RING3_MT_ACTIVE_TASKS.load(Ordering::Relaxed);
+    let current = RING3_MT_CURRENT.load(Ordering::Relaxed);
+    unsafe {
+        let slots = core::ptr::addr_of!(RING3_MT_TASK_CTX);
+        let dest = (*slots)[current];
+        core::ptr::copy_nonoverlapping(saved_ctx_ptr as *const u8, dest as *mut u8, 160);
+        core::ptr::write_bytes(saved_ctx_ptr as *mut u8, 0xAA, 160);
+
+        let done_slots = core::ptr::addr_of_mut!(RING3_MT_TASK_DONE);
+        (*done_slots)[current] = true;
+
+        let prios: &[u8; RING3_MT_MAX_TASKS] = &*core::ptr::addr_of!(RING3_MT_TASK_PRIORITY);
+        let done: &[bool; RING3_MT_MAX_TASKS] = &*core::ptr::addr_of!(RING3_MT_TASK_DONE);
+        let next = select_next(active_tasks, current, prios, done);
 
         RING3_MT_CURRENT.store(next, Ordering::Relaxed);
         RING3_MT_SWITCH_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -170,7 +246,7 @@ pub fn run_multitasking<F: FnOnce() -> u64>(
     task0_priority: Priority,
     other_tasks: &[(Priority, [u8; 160])],
     f: F,
-) -> (u64, alloc::vec::Vec<u32>, usize) {
+) -> (u64, alloc::vec::Vec<u32>, alloc::vec::Vec<bool>, usize) {
     let active_tasks = other_tasks.len() + 1;
     assert!(
         active_tasks <= RING3_MT_MAX_TASKS,
@@ -193,6 +269,10 @@ pub fn run_multitasking<F: FnOnce() -> u64>(
         for (i, (p, _)) in other_tasks.iter().enumerate() {
             (*prios)[i + 1] = *p as u8;
         }
+        let done = core::ptr::addr_of_mut!(RING3_MT_TASK_DONE);
+        for i in 0..RING3_MT_MAX_TASKS {
+            (*done)[i] = false;
+        }
     }
     RING3_MT_ACTIVE_TASKS.store(active_tasks, Ordering::Relaxed);
     RING3_MT_CURRENT.store(0, Ordering::Relaxed);
@@ -203,20 +283,28 @@ pub fn run_multitasking<F: FnOnce() -> u64>(
 
     RING3_MT_ENABLED.store(false, Ordering::Relaxed);
     let switches = RING3_MT_SWITCH_COUNT.load(Ordering::Relaxed);
-    // None of the other tasks ever voluntarily exit (see `ring3::run_
-    // ring3_mt_test`'s own doc) - reading each one's own LAST-saved
-    // `eax` (offset 0 of its 160-byte context, the same layout `ring3_
-    // preempt` already relies on) directly out of its dedicated buffer,
-    // right here before it's dropped, is the only way to observe
-    // whether it genuinely ran its own loop and reached its own
-    // post-loop checksum - or, under real priority starvation (Fase 92),
-    // whether it never ran at all, in which case this reads back
-    // whatever its own cold bootstrap context started with (0, per
-    // `ring3::prepare_ring3_mt_task_ctx`'s own zeroed GPR slots).
+    // Reading each other task's own LAST-saved `eax` (offset 0 of its
+    // 160-byte context, the same layout `ring3_preempt` already relies
+    // on) directly out of its dedicated buffer, right here before it's
+    // dropped, is the only way to observe whether it genuinely ran its
+    // own loop and reached its own post-loop checksum - whether it
+    // retired early via `task_done` (Fase 93), never ran at all under
+    // real priority starvation (Fase 92, reading back whatever its own
+    // cold bootstrap context started with - 0, per `ring3::prepare_
+    // ring3_mt_task_ctx`'s own zeroed GPR slots), or simply spun forever
+    // and was last observed mid-loop or post-checksum (Fase 86/91's own
+    // original tasks).
     let other_last_eax: alloc::vec::Vec<u32> = bufs[1..]
         .iter()
         .map(|buf| u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
         .collect();
+    // Fase 93: which of the OTHER tasks voluntarily retired via `task_
+    // done` - read directly out of the static done-mask (index 0 is
+    // task 0's own slot, always false, so this always skips it).
+    let other_done: alloc::vec::Vec<bool> = unsafe {
+        let done: &[bool; RING3_MT_MAX_TASKS] = &*core::ptr::addr_of!(RING3_MT_TASK_DONE);
+        done[1..active_tasks].to_vec()
+    };
     drop(bufs);
-    (exit_code, other_last_eax, switches)
+    (exit_code, other_last_eax, other_done, switches)
 }
