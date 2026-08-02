@@ -2941,6 +2941,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ring3_mt_switches
     );
 
+    // Fase 87: proves the preemptive scheduler's own priority field is
+    // now genuinely used, not cosmetic - see scheduler::preemptive::
+    // run_priority_preemptive_test's own doc. Deliberately placed as the
+    // VERY LAST test before the final banner: this is the first NEW
+    // PCB-spawning test since Fase 80's own regression (see that Fase's
+    // own fix in this file's history) - any spawn() call shifts every
+    // LATER-spawned task's PID, so nothing may come after this one.
+    let (priority_task0_delta, priority_task1_delta) =
+        scheduler::preemptive::run_priority_preemptive_test();
+    kprintln!(
+        "[KERNEL INIT] Back from priority test - task0_delta={} task1_delta={}",
+        priority_task0_delta,
+        priority_task1_delta
+    );
+
     kprintln!("==================================================");
     kprintln!("  [SUCCESS] AgentOS Native Kernel Boot Sequence Complete ");
     kprintln!("  [SHELL] AgentOS Native Console Ready. Type commands: ");

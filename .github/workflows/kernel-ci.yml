@@ -578,6 +578,24 @@ jobs:
           # pinned here, the same reasoning already established for
           # every other real-tick-count value in this file.
           grep -q "RING3\] ring3_mt_test task0_checksum=0x10000004 task1_last_eax=0x20000004" boot.log
+          # Fase 87: the preemptive (timer-driven) scheduler's own
+          # `priority` field was tracked and displayed since Fase 31 but
+          # never actually used by tick()'s own task-selection logic -
+          # this file's own earlier comments admitted it outright
+          # ("the scheduler just alternates strictly 0/1/0/1, ignoring
+          # priority entirely"). tick() now finds the highest actual
+          # priority among ready tasks and round-robins ONLY within that
+          # top tier - reducing to the old alternation exactly when both
+          # tasks share one priority (preserving run_preemptive_demo's
+          # own "both counters > 0" guarantee below, unchanged), while a
+          # genuinely higher-priority task now wins every comparison and
+          # monopolizes the CPU completely. task1_delta=0 here is the
+          # proof: task-preempt-1 (Background) gets EXACTLY zero ticks
+          # while task-preempt-0 (High) is ready, not just fewer than
+          # before - task0_delta is deliberately NOT pinned (a real,
+          # TCG-timing-dependent tick count, the same reasoning already
+          # applied to every other real-tick-count value in this file).
+          grep -q "PREEMPT\] priority_test task0_delta=.* task1_delta=0" boot.log
           grep -q "SHELL\] ps ->" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -

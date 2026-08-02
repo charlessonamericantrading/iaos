@@ -55,6 +55,9 @@ const DEMO_TICKS: u64 = 50; // ~2.7s at the PIT's default ~18.2Hz
 
 struct PreemptTask {
     saved_rsp: u64,
+    /// Fase 87: now genuinely used by `tick()`'s own task-selection logic
+    /// below, not just carried for display - see that function's own doc.
+    priority: Priority,
     /// Real PCB pid (see module doc's new "ps unification" section) -
     /// registered from `run_preemptive_demo` (normal context, safe to
     /// block on `SCHEDULER.lock()` there); `tick()` itself only ever uses
@@ -134,26 +137,74 @@ pub fn tick(interrupted_ring3: bool) {
         let current_ptr = core::ptr::addr_of_mut!(PREEMPT_CURRENT);
         let from = *current_ptr;
 
+        let tasks: *mut [Option<PreemptTask>; 2] = core::ptr::addr_of_mut!(PREEMPT_TASKS);
+
         let next: Option<usize> = if *remaining_ptr == 0 {
             // Demo window elapsed - force one last switch back to the
             // kernel/idle context and stop ticking after this.
             PREEMPT_ENABLED.store(false, Ordering::Relaxed);
             None
         } else {
-            match from {
-                None => Some(0),
-                Some(0) => Some(1),
-                Some(1) => Some(0),
-                Some(_) => unreachable!("only 2 preemptive task slots exist"),
+            // Fase 87: real priority, not blind alternation. First find
+            // the highest actual priority present among the populated
+            // slots (lowest `Priority` enum value wins). Then round-robin
+            // ONLY among slots at that top tier, starting right after
+            // `from` and wrapping - this is deliberately NOT the simpler
+            // "always lowest slot index wins ties" rule `context_switch.
+            // rs`'s own `yield_now()` uses (correct there because a
+            // cooperative task only ever contends against itself in the
+            // no-op case), since applying that rule here would mean two
+            // EQUAL-priority tasks never alternate at all (slot 0 always
+            // wins) - silently breaking `run_preemptive_demo`'s own
+            // already-proven "both counters > 0" guarantee under
+            // Priority::Normal for both. Round-robin-within-the-top-tier
+            // reduces to the OLD strict 0<->1 alternation exactly when
+            // both tasks share one priority (preserving that guarantee
+            // byte-for-byte), while a genuinely higher-priority task now
+            // wins every single comparison and monopolizes the CPU
+            // completely - the new, previously-missing behavior.
+            let mut top: Option<u8> = None;
+            for idx in 0..2 {
+                if let Some(task) = (*tasks)[idx].as_ref() {
+                    let p = task.priority as u8;
+                    top = Some(match top {
+                        None => p,
+                        Some(cur) => cur.min(p),
+                    });
+                }
+            }
+            match top {
+                None => None,
+                Some(top_priority) => {
+                    let start = match from {
+                        Some(i) => (i + 1) % 2,
+                        None => 0,
+                    };
+                    let mut chosen = None;
+                    for offset in 0..2 {
+                        let idx = (start + offset) % 2;
+                        if let Some(task) = (*tasks)[idx].as_ref() {
+                            if task.priority as u8 == top_priority {
+                                chosen = Some(idx);
+                                break;
+                            }
+                        }
+                    }
+                    chosen
+                }
             }
         };
 
         if next == from {
-            // Only reachable if DEMO_TICKS were 0 (nothing ever started).
+            // Reachable whenever a strictly higher-priority task keeps
+            // winning every comparison (the new, common case a real
+            // priority scheduler produces), not just the old "DEMO_TICKS
+            // was 0" corner case - skipping the switch here is still
+            // exactly as correct and necessary as before: a real switch
+            // would restore `saved_rsp` as of the last time this exact
+            // task was switched away from, corrupting its live stack.
             return;
         }
-
-        let tasks: *mut [Option<PreemptTask>; 2] = core::ptr::addr_of_mut!(PREEMPT_TASKS);
 
         // Best-effort ps-visible PCB sync - see the module doc's `try_lock`
         // section for why this must never be the blocking `.lock()`.
@@ -236,18 +287,20 @@ fn preempt_task_body(id: usize) -> ! {
 ///
 /// Real PCB entries, same as `spawn_cooperative` - normal (non-interrupt)
 /// context, so the ordinary blocking `.lock()` is fine here even though
-/// `tick()` itself must only ever use `try_lock()`. Neither task has a
-/// real priority relationship (the scheduler just alternates strictly
-/// 0/1/0/1, ignoring priority entirely), so Normal for both is the
-/// honest choice, not a placeholder.
-fn start_demo(ticks: u64) {
+/// `tick()` itself must only ever use `try_lock()`. Fase 87: `tick()`
+/// now genuinely uses each task's own `priority` - callers that want the
+/// old, priority-blind alternation (every caller before Fase 87) simply
+/// pass `Priority::Normal` for both, which is honest and correct: real
+/// priority scheduling reduces to round-robin exactly when both tasks
+/// share one priority tier.
+fn start_demo(ticks: u64, priority0: Priority, priority1: Priority) {
     let pid0 = SCHEDULER
         .lock()
-        .spawn("preempt-task-0", Priority::Normal, 0)
+        .spawn("preempt-task-0", priority0, 0)
         .expect("PCB table full");
     let pid1 = SCHEDULER
         .lock()
-        .spawn("preempt-task-1", Priority::Normal, 0)
+        .spawn("preempt-task-1", priority1, 0)
         .expect("PCB table full");
 
     unsafe {
@@ -258,6 +311,7 @@ fn start_demo(ticks: u64) {
         let rsp0 = prepare_initial_stack(top0, preempt_task_entry_0);
         (*tasks)[0] = Some(PreemptTask {
             saved_rsp: rsp0,
+            priority: priority0,
             pid: pid0,
             _stack: stack0,
         });
@@ -267,6 +321,7 @@ fn start_demo(ticks: u64) {
         let rsp1 = prepare_initial_stack(top1, preempt_task_entry_1);
         (*tasks)[1] = Some(PreemptTask {
             saved_rsp: rsp1,
+            priority: priority1,
             pid: pid1,
             _stack: stack1,
         });
@@ -349,7 +404,7 @@ pub fn run_preemptive_demo() {
     kprintln!("[PREEMPT] Testing real timer-driven preemption (2 tasks, neither ever yields)...");
     serial_println!("[PREEMPT] starting: timer will force-switch 2 non-yielding tasks");
 
-    start_demo(DEMO_TICKS);
+    start_demo(DEMO_TICKS, Priority::Normal, Priority::Normal);
     let (c0, c1) = wait_for_demo_and_cleanup();
 
     kprintln!(
@@ -388,7 +443,7 @@ pub fn run_concurrent_ring3_preemption_test(
     const CONCURRENT_DEMO_TICKS: u64 = 30;
 
     let (c0_before, c1_before) = task_counters();
-    start_demo(CONCURRENT_DEMO_TICKS);
+    start_demo(CONCURRENT_DEMO_TICKS, Priority::Normal, Priority::Normal);
 
     let ticks_before_ring3 = ticks_remaining();
     let exit_code = enter_ring3_spin_loop();
@@ -403,4 +458,54 @@ pub fn run_concurrent_ring3_preemption_test(
         budget_untouched_during_ring3,
         tasks_advanced_after,
     )
+}
+
+/// Fase 87: proof that `tick()`'s own priority comparison is real, not
+/// cosmetic - the exact gap this module's own doc comments (on
+/// `PreemptTask::priority` and `start_demo`) used to admit outright
+/// ("the scheduler just alternates strictly 0/1/0/1, ignoring priority
+/// entirely"). Spawns task-preempt-0 as `Priority::High` and
+/// task-preempt-1 as `Priority::Background` - genuinely UNEQUAL, unlike
+/// every earlier caller of `start_demo` (which always passes `Normal`
+/// for both, since none of them are actually testing priority).
+///
+/// `PREEMPT_COUNTERS` are cumulative since boot, not reset per demo (see
+/// `task_counters`'s own doc) - `run_preemptive_demo` already ran earlier
+/// in the same boot and left both counters nonzero, so this captures a
+/// BEFORE snapshot and compares the DELTA, the same pattern `run_
+/// concurrent_ring3_preemption_test` already established.
+///
+/// Under the OLD priority-blind alternation this would have produced
+/// `task1_delta > 0` (same as every prior demo). Under REAL priority,
+/// task-preempt-0 (High) wins every single comparison in `tick()` for as
+/// long as it's ready - which is always, since it's an infinite loop
+/// that never blocks - so task-preempt-1 (Background) never gets
+/// scheduled even once: `task1_delta == 0` exactly, not just "smaller."
+pub fn run_priority_preemptive_test() -> (u64, u64) {
+    const PRIORITY_DEMO_TICKS: u64 = 50;
+
+    kprintln!(
+        "[PREEMPT] Testing REAL priority in the preemptive scheduler (High vs Background, unequal for the first time)..."
+    );
+    serial_println!("[PREEMPT] priority_test starting: task0=High task1=Background");
+
+    let (c0_before, c1_before) = task_counters();
+    start_demo(PRIORITY_DEMO_TICKS, Priority::High, Priority::Background);
+    let (c0_after, c1_after) = wait_for_demo_and_cleanup();
+
+    let task0_delta = c0_after - c0_before;
+    let task1_delta = c1_after - c1_before;
+
+    kprintln!(
+        "[PREEMPT] priority_test task0_delta={} task1_delta={} - task1 (Background) getting exactly zero proves task0 (High) genuinely monopolized the CPU.",
+        task0_delta,
+        task1_delta
+    );
+    serial_println!(
+        "[PREEMPT] priority_test task0_delta={} task1_delta={}",
+        task0_delta,
+        task1_delta
+    );
+
+    (task0_delta, task1_delta)
 }
