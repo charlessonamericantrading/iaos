@@ -145,7 +145,18 @@ lazy_static! {
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
-        idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
+        // Fase 84: `set_handler_addr`, not `set_handler_fn` - the timer
+        // entry point is now a hand-written naked stub (see its own doc
+        // below), the same reasoning `SYSCALL_INT_VECTOR`'s own
+        // registration already established for the identical reason
+        // (exposing general-purpose registers `extern "x86-interrupt"`
+        // can't). Stays DPL=0 (unlike the syscall/ring3 vectors below) -
+        // a hardware IRQ is never reachable via a deliberate ring-3 `int`
+        // instruction, so there's no privilege level to relax here.
+        unsafe {
+            idt[InterruptIndex::Timer.as_u8()]
+                .set_handler_addr(VirtAddr::new(timer_interrupt_entry_asm as *const () as u64));
+        }
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt[ATA_PRIMARY_IRQ_VECTOR].set_handler_fn(ata_primary_interrupt_handler);
         // DPL=3, unlike every entry above (all default to DPL=0) - the
@@ -220,9 +231,86 @@ pub fn init_pics() {
     );
 }
 
-extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
+/// Fase 84: the timer IRQ entry point converted from a compiler-generated
+/// `extern "x86-interrupt"` fn (which only ever transparently preserves
+/// whatever THIS SAME invocation's own compiled body happens to touch,
+/// on the assumption its OWN epilogue will eventually restore them) to a
+/// hand-written naked stub that explicitly saves ALL 15 general-purpose
+/// registers - the exact same shape, push/pop order, and CS.RPL-read-at-
+/// offset-128 trick `syscall_entry_asm` (Fase 72/75) already established
+/// and this kernel already relies on working. Reused here verbatim
+/// rather than re-derived, since the underlying reasoning (a
+/// cross-privilege interrupt frame's CS field sits at a FIXED offset
+/// above 15 pushed registers regardless of whether this specific
+/// interrupt happened to be same-privilege or cross-privilege, since the
+/// extra RSP/SS fields a cross-privilege entry adds sit ABOVE RFLAGS,
+/// never between RIP and CS) applies identically to the timer IRQ.
+///
+/// **Deliberately a PURE, behavior-preserving refactor - this Fase adds
+/// no new capability and changes no CI assertion.** The only thing that
+/// changes is HOW MANY registers are actually captured at the moment a
+/// tick lands (all 15, not just whatever LLVM happened to need) - a
+/// real, necessary prerequisite for genuine mid-flight ring-3 preemption
+/// (which needs the FULL register state of whatever was interrupted, not
+/// just the 6 callee-saved ones `switch_to`/Fase 83's own cooperative
+/// yield already handle), but this Fase does not yet USE those extra
+/// registers for anything - `handle_timer_tick`'s own body is BYTE-FOR-
+/// BYTE the same logic `timer_interrupt_handler`'s old body already had.
+/// Verified via the complete pre-existing CI assertion suite passing
+/// unchanged, not a new self-test - there is nothing new to observe yet.
+#[unsafe(naked)]
+extern "C" fn timer_interrupt_entry_asm() {
+    core::arch::naked_asm!(
+        "push rbx",
+        "push rcx",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rax",
+        "mov rdi, [rsp + 128]",
+        "and rdi, 3",
+        "call {handler}",
+        "pop rax",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rcx",
+        "pop rbx",
+        "iretq",
+        handler = sym handle_timer_tick,
+    );
+}
+
+/// Called by `timer_interrupt_entry_asm` with the interrupted context's
+/// own CS.RPL (0 or 3) already isolated to its low 2 bits - a normal,
+/// non-naked `extern "C" fn`, so this is exactly as safe to write as any
+/// other Rust code in this codebase, the same reasoning `handle_real_
+/// syscall` (Fase 72) already established for the identical "raw
+/// register work stays in the naked stub, ordinary logic lives here"
+/// split. Byte-for-byte the same body `timer_interrupt_handler`'s old
+/// `extern "x86-interrupt"` fn already had - see this section's own
+/// module doc for why this Fase deliberately changes nothing observable.
+extern "C" fn handle_timer_tick(caller_rpl: u64) {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
-    let interrupted_ring3 = stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3;
+    let interrupted_ring3 = caller_rpl == 3;
     if interrupted_ring3 {
         TIMER_TICKS_WHILE_RING3.fetch_add(1, Ordering::Relaxed);
     }
