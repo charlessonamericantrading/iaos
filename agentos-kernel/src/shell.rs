@@ -27,9 +27,11 @@ pub fn dispatch_command(line: &str) {
             );
         }
         "ps" => {
+            let sched = SCHEDULER.lock();
+            kprintln!("Active processes: {}", sched.get_active_count());
             kprintln!("PID  PRIO   STATE    NAME              RSP");
-            serial_println!("[SHELL] ps ->");
-            SCHEDULER.lock().for_each_process(|p| {
+            serial_println!("[SHELL] ps -> active_count={}", sched.get_active_count());
+            sched.for_each_process(|p| {
                 kprintln!(
                     "{:<4} {:<6} {:<8} {:<17} {:#x}",
                     p.pid,

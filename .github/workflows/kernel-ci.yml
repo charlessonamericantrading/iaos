@@ -820,6 +820,19 @@ jobs:
           # applied to every other real-tick-count value in this file).
           grep -q "PREEMPT\] priority_test task0_delta=.* task1_delta=0" boot.log
           grep -q "SHELL\] ps ->" boot.log
+          # Confirms `ps` now reports a real active-process count (Fase
+          # 136) - NativeAgentScheduler::get_active_count() existed since
+          # before this session's own start but had zero callers anywhere
+          # in the tree, the same "defined but never wired up" gap Fase 55
+          # found for SYS_TENSOR_EVAL. `ps` is invoked many times over the
+          # course of the boot self-test (directly and via simulated
+          # keystrokes in the command-history/cursor-movement tests), and
+          # the count grows monotonically as later self-tests spawn more
+          # processes into the same shared SCHEDULER - active_count=13 is
+          # the LAST such line, after every self-test that spawns a
+          # process has already run, so it's a real, deterministic,
+          # reproducible total, not an arbitrary pinned snapshot.
+          grep -q "SHELL\] ps -> active_count=13" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -
           # it's genuinely real time, different on every run by design -
