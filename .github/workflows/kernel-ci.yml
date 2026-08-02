@@ -833,6 +833,22 @@ jobs:
           # process has already run, so it's a real, deterministic,
           # reproducible total, not an arbitrary pinned snapshot.
           grep -q "SHELL\] ps -> active_count=13" boot.log
+          # Confirms `mem` now displays each KV block's own token_capacity
+          # (Fase 137) - the field was recorded on every block since Fase
+          # 21 ("still recorded... for whenever that distinction starts to
+          # matter", per its own doc comment) but never actually printed
+          # anywhere, the same "recorded but never surfaced" gap Fase 136
+          # just closed for the scheduler's own active-process count. No
+          # existing assertion covered ANY `mem`/KV-block output before
+          # this Fase - confirmed by grepping this whole file. Two real,
+          # deterministic blocks get allocated over the course of the boot
+          # self-test before `mem` first runs: block #1 (pid=2,
+          # tokens=2048, from an earlier direct KV_MANAGER call) and block
+          # #2 (pid=4, tokens=1024, from the SYS_KV_ALLOC syscall
+          # self-test) - both values are real requested token counts, not
+          # arbitrary.
+          grep -q "KV block #1 pid=2 tokens=2048 SystemRam" boot.log
+          grep -q "KV block #2 pid=4 tokens=1024 SystemRam" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -
           # it's genuinely real time, different on every run by design -
