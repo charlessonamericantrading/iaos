@@ -62,9 +62,10 @@
 //! builds a real question section for ANY caller-supplied hostname,
 //! closing the gap `dns_query_test`'s own Fase 106 doc left open (it
 //! only ever sent one fixed, hand-built "A? example.com" query byte
-//! array). Still only ever a single-question, single-record-type (A)
-//! query - the same "not a resolver" scope this module already commits
-//! to on the parsing side.
+//! array). Fase 126 further lets the caller choose which QTYPE to ask
+//! for (`DNS_TYPE_A` or `DNS_TYPE_AAAA`), rather than always hardcoding
+//! A - still only ever a single-QUESTION query, though, the same "not a
+//! resolver" scope this module already commits to on the parsing side.
 
 use alloc::vec::Vec;
 
@@ -301,19 +302,33 @@ pub fn encode_qname(hostname: &str, out: &mut Vec<u8>) -> Result<(), &'static st
 }
 
 /// Builds a complete DNS query message (12-byte header + question
-/// section) asking for `hostname`'s A record - the general form of
+/// section) asking for `hostname`'s `qtype` record - the general form of
 /// `dns_query_test`'s own Fase 106 fixed `DNS_QUERY` byte array, which
 /// this exact function now replaces there. Flags are always `0x0100`
 /// (standard query, recursion desired) and QDCOUNT is always 1 - still
 /// not a general multi-question query builder, matching this module's
 /// own standing "not a resolver" scope on the parsing side.
 ///
+/// Fase 126: `qtype` is now caller-chosen (`DNS_TYPE_A` or
+/// `DNS_TYPE_AAAA`) rather than always `DNS_TYPE_A` - otherwise Fase
+/// 124's own `parse_first_aaaa_record` could never actually be reached
+/// by a real query this kernel sends, only by a synthetic self-test
+/// fixture. Live wiring of an AAAA-requesting `dns_query_test`/`ping`
+/// path remains real, separate follow-on work if ever wanted - this
+/// Fase only makes the QTYPE choice possible, matching the same
+/// encode-then-generalize order Fase 107 (decode A) then Fase 110
+/// (generalize the encoder) already used.
+///
 /// `transaction_id` is caller-chosen. Real DNS clients randomize it per
 /// query to resist cache-poisoning/spoofing; this kernel does not - the
 /// same undefended trust model `arp_resolve` already has toward its own
 /// replies, and genuinely out of scope for what this Fase closes (a real
 /// hostname parameter, not a hardened resolver).
-pub fn build_query(transaction_id: u16, hostname: &str) -> Result<Vec<u8>, &'static str> {
+pub fn build_query(
+    transaction_id: u16,
+    hostname: &str,
+    qtype: u16,
+) -> Result<Vec<u8>, &'static str> {
     let mut query = Vec::with_capacity(DNS_HEADER_LEN + hostname.len() + 6);
     query.extend_from_slice(&transaction_id.to_be_bytes());
     query.extend_from_slice(&[0x01, 0x00]); // flags: standard query, recursion desired
@@ -322,7 +337,7 @@ pub fn build_query(transaction_id: u16, hostname: &str) -> Result<Vec<u8>, &'sta
     query.extend_from_slice(&[0x00, 0x00]); // NSCOUNT = 0
     query.extend_from_slice(&[0x00, 0x00]); // ARCOUNT = 0
     encode_qname(hostname, &mut query)?;
-    query.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+    query.extend_from_slice(&qtype.to_be_bytes());
     query.extend_from_slice(&DNS_QCLASS_IN.to_be_bytes());
     Ok(query)
 }

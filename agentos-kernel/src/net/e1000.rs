@@ -1988,7 +1988,7 @@ pub fn dns_query_test(target_ip: [u8; 4], hostname: &str) -> DnsQueryResult {
     // (unchanged from Fase 106's original hand-built bytes when
     // hostname="example.com" and transaction_id=0x1234).
     const DNS_TRANSACTION_ID: u16 = 0x1234;
-    let query = dns::build_query(DNS_TRANSACTION_ID, hostname)?;
+    let query = dns::build_query(DNS_TRANSACTION_ID, hostname, dns::DNS_TYPE_A)?;
 
     let dest_mac = arp_resolve(target_ip)?;
     let (dev, mmio_base) = find_mmio_base()?;

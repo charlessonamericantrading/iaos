@@ -1153,7 +1153,12 @@ jobs:
           # genuinely invalid hostname (empty, a label over 63 bytes, an
           # empty label from a doubled '.') is rejected rather than
           # silently mis-encoded.
-          grep -q "DNS\] build_query_selftest valid_query_matches_known_bytes=true empty_hostname_rejected=true over_long_label_rejected=true empty_label_rejected=true" boot.log
+          # Fase 127: build_query's own QTYPE is now caller-chosen -
+          # aaaa_query_matches_known_bytes proves a real AAAA query
+          # encodes correctly too, making Fase 124's own
+          # parse_first_aaaa_record reachable from a real query this
+          # kernel could send, not just a synthetic reply fixture.
+          grep -q "DNS\] build_query_selftest valid_query_matches_known_bytes=true empty_hostname_rejected=true over_long_label_rejected=true empty_label_rejected=true aaaa_query_matches_known_bytes=true" boot.log
           # Confirms generalized ARP resolution (Fase 48, net::e1000::
           # arp_resolve) - a new, independent function (does not touch
           # send_test_frame/receive_test_frame, whose exact log output is

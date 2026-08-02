@@ -2241,6 +2241,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // genuinely invalid hostname is rejected rather than silently
     // mis-encoded, the same discipline the answer-parse self-test above
     // already established with its own corrupted-fixture cases.
+    //
+    // Fase 126: build_query's own QTYPE is now caller-chosen rather
+    // than always DNS_TYPE_A - aaaa_query_matches_known_bytes proves a
+    // real AAAA query encodes correctly too (the same fixture as
+    // EXPECTED_EXAMPLE_COM_QUERY, differing only in the QTYPE field),
+    // making Fase 124's own parse_first_aaaa_record reachable from a
+    // real query this kernel could send, not just a synthetic reply
+    // fixture.
     kprintln!("[KERNEL INIT] Testing real DNS query building (net::dns::build_query)...");
     {
         use net::dns;
@@ -2260,22 +2268,42 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             0x00, 0x01, // QCLASS = IN
         ];
         let valid_query_matches_known_bytes =
-            dns::build_query(0x1234, "example.com") == Ok(EXPECTED_EXAMPLE_COM_QUERY.to_vec());
+            dns::build_query(0x1234, "example.com", dns::DNS_TYPE_A)
+                == Ok(EXPECTED_EXAMPLE_COM_QUERY.to_vec());
 
-        let empty_hostname_rejected = dns::build_query(0x1234, "").is_err();
+        let empty_hostname_rejected = dns::build_query(0x1234, "", dns::DNS_TYPE_A).is_err();
 
         let over_long_label = "a".repeat(64);
-        let over_long_label_rejected = dns::build_query(0x1234, &over_long_label).is_err();
+        let over_long_label_rejected =
+            dns::build_query(0x1234, &over_long_label, dns::DNS_TYPE_A).is_err();
 
-        let empty_label_rejected = dns::build_query(0x1234, "a..b").is_err();
+        let empty_label_rejected = dns::build_query(0x1234, "a..b", dns::DNS_TYPE_A).is_err();
+
+        #[rustfmt::skip]
+        const EXPECTED_EXAMPLE_COM_AAAA_QUERY: [u8; 29] = [
+            0x12, 0x34, // transaction ID
+            0x01, 0x00, // flags: standard query, recursion desired
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, // ANCOUNT = 0
+            0x00, 0x00, // NSCOUNT = 0
+            0x00, 0x00, // ARCOUNT = 0
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', // "example"
+            0x03, b'c', b'o', b'm', // "com"
+            0x00, // QNAME terminator
+            0x00, 0x1C, // QTYPE = AAAA
+            0x00, 0x01, // QCLASS = IN
+        ];
+        let aaaa_query_matches_known_bytes =
+            dns::build_query(0x1234, "example.com", dns::DNS_TYPE_AAAA)
+                == Ok(EXPECTED_EXAMPLE_COM_AAAA_QUERY.to_vec());
 
         kprintln!(
-            "[DNS] query-build self-test: valid_query_matches_known_bytes={} empty_hostname_rejected={} over_long_label_rejected={} empty_label_rejected={}",
-            valid_query_matches_known_bytes, empty_hostname_rejected, over_long_label_rejected, empty_label_rejected
+            "[DNS] query-build self-test: valid_query_matches_known_bytes={} empty_hostname_rejected={} over_long_label_rejected={} empty_label_rejected={} aaaa_query_matches_known_bytes={}",
+            valid_query_matches_known_bytes, empty_hostname_rejected, over_long_label_rejected, empty_label_rejected, aaaa_query_matches_known_bytes
         );
         serial_println!(
-            "[DNS] build_query_selftest valid_query_matches_known_bytes={} empty_hostname_rejected={} over_long_label_rejected={} empty_label_rejected={}",
-            valid_query_matches_known_bytes, empty_hostname_rejected, over_long_label_rejected, empty_label_rejected
+            "[DNS] build_query_selftest valid_query_matches_known_bytes={} empty_hostname_rejected={} over_long_label_rejected={} empty_label_rejected={} aaaa_query_matches_known_bytes={}",
+            valid_query_matches_known_bytes, empty_hostname_rejected, over_long_label_rejected, empty_label_rejected, aaaa_query_matches_known_bytes
         );
     }
 
