@@ -1499,8 +1499,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // 6. Test Native VirtIO-Net & TCP/IPv4 Network Stack
-    kprintln!("[NET INIT] Initializing VirtIO-Net Hardware Adapter & TCP/IP Stack...");
+    // 6. Exercise the simulated net::tcpip/net::virtio_net stack (Fase 134:
+    // this predates every real driver this kernel has since built - see
+    // net::virtio_net's own module doc for why it's kept simulated rather
+    // than deleted, and net::e1000/net::virtio for the genuinely real NIC
+    // drivers this kernel actually talks to hardware through).
+    kprintln!("[NET INIT] Initializing simulated VirtIO-Net stack & TCP/IP demo...");
     NativeNetworkStack::send_ipv4_packet([192, 168, 1, 1], b"AgentOS Kernel Online");
 
     // 7. Invoke System Calls (Syscalls)
