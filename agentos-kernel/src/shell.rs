@@ -546,7 +546,9 @@ pub fn dispatch_command(line: &str) {
             // `cli`. Exposed as its own explicit command so the normal
             // interactive shell stays fully usable otherwise - typing
             // this one specific command is an intentional, documented
-            // exception, not a hazard a user could hit by accident.
+            // exception, not a hazard a user could hit by accident -
+            // and for that same reason, deliberately left out of
+            // `help`'s own command list below (`ring3syscall` too).
             kprintln!("[SHELL] ring3test -> entering ring-3 (this will not return)");
             serial_println!("[SHELL] ring3test -> entering ring-3");
             crate::ring3::run_ring3_test();
@@ -554,7 +556,9 @@ pub fn dispatch_command(line: &str) {
         "ring3syscall" => {
             // A real ring-3-originated syscall round trip (Fase 72),
             // then the same proven `cli`-fault ending as `ring3test` -
-            // see ring3.rs's own doc for why this also never returns.
+            // see ring3.rs's own doc for why this also never returns,
+            // and `ring3test`'s own comment above for why both are
+            // deliberately left out of `help`'s own command list.
             kprintln!("[SHELL] ring3syscall -> entering ring-3 (this will not return)");
             serial_println!("[SHELL] ring3syscall -> entering ring-3");
             crate::ring3::run_ring3_syscall_test();
