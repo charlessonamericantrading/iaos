@@ -2186,7 +2186,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!(
         "[KERNEL INIT] Testing TCP handshake completion + real data echo (net::e1000::tcp_echo_test)..."
     );
-    match net::e1000::tcp_echo_test([10, 0, 2, 100], 9999, b"AgentOS Fase90 TCP echo\n") {
+    match net::e1000::tcp_echo_test(
+        [10, 0, 2, 100],
+        9999,
+        54322,
+        0x3000_0000,
+        b"AgentOS Fase90 TCP echo\n",
+    ) {
         Ok(_) => {}
         Err(e) => {
             kprintln!("[E1000] tcp_echo_test(10.0.2.100:9999): {}", e);
@@ -2216,12 +2222,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Fase 108: a SECOND, sequential call to the same, completely
     // unchanged tcp_echo_test (Fase 90/102) - zero risk to that already-
     // proven, CI-asserted function, since nothing about it changes here.
-    // tcp_echo_test's own SRC_PORT (54322) and INITIAL_SEQ (0x30000000)
-    // are hardcoded internal constants, not parameters - calling it
-    // again reuses the EXACT SAME local port and initial sequence
-    // number for a genuinely NEW connection, immediately after the
-    // first call's own full close. This is a real, previously-untested
-    // scenario against SLIRP's real TCP stack (does it allow immediate
+    // Passes the EXACT SAME 54322/0x30000000 src_port/initial_seq this
+    // call always used (a hardcoded internal constant at the time this
+    // Fase was written, generalized to real parameters in Fase 112,
+    // updated here to keep passing those identical values explicitly) -
+    // a genuinely NEW connection reusing the same local port and
+    // initial sequence number, immediately after the first call's own
+    // full close. This is a real, previously-untested scenario against
+    // SLIRP's real TCP stack (does it allow immediate
     // same-4-tuple reuse, or does some TIME_WAIT-like state reject a
     // second SYN too soon?) - the smallest safe step toward the "more
     // than one connection" item the TCP-connection-abstraction thread
@@ -2248,6 +2256,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     match net::e1000::tcp_echo_test(
         [10, 0, 2, 100],
         9999,
+        54322,
+        0x3000_0000,
         b"AgentOS Fase108 second connection reusing the same port\n",
     ) {
         Ok(_) => {
@@ -2259,6 +2269,50 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Err(e) => {
             kprintln!("[E1000] tcp_reconnect_test(10.0.2.100:9999): {}", e);
             serial_println!("[E1000] tcp_reconnect_test_result -> FAILED: {}", e);
+        }
+    }
+
+    // Fase 112: a THIRD, sequential tcp_echo_test call - this time with
+    // a genuinely DIFFERENT 4-tuple (src_port 54323, distinct from both
+    // tcp_syn_test's own 54321 and tcp_echo_test's own former hardcoded
+    // default 54322 the two calls above still use; initial_seq
+    // 0x4000_0000, distinct from their own 0x3000_0000) rather than
+    // Fase 108's own same-port reuse. Only possible now that Fase 112
+    // itself turned src_port/initial_seq into real parameters - the
+    // smallest safe step structurally necessary before real CONCURRENT
+    // connections could ever be attempted (two connections literally
+    // cannot coexist on the same 4-tuple, so proving a second, distinct
+    // port/sequence pair also works correctly is a real prerequisite,
+    // even though this call is still sequential, not simultaneous).
+    //
+    // Genuinely uncertain going in, the same honest posture every real
+    // network Fase in this arc has used: cannot be verified locally at
+    // all (the same fork()-on-Windows limitation blocks every call in
+    // this sequence from ever reaching a real handshake on this
+    // machine) - only the real CI runner can show whether a genuinely
+    // different port/sequence pair also completes successfully.
+    kprintln!(
+        "[KERNEL INIT] Testing a THIRD TCP connection with a genuinely different local port/sequence (net::e1000::tcp_echo_test again)..."
+    );
+    serial_println!(
+        "[E1000] tcp_multiport_test attempting=true target=[10, 0, 2, 100] port=9999 src_port=54323"
+    );
+    match net::e1000::tcp_echo_test(
+        [10, 0, 2, 100],
+        9999,
+        54323,
+        0x4000_0000,
+        b"AgentOS Fase112 third connection, different port\n",
+    ) {
+        Ok(_) => {
+            kprintln!("[E1000] tcp_multiport_test: third connection succeeded");
+            serial_println!(
+                "[E1000] tcp_multiport_test target=[10, 0, 2, 100] port=9999 src_port=54323 third_connection_ok=true"
+            );
+        }
+        Err(e) => {
+            kprintln!("[E1000] tcp_multiport_test(10.0.2.100:9999): {}", e);
+            serial_println!("[E1000] tcp_multiport_test_result -> FAILED: {}", e);
         }
     }
 

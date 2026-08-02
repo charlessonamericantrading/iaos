@@ -1199,25 +1199,47 @@ jobs:
           grep -q "E1000\] tcp_close_test target=\[10, 0, 2, 100\] port=9999 fin_sent=true" boot.log
           # Fase 108: a SECOND, sequential call to the SAME, completely
           # unchanged tcp_echo_test (Fase 90/102) - zero risk to that
-          # already-proven function. tcp_echo_test's own SRC_PORT (54322)
-          # and INITIAL_SEQ (0x30000000) are hardcoded internal
-          # constants, not parameters, so this reuses the EXACT SAME
-          # local port and initial sequence number for a genuinely NEW
-          # connection right after the first call's own full close - a
-          # real, previously-untested scenario against SLIRP's real TCP
-          # stack (does it allow immediate same-4-tuple reuse, or does
-          # some TIME_WAIT-like state reject a second SYN too soon?).
-          # Only asserting the fully deterministic half here (the second
-          # attempt was genuinely reached) - whether it actually succeeds
-          # is observed and recorded (`second_connection_ok`), not gated
-          # on, the same honest-uncertain-value discipline the assertion
-          # right above already established for peer_fin_received. This
-          # Fase also bumped the boot-test timeout 35s -> 45s (see this
-          # job's own "Boot-test in QEMU" step comment) - the second real
-          # network round trip roughly doubles the same class of
-          # wall-clock cost the earlier 25s->35s bump already accounted
-          # for once, confirmed locally before trusting it here.
+          # already-proven function. Passes the same 54322/0x30000000
+          # src_port/initial_seq the FIRST call also uses (a hardcoded
+          # internal constant at the time this Fase was written,
+          # generalized to real parameters in Fase 112), reusing the
+          # EXACT SAME local port and initial sequence number for a
+          # genuinely NEW connection right after the first call's own
+          # full close - a real, previously-untested scenario against
+          # SLIRP's real TCP stack (does it allow immediate same-4-tuple
+          # reuse, or does some TIME_WAIT-like state reject a second SYN
+          # too soon?). Only asserting the fully deterministic half here
+          # (the second attempt was genuinely reached) - whether it
+          # actually succeeds is observed and recorded
+          # (`second_connection_ok`), not gated on, the same honest-
+          # uncertain-value discipline the assertion right above already
+          # established for peer_fin_received. This Fase also bumped the
+          # boot-test timeout 35s -> 45s (see this job's own "Boot-test
+          # in QEMU" step comment) - the second real network round trip
+          # roughly doubles the same class of wall-clock cost the
+          # earlier 25s->35s bump already accounted for once, confirmed
+          # locally before trusting it here.
           grep -q "E1000\] tcp_reconnect_test attempting=true target=\[10, 0, 2, 100\] port=9999" boot.log
+          # Fase 112: a THIRD, sequential tcp_echo_test call - this time
+          # with a genuinely DIFFERENT 4-tuple (src_port 54323/initial_
+          # seq 0x40000000, distinct from both calls above) rather than
+          # Fase 108's own same-port reuse, made possible by Fase 112
+          # itself turning src_port/initial_seq into real parameters -
+          # the smallest safe step structurally necessary before real
+          # CONCURRENT connections could ever be attempted (two
+          # connections cannot coexist on the same 4-tuple, so a second,
+          # genuinely distinct port/sequence pair working correctly is a
+          # real prerequisite, even though this call is still sequential,
+          # not simultaneous). Only asserting the deterministic "attempt
+          # reached" half - whether it actually succeeds
+          # (`third_connection_ok`) is observed and recorded, not gated
+          # on, the same honest-uncertain-value discipline as the two
+          # assertions above. Confirmed locally that adding this third
+          # real network round trip does NOT need another timeout bump
+          # (unlike Fase 90's 25s->35s and Fase 108's 35s->45s) - the
+          # final priority_test still completes with room to spare
+          # across 5 repeated boots at the current 45s budget.
+          grep -q "E1000\] tcp_multiport_test attempting=true target=\[10, 0, 2, 100\] port=9999 src_port=54323" boot.log
           # Fase 106: the first real UDP round trip this kernel has ever
           # attempted (every prior network Fase built TCP or ICMP).
           # guestfwd was directly confirmed NOT to support UDP (tested

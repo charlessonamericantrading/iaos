@@ -442,7 +442,13 @@ pub fn dispatch_command(line: &str) {
                 (Some(target_ip), Ok(target_port)) if message.len() <= MAX_TCPECHO_PAYLOAD => {
                     let mut payload = message.into_bytes();
                     payload.push(b'\n');
-                    match crate::net::e1000::tcp_echo_test(target_ip, target_port, &payload) {
+                    match crate::net::e1000::tcp_echo_test(
+                        target_ip,
+                        target_port,
+                        54322,
+                        0x3000_0000,
+                        &payload,
+                    ) {
                         Ok(echoed) => {
                             let matches = echoed == payload;
                             kprintln!(

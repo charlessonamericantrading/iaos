@@ -1515,9 +1515,25 @@ fn parse_reply_frame(
 /// where `cat` and POSIX `fork()`/`exec()` are native, so the full
 /// round trip (including the real echo) is expected to complete there
 /// even though it cannot locally on this machine.
+///
+/// Fase 112: `src_port`/`initial_seq` were originally internal
+/// constants (`54322`/`0x3000_0000`) - now real parameters, the
+/// smallest safe step toward the TCP-connection-abstraction thread's
+/// own long-flagged goal (genuinely concurrent connections structurally
+/// need distinct 4-tuples, which a hardcoded source port could never
+/// provide). Every pre-existing caller still passes those exact
+/// original values, so this is a pure signature widening with zero
+/// behavior change for them. Caller-chosen, not validated here: picking
+/// a value that collides with another in-flight connection's own
+/// 4-tuple is a real, caller-responsibility mistake - the same trust
+/// model `tcp_syn_test`'s own doc already established by picking
+/// `54321` specifically to avoid colliding with this function's own
+/// former hardcoded default.
 pub fn tcp_echo_test(
     target_ip: [u8; 4],
     target_port: u16,
+    src_port: u16,
+    initial_seq: u32,
     payload: &[u8],
 ) -> Result<alloc::vec::Vec<u8>, &'static str> {
     use crate::net::tcp;
@@ -1527,17 +1543,15 @@ pub fn tcp_echo_test(
     dev.enable_bus_mastering();
     let src_mac = read_mac(mmio_base);
     const SRC_IP: [u8; 4] = [10, 0, 2, 15]; // SLIRP guest default
-    const SRC_PORT: u16 = 54322; // distinct from tcp_syn_test's own 54321, so a leftover half-open handshake from that test can never be confused with this one's fresh 4-tuple
-    const INITIAL_SEQ: u32 = 0x3000_0000;
     const NUM_RX_SLOTS: usize = 7; // this connection's own SYN-ACK, the stack's own immediate bare ACK, the real echo, and (Fase 102) the peer's own ACK-of-our-FIN and/or its own FIN, plus spares - bumped from 4 since the graceful close below needs real headroom beyond the handshake+echo NUM_RX_DESCRIPTORS is 8 (module-level), so 7 leaves the ring's own last slot genuinely unarmed rather than cutting it exactly at the cap
     const RX_SLOT_STRIDE: u64 = 256;
 
     let syn_header = tcp::build_tcp_header(
         SRC_IP,
         target_ip,
-        SRC_PORT,
+        src_port,
         target_port,
-        INITIAL_SEQ,
+        initial_seq,
         0,
         tcp::TCP_FLAG_SYN,
         65535,
@@ -1699,8 +1713,8 @@ pub fn tcp_echo_test(
                 if let Some((info, _)) = parse_reply_frame(data, target_ip, SRC_IP) {
                     let is_syn_ack = info.flags == (tcp::TCP_FLAG_SYN | tcp::TCP_FLAG_ACK)
                         && info.source_port == target_port
-                        && info.dest_port == SRC_PORT
-                        && info.ack_num == INITIAL_SEQ.wrapping_add(1);
+                        && info.dest_port == src_port
+                        && info.ack_num == initial_seq.wrapping_add(1);
                     if is_syn_ack {
                         peer_isn = Some(info.seq_num);
                     }
@@ -1729,9 +1743,9 @@ pub fn tcp_echo_test(
     let ack_header = tcp::build_tcp_header(
         SRC_IP,
         target_ip,
-        SRC_PORT,
+        src_port,
         target_port,
-        INITIAL_SEQ.wrapping_add(1),
+        initial_seq.wrapping_add(1),
         peer_isn.wrapping_add(1),
         tcp::TCP_FLAG_ACK,
         65535,
@@ -1744,9 +1758,9 @@ pub fn tcp_echo_test(
     let data_header = tcp::build_tcp_header(
         SRC_IP,
         target_ip,
-        SRC_PORT,
+        src_port,
         target_port,
-        INITIAL_SEQ.wrapping_add(1),
+        initial_seq.wrapping_add(1),
         peer_isn.wrapping_add(1),
         tcp::TCP_FLAG_PSH | tcp::TCP_FLAG_ACK,
         65535,
@@ -1755,7 +1769,7 @@ pub fn tcp_echo_test(
     let data_frame = build_tcp_frame(dest_mac, src_mac, SRC_IP, target_ip, data_header, payload);
     send_and_wait(2, &data_frame)?;
 
-    let expected_ack = INITIAL_SEQ
+    let expected_ack = initial_seq
         .wrapping_add(1)
         .wrapping_add(payload.len() as u32);
 
@@ -1786,7 +1800,7 @@ pub fn tcp_echo_test(
                 let data = core::slice::from_raw_parts(buf_virt, length);
                 if let Some((info, echoed)) = parse_reply_frame(data, target_ip, SRC_IP) {
                     let is_echo = info.source_port == target_port
-                        && info.dest_port == SRC_PORT
+                        && info.dest_port == src_port
                         && info.ack_num == expected_ack
                         && !echoed.is_empty();
                     if is_echo {
@@ -1837,7 +1851,7 @@ pub fn tcp_echo_test(
     let fin_header = tcp::build_tcp_header(
         SRC_IP,
         target_ip,
-        SRC_PORT,
+        src_port,
         target_port,
         our_seq_after_data,
         peer_seq_after_echo,
@@ -1876,14 +1890,14 @@ pub fn tcp_echo_test(
                 let data = core::slice::from_raw_parts(buf_virt, length);
                 if let Some((info, _)) = parse_reply_frame(data, target_ip, SRC_IP) {
                     let is_peer_fin = info.source_port == target_port
-                        && info.dest_port == SRC_PORT
+                        && info.dest_port == src_port
                         && info.flags & tcp::TCP_FLAG_FIN != 0;
                     if is_peer_fin {
                         peer_fin_received = true;
                         let final_ack_header = tcp::build_tcp_header(
                             SRC_IP,
                             target_ip,
-                            SRC_PORT,
+                            src_port,
                             target_port,
                             our_seq_after_data.wrapping_add(1),
                             info.seq_num.wrapping_add(1),
