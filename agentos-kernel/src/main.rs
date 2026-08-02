@@ -3023,14 +3023,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ring3_switchto_code
     );
 
-    // Fase 83: two ring-3 tasks cooperatively interleaving via a new
+    // Fase 83: ring-3 tasks cooperatively interleaving via a new
     // voluntary yield vector (0x83) - the lower-risk stepping stone
     // toward genuine ring-3 scheduling this kernel's own ring-0 history
     // already validated (cooperative before preemptive). Zero changes to
     // the timer interrupt path; reuses Fase 81's own switch_to-bootstrap
     // mechanism entirely. Spawns no PCB entries either, same as Fase 81.
+    // Fase 94 generalized this from exactly 2 hardcoded tasks to 3.
     kprintln!(
-        "[KERNEL INIT] Testing two ring-3 tasks cooperatively interleaving via a new yield vector..."
+        "[KERNEL INIT] Testing 3 ring-3 tasks cooperatively interleaving via a round-robin yield vector..."
     );
     let (ring3_coop_code, ring3_coop_sig) = ring3::run_ring3_cooperative_test();
     kprintln!(

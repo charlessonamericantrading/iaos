@@ -550,29 +550,38 @@ jobs:
           # through this new path end to end, not just that some
           # incidental value came back.
           grep -q "RING3\] ring3_switchto_bootstrap_test exit_code=15" boot.log
-          # Fase 83: two ring-3 tasks cooperatively interleave via a new
+          # Fase 83: ring-3 tasks cooperatively interleave via a new
           # voluntary yield vector (0x83) - genuine mid-flight ring-3
           # preemption remains real, separate follow-on work, but this
-          # proves two ring-3 "processes" can hand off to each other
-          # under their own control, the lower-risk stepping stone this
+          # proves ring-3 "processes" can hand off to each other under
+          # their own control, the lower-risk stepping stone this
           # kernel's own ring-0 scheduler history already validated
           # (cooperative before preemptive). Task 0 writes 'A', yields -
           # resuming task 1 for the very first time via the yield path
           # itself, not a direct switch_to call from Rust; task 1 writes
-          # 'B', yields back; task 0 resumes and writes 'C', proving its
-          # own task-id register survived the full round trip, then
-          # exits. `signature=[41, 42, 43]` ("ABC") is exact, ordered
-          # proof of correct interleaving, not just "nothing crashed".
-          # A REAL bug was caught by this test's own first boot: an
-          # early version saved a POINTER into the shared, CPU-reloaded-
-          # every-transition RSP0 stack instead of copying the snapshot
-          # into each task's own dedicated memory - task 0 came back
-          # showing task 1's own register state instead of its own
-          # (`signature=[41,42,44]`) - see ring3.rs's own module doc for
+          # 'B', yields - resuming task 2 (Fase 94: NOT back to task 0 -
+          # real, new proof round-robin genuinely visits every task in
+          # turn, not just ping-pongs between the first two); task 2
+          # writes 'C', yields, wrapping back around to task 0, which
+          # resumes and writes a deliberately distinct completion marker
+          # (`0x58`, chosen so it can never collide with 'A'/'B'/'C') -
+          # proving its own task-id register survived the full round
+          # trip through BOTH other tasks and back, then exits.
+          # `signature=[41, 42, 43, 58]` ("ABC" + the marker) is exact,
+          # ordered proof of correct interleaving, not just "nothing
+          # crashed". A REAL bug was caught by this test's own first
+          # boot (Fase 83 itself): an early version saved a POINTER into
+          # the shared, CPU-reloaded-every-transition RSP0 stack instead
+          # of copying the snapshot into each task's own dedicated
+          # memory - task 0 came back showing task 1's own register
+          # state instead of its own - see ring3.rs's own module doc for
           # the full story. Fixed by copying the 96-byte snapshot into
           # per-task memory instead of just remembering where it
-          # transiently sat.
-          grep -q "RING3\] ring3_cooperative_test exit_code=42 signature=\[41, 42, 43\]" boot.log
+          # transiently sat. Fase 94 generalized the mechanism itself
+          # from exactly 2 hardcoded tasks to a real N-task (3)
+          # round-robin, the same generalization Fase 91 already did for
+          # the OTHER, involuntary-timer-driven ring-3 scheduler.
+          grep -q "RING3\] ring3_cooperative_test exit_code=42 signature=\[41, 42, 43, 58\]" boot.log
           # Fase 85: the first genuine, INVOLUNTARY (timer-driven) ring-3
           # preemption this kernel has ever attempted - a real hardware
           # tick, landing at an arbitrary point this ring-3 program did

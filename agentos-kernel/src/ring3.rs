@@ -1026,12 +1026,22 @@ pub fn run_ring3_switchto_bootstrap_test() -> u64 {
 // remains real, separate follow-on work for genuine async preemption,
 // where the interrupted program never got a chance to arrange its own
 // live values into "safe" registers the way voluntary-yield code can).
-// The test's own two ring-3 "programs" are written with this convention
-// in mind: `bl` (the task's own identity, 0 or 1) and `r12` (a shared
-// buffer address) are the only state that needs to survive a yield, and
-// both are deliberately kept in the preserved set.
+// The test's own ring-3 "programs" (Fase 94: 3 of them, generalized from
+// the original 2) are written with this convention in mind: `bl` (the
+// task's own identity) and `r12` (a shared buffer address) are the only
+// state that needs to survive a yield, and both are deliberately kept in
+// the preserved set.
 
-static mut RING3_COOP_TASK_RSP: [u64; 2] = [0, 0];
+/// Fase 94: real, fixed headroom for how many cooperative-yield tasks
+/// this mechanism can track at once - the same "genuine limit, not a
+/// shortcut" reasoning `scheduler::ring3_mt::RING3_MT_MAX_TASKS` (Fase
+/// 91) already established, mirrored here for consistency. NOT the
+/// number actually active in a given run - that's `RING3_COOP_ACTIVE_
+/// TASKS`, set fresh by each test.
+const RING3_COOP_MAX_TASKS: usize = 4;
+
+static mut RING3_COOP_TASK_RSP: [u64; RING3_COOP_MAX_TASKS] = [0; RING3_COOP_MAX_TASKS];
+static mut RING3_COOP_ACTIVE_TASKS: usize = 0;
 static mut RING3_COOP_CURRENT: usize = 0;
 
 /// Entry point for vector 0x83 - a ring-3 task's voluntary "let someone
@@ -1090,12 +1100,13 @@ pub(crate) extern "C" fn ring3_coop_yield_entry_asm() {
 /// bootstrap already uses) OFF of RSP0 and into that task's OWN fixed,
 /// dedicated parking location (`RING3_COOP_TASK_RSP[cur]`, set ONCE at
 /// startup to that task's own `prepare_ring3_initial_stack`-returned
-/// address and never changed afterward), alternates `RING3_COOP_CURRENT`
-/// between the only two slots this first proof supports, and returns the
-/// OTHER task's own fixed location - either holding a previously-yielded
-/// snapshot in that same shape (copied there by ITS OWN earlier yield),
-/// or, the first time it's ever resumed, its own still-untouched fresh
-/// bootstrap.
+/// address and never changed afterward), advances `RING3_COOP_CURRENT`
+/// to the NEXT task in round-robin order (Fase 94: `(cur + 1) %
+/// active_tasks`, generalized from the original hardcoded `1 - cur`
+/// two-slot toggle), and returns that task's own fixed location - either
+/// holding a previously-yielded snapshot in that same shape (copied
+/// there by ITS OWN earlier yield), or, the first time it's ever
+/// resumed, its own still-untouched fresh bootstrap.
 ///
 /// **A real bug, caught by the very first boot test, not assumed
 /// correct**: the first version of this function saved `current_rsp`
@@ -1115,11 +1126,15 @@ pub(crate) extern "C" fn ring3_coop_yield_entry_asm() {
 /// kernel stack memory (the exact fix this doc now describes) rather
 /// than just remembering where they transiently were.
 ///
-/// Deliberately hardcoded to exactly 2 tasks, alternating unconditionally.
-/// A real N-task ring-3 scheduler (priority, more than 2 tasks, one task
-/// exiting while another keeps running) is real, separate, more
-/// substantial follow-on work; this function's only job is proving the
-/// mechanism itself is correct.
+/// **Fase 94 generalizes this from exactly 2 hardcoded tasks to a real
+/// N-task round-robin** (still bounded by `RING3_COOP_MAX_TASKS`, the
+/// same "real, fixed headroom" reasoning `scheduler::ring3_mt::
+/// RING3_MT_MAX_TASKS` already established for the OTHER, involuntary-
+/// timer-driven ring-3 scheduling mechanism) - this mechanism still has
+/// no priority-awareness and no early-exit-before-the-caller-decides
+/// (every task besides the one that eventually calls `int 0x82` is
+/// simply abandoned once the test function returns), both real,
+/// separate, further follow-on work.
 extern "C" fn ring3_coop_yield_helper(current_rsp: u64) -> u64 {
     unsafe {
         let current_ptr = core::ptr::addr_of_mut!(RING3_COOP_CURRENT);
@@ -1127,14 +1142,50 @@ extern "C" fn ring3_coop_yield_helper(current_rsp: u64) -> u64 {
         let tasks = core::ptr::addr_of!(RING3_COOP_TASK_RSP);
         let dest = (*tasks)[cur];
         core::ptr::copy_nonoverlapping(current_rsp as *const u8, dest as *mut u8, 96);
-        let next = 1 - cur;
+        let active_tasks = *core::ptr::addr_of!(RING3_COOP_ACTIVE_TASKS);
+        let next = (cur + 1) % active_tasks;
         *current_ptr = next;
         (*tasks)[next]
     }
 }
 
-/// Proves two ring-3 "tasks" can genuinely interleave via voluntary
-/// yields, not just enter-and-run-to-completion one at a time. Both
+/// Fase 94: builds one of `run_ring3_cooperative_test`'s own 16-byte
+/// per-task prologues (`mov r12, sig_addr` / `mov bl, task_id` / `jmp
+/// rel8`) - COMPUTING the trailing `jmp`'s relative offset from where
+/// this prologue sits and where the shared body starts, rather than
+/// hand-deriving a separate hex constant per task the way the original
+/// 2-task version did. `rel8` is relative to the address right after the
+/// 2-byte `jmp` instruction itself (`prologue_offset + 14`, since the
+/// `mov r12,imm64`/`mov bl,imm8` pair ahead of it are 10+2=12 bytes) -
+/// asserts the result fits a short (single-byte, forward-only) jump
+/// rather than silently truncating or wrapping if a future caller ever
+/// spaced prologues/body far enough apart to need a near/far jump
+/// instead.
+fn build_coop_task_prologue(
+    task_id: u8,
+    sig_addr: u64,
+    prologue_offset: usize,
+    shared_body_offset: usize,
+) -> [u8; 16] {
+    let mut p = [0u8; 16];
+    p[0] = 0x49;
+    p[1] = 0xBC; // mov r12, imm64
+    p[2..10].copy_from_slice(&sig_addr.to_le_bytes());
+    p[10] = 0xB3;
+    p[11] = task_id; // mov bl, task_id
+    p[12] = 0xEB; // jmp rel8
+    let next_ip = prologue_offset + 14;
+    let rel8 = shared_body_offset as isize - next_ip as isize;
+    assert!(
+        (0..=127).contains(&rel8),
+        "build_coop_task_prologue: rel8={rel8} out of short-forward-jump range"
+    );
+    p[13] = rel8 as u8;
+    p
+}
+
+/// Proves N ring-3 "tasks" can genuinely interleave via voluntary
+/// yields, not just enter-and-run-to-completion one at a time. All
 /// tasks share the SAME instruction bytes (the same "N tasks, shared
 /// code, distinct identity" shape `scheduler::preemptive`'s own
 /// `preempt_task_body(id)` already established for ring-0) - each has a
@@ -1144,40 +1195,52 @@ extern "C" fn ring3_coop_yield_helper(current_rsp: u64) -> u64 {
 /// code page (real, separate follow-on work - `memory::user_page`'s own
 /// doc already notes this kernel has exactly one such page).
 ///
+/// **Fase 94 generalizes this from exactly 2 hardcoded tasks to 3** -
+/// not an arbitrary bigger number, but the same "smallest scale that
+/// actually proves the mechanism isn't secretly still a hardcoded pair"
+/// reasoning Fase 91 already applied when generalizing `scheduler::
+/// ring3_mt` (the OTHER, involuntary-timer-driven ring-3 scheduling
+/// mechanism) the identical way.
+///
 /// Real proof of correct interleaving, not just "nothing crashed": task
 /// 0 enters first (via the ordinary Fase 81 switch_to-bootstrap), writes
-/// `'A'` (0x41) to the shared buffer, then yields (int 0x83) - resuming
-/// task 1 for the very first time (its own fresh bootstrap, reached ONLY
-/// via a yield, never a direct switch_to call from Rust - proving the
-/// yield path itself can originate a task's first run, not merely
-/// hand off between two already-started ones). Task 1 writes `'B'`
-/// (0x42, its own id folded into the same shared instruction via `bl`),
-/// then yields BACK - resuming task 0 exactly where it left off. Task
-/// 0's second run writes `'C'` (0x43) - real proof `bl` (its own task
-/// id) survived the full round trip through task 1 and back - then
-/// exits via the existing Fase 81 vector with `exit_code=42`. Task 1 is
-/// deliberately never resumed again after its own single yield (its
-/// kernel-side bootstrap stack is simply abandoned, freed once this
-/// function returns) - a real N-task scheduler that keeps every task
-/// alive indefinitely is the separate, more substantial follow-on work
-/// this Fase's own module doc already names.
+/// `'A'` (0x41) to `sig[0]`, then yields (int 0x83) - resuming task 1 for
+/// the very first time (its own fresh bootstrap, reached ONLY via a
+/// yield, never a direct switch_to call from Rust). Task 1 writes `'B'`
+/// (0x42) to `sig[1]`, then yields - resuming task 2 (NOT back to task
+/// 0 - the real, new proof that round-robin genuinely visits every
+/// task in turn, not just ping-pongs between the first two). Task 2
+/// writes `'C'` (0x43) to `sig[2]`, then yields - wrapping back around to
+/// task 0, which resumes exactly where it left off. Task 0's second run
+/// writes a DELIBERATELY distinct completion marker, `sig[3] = bl + 0x58`
+/// (`0x58` for task 0's own `bl=0`, chosen specifically so it can never
+/// collide with any of the `'A'`/`'B'`/`'C'` first-round values) - real
+/// proof `bl` (its own task id) survived the full round trip through
+/// BOTH other tasks and back - then exits via the existing Fase 81
+/// vector with `exit_code=42`. Tasks 1 and 2 are deliberately never
+/// resumed again after their own single yield (their kernel-side
+/// bootstrap stacks are simply abandoned, freed once this function
+/// returns) - real per-task early-exit/retirement (mirroring what Fase
+/// 93 added to the OTHER, involuntary-timer mechanism) remains real,
+/// separate, further follow-on work for this cooperative one.
 ///
-///   Task 0 entry (offset 0):  mov r12, sig_addr -> 49 BC + imm64
-///                             mov bl, 0         -> B3 00
-///                             jmp +0x12         -> EB 12  (-> offset 32)
-///   Task 1 entry (offset 16): mov r12, sig_addr -> 49 BC + imm64
-///                             mov bl, 1         -> B3 01
-///                             jmp +0x02         -> EB 02  (-> offset 32)
-///   Shared body (offset 32):  mov al, bl        -> 8A C3
-///                             add al, 0x41      -> 04 41
-///                             mov [r12+rbx], al -> 41 88 04 1C
-///                             int 0x83 (yield)  -> CD 83
-///                             mov al, bl        -> 8A C3
-///                             add al, 0x43      -> 04 43
-///                             mov [r12+2], al   -> 41 88 44 24 02
-///                             mov eax, 42       -> B8 2A 00 00 00
-///                             int 0x82 (exit)   -> CD 82
-pub fn run_ring3_cooperative_test() -> (u64, [u8; 3]) {
+/// Each 16-byte prologue slot is built by `build_coop_task_prologue`,
+/// which COMPUTES the correct `jmp rel8` target from the prologue's own
+/// offset and the shared body's offset, rather than 3 separately
+/// hand-derived hex constants - deliberately safer given this whole
+/// class of hand-encoded x86 has bitten this codebase before (Fase 83's
+/// own RSP0 bug, among others).
+///
+///   Shared body (offset 48):  mov al, bl          -> 8A C3
+///                              add al, 0x41        -> 04 41
+///                              mov [r12+rbx], al   -> 41 88 04 1C
+///                              int 0x83 (yield)    -> CD 83
+///                              mov al, bl          -> 8A C3
+///                              add al, 0x58         -> 04 58
+///                              mov [r12+3], al      -> 41 88 44 24 03
+///                              mov eax, 42          -> B8 2A 00 00 00
+///                              int 0x82 (exit)      -> CD 82
+pub fn run_ring3_cooperative_test() -> (u64, [u8; 4]) {
     let info = gdt::ring3_info();
     let user_cs = info.user_code_selector as u64;
     let user_ss = info.user_data_selector as u64;
@@ -1185,64 +1248,51 @@ pub fn run_ring3_cooperative_test() -> (u64, [u8; 3]) {
     let code_addr = USER_TEST_PAGE_ADDR;
     const SIG_OFFSET: u64 = 600;
     let sig_addr = code_addr + SIG_OFFSET;
-    let sig_bytes = sig_addr.to_le_bytes();
 
-    let mut program = [0u8; 58];
-    program[0] = 0x49;
-    program[1] = 0xBC; // mov r12, imm64
-    program[2..10].copy_from_slice(&sig_bytes);
-    program[10] = 0xB3;
-    program[11] = 0x00; // mov bl, 0
-    program[12] = 0xEB;
-    program[13] = 0x12; // jmp +0x12 -> offset 32
-    program[16] = 0x49;
-    program[17] = 0xBC; // mov r12, imm64
-    program[18..26].copy_from_slice(&sig_bytes);
-    program[26] = 0xB3;
-    program[27] = 0x01; // mov bl, 1
-    program[28] = 0xEB;
-    program[29] = 0x02; // jmp +0x02 -> offset 32
-    program[32] = 0x8A;
-    program[33] = 0xC3; // mov al, bl
-    program[34] = 0x04;
-    program[35] = 0x41; // add al, 0x41
-    program[36] = 0x41;
-    program[37] = 0x88;
-    program[38] = 0x04;
-    program[39] = 0x1C; // mov [r12+rbx], al
-    program[40] = 0xCD;
-    program[41] = 0x83; // int 0x83 (yield)
-    program[42] = 0x8A;
-    program[43] = 0xC3; // mov al, bl
-    program[44] = 0x04;
-    program[45] = 0x43; // add al, 0x43
-    program[46] = 0x41;
-    program[47] = 0x88;
-    program[48] = 0x44;
-    program[49] = 0x24;
-    program[50] = 0x02; // mov [r12+2], al
-    program[51] = 0xB8;
-    program[52] = 0x2A;
-    program[53] = 0x00;
-    program[54] = 0x00;
-    program[55] = 0x00; // mov eax, 42
-    program[56] = 0xCD;
-    program[57] = 0x82; // int 0x82 (exit)
+    const SHARED_BODY_OFFSET: usize = 48;
+    let task0_entry_offset: usize = 0;
+    let task1_entry_offset: usize = 16;
+    let task2_entry_offset: usize = 32;
+
+    let prologue0 = build_coop_task_prologue(0, sig_addr, task0_entry_offset, SHARED_BODY_OFFSET);
+    let prologue1 = build_coop_task_prologue(1, sig_addr, task1_entry_offset, SHARED_BODY_OFFSET);
+    let prologue2 = build_coop_task_prologue(2, sig_addr, task2_entry_offset, SHARED_BODY_OFFSET);
+    let body: [u8; 26] = [
+        0x8A, 0xC3, // mov al, bl
+        0x04, 0x41, // add al, 0x41
+        0x41, 0x88, 0x04, 0x1C, // mov [r12+rbx], al
+        0xCD, 0x83, // int 0x83 (yield)
+        0x8A, 0xC3, // mov al, bl
+        0x04, 0x58, // add al, 0x58
+        0x41, 0x88, 0x44, 0x24, 0x03, // mov [r12+3], al
+        0xB8, 0x2A, 0x00, 0x00, 0x00, // mov eax, 42
+        0xCD, 0x82, // int 0x82 (exit)
+    ];
+
+    let mut program = [0u8; SHARED_BODY_OFFSET + 26];
+    program[task0_entry_offset..task0_entry_offset + 16].copy_from_slice(&prologue0);
+    program[task1_entry_offset..task1_entry_offset + 16].copy_from_slice(&prologue1);
+    program[task2_entry_offset..task2_entry_offset + 16].copy_from_slice(&prologue2);
+    program[SHARED_BODY_OFFSET..SHARED_BODY_OFFSET + 26].copy_from_slice(&body);
 
     unsafe {
         core::ptr::copy_nonoverlapping(program.as_ptr(), code_addr as *mut u8, program.len());
-        core::ptr::write_bytes(sig_addr as *mut u8, 0, 3);
+        core::ptr::write_bytes(sig_addr as *mut u8, 0, 4);
     }
 
-    let task0_entry = code_addr;
-    let task1_entry = code_addr + 16;
+    let task0_entry = code_addr + task0_entry_offset as u64;
+    let task1_entry = code_addr + task1_entry_offset as u64;
+    let task2_entry = code_addr + task2_entry_offset as u64;
     let task0_stack_top = code_addr + 2048;
     let task1_stack_top = code_addr + 3072;
+    let task2_stack_top = code_addr + 4096;
 
     let mut kernel_stack0 = alloc::boxed::Box::new([0u8; 16 * 1024]);
     let mut kernel_stack1 = alloc::boxed::Box::new([0u8; 16 * 1024]);
+    let mut kernel_stack2 = alloc::boxed::Box::new([0u8; 16 * 1024]);
     let k0_top = unsafe { kernel_stack0.as_mut_ptr().add(16 * 1024) };
     let k1_top = unsafe { kernel_stack1.as_mut_ptr().add(16 * 1024) };
+    let k2_top = unsafe { kernel_stack2.as_mut_ptr().add(16 * 1024) };
 
     let rsp0 = unsafe {
         prepare_ring3_initial_stack(
@@ -1264,21 +1314,34 @@ pub fn run_ring3_cooperative_test() -> (u64, [u8; 3]) {
             RING3_TEST_RFLAGS,
         )
     };
+    let rsp2 = unsafe {
+        prepare_ring3_initial_stack(
+            k2_top,
+            task2_entry,
+            user_cs,
+            user_ss,
+            task2_stack_top,
+            RING3_TEST_RFLAGS,
+        )
+    };
 
     unsafe {
         let tasks = core::ptr::addr_of_mut!(RING3_COOP_TASK_RSP);
         (*tasks)[0] = rsp0;
         (*tasks)[1] = rsp1;
+        (*tasks)[2] = rsp2;
+        *core::ptr::addr_of_mut!(RING3_COOP_ACTIVE_TASKS) = 3;
         *core::ptr::addr_of_mut!(RING3_COOP_CURRENT) = 0;
     }
 
     kprintln!(
-        "[RING3] Attempting two ring-3 tasks cooperatively interleaving via a new yield vector (0x83)..."
+        "[RING3] Attempting 3 ring-3 tasks cooperatively interleaving via a round-robin yield vector (0x83)..."
     );
     serial_println!(
-        "[RING3] ring3_cooperative_test task0_entry={:#x} task1_entry={:#x} sig_addr={:#x}",
+        "[RING3] ring3_cooperative_test task0_entry={:#x} task1_entry={:#x} task2_entry={:#x} sig_addr={:#x}",
         task0_entry,
         task1_entry,
+        task2_entry,
         sig_addr
     );
 
@@ -1289,21 +1352,23 @@ pub fn run_ring3_cooperative_test() -> (u64, [u8; 3]) {
         );
     }
     // Resumes HERE once task 0 exits via int 0x82, after its own real
-    // round trip through task 1 and back.
+    // round trip through tasks 1 and 2 and back.
 
     let exit_code = unsafe { core::ptr::addr_of!(RING3_TASK_EXIT_CODE).read() };
-    let mut sig = [0u8; 3];
+    let mut sig = [0u8; 4];
     unsafe {
         sig[0] = core::ptr::read_volatile(sig_addr as *const u8);
         sig[1] = core::ptr::read_volatile((sig_addr + 1) as *const u8);
         sig[2] = core::ptr::read_volatile((sig_addr + 2) as *const u8);
+        sig[3] = core::ptr::read_volatile((sig_addr + 3) as *const u8);
     }
 
     drop(kernel_stack0);
     drop(kernel_stack1);
+    drop(kernel_stack2);
 
     kprintln!(
-        "[RING3] Back in ring-0 - cooperative test exit_code={} signature={:02x?} (expected [41, 42, 43] = \"ABC\")",
+        "[RING3] Back in ring-0 - cooperative test exit_code={} signature={:02x?} (expected [41, 42, 43, 58] = \"ABC\" + completion marker)",
         exit_code,
         sig
     );
