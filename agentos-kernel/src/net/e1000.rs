@@ -1340,14 +1340,12 @@ pub fn tcp_syn_test(
                     // ports) is a distinct, immediate outcome ("refused")
                     // from "not our reply yet, keep polling" and deserves
                     // its own error rather than silently absorbing it and
-                    // waiting out the full ~90-tick timeout. Does NOT
-                    // require matching ack_num the way a SYN-ACK does,
-                    // since a real RST-to-SYN is not required to carry
-                    // ACK at all.
-                    if info.flags & tcp::TCP_FLAG_RST != 0
-                        && info.source_port == target_port
-                        && info.dest_port == SRC_PORT
-                    {
+                    // waiting out the full ~90-tick timeout. Fase 131:
+                    // the match condition itself is now the shared
+                    // `is_matching_rst` helper below, unified with
+                    // `tcp_echo_test`'s own identical Fase 128 check -
+                    // see that helper's own doc for the `ack_num` note.
+                    if is_matching_rst(&info, target_port, SRC_PORT) {
                         serial_println!(
                             "[E1000] tcp_syn_test target={:?} port={} connection_reset=true",
                             target_ip,
@@ -1459,6 +1457,23 @@ fn parse_reply_frame(
         &[]
     };
     Some((info, payload))
+}
+
+/// Fase 131: `tcp_syn_test`'s and `tcp_echo_test`'s own Fase 128 RST checks
+/// were two independently hand-written, near-identical conditions added in
+/// the same commit - the same "duplicate logic, unify it" class Fase 118/125
+/// already found and fixed elsewhere in this exact file. Deliberately does
+/// NOT require `ack_num` to match the way a SYN-ACK does, since a real
+/// RST-to-SYN is not required to carry a valid ACK at all.
+fn is_matching_rst(
+    info: &crate::net::tcp::TcpSegmentInfo,
+    expected_source_port: u16,
+    expected_dest_port: u16,
+) -> bool {
+    use crate::net::tcp;
+    info.flags & tcp::TCP_FLAG_RST != 0
+        && info.source_port == expected_source_port
+        && info.dest_port == expected_dest_port
 }
 
 /// Fase 90: picks up exactly where `tcp_syn_test` deliberately stopped
@@ -1707,7 +1722,10 @@ pub fn tcp_echo_test(
     // attempt from a genuine timeout - see tcp_syn_test's own analogous
     // check for why this is a real, distinct outcome ("refused") worth
     // its own error rather than falling into the generic timeout
-    // message below.
+    // message below. Fase 131: the match condition itself is now the
+    // shared `is_matching_rst` helper, unified with `tcp_syn_test`'s
+    // own identical check (both hand-written independently in the same
+    // Fase 128 commit).
     let mut reset_received = false;
     let rx_start_tick = crate::interrupts::timer_ticks();
     unsafe {
@@ -1724,10 +1742,7 @@ pub fn tcp_echo_test(
                         && info.ack_num == initial_seq.wrapping_add(1);
                     if is_syn_ack {
                         peer_isn = Some(info.seq_num);
-                    } else if info.flags & tcp::TCP_FLAG_RST != 0
-                        && info.source_port == target_port
-                        && info.dest_port == src_port
-                    {
+                    } else if is_matching_rst(&info, target_port, src_port) {
                         reset_received = true;
                     }
                 }
