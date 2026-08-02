@@ -62,7 +62,7 @@
 //! builds a real question section for ANY caller-supplied hostname,
 //! closing the gap `dns_query_test`'s own Fase 106 doc left open (it
 //! only ever sent one fixed, hand-built "A? example.com" query byte
-//! array). Fase 126 further lets the caller choose which QTYPE to ask
+//! array). Fase 127 further lets the caller choose which QTYPE to ask
 //! for (`DNS_TYPE_A` or `DNS_TYPE_AAAA`), rather than always hardcoding
 //! A - still only ever a single-QUESTION query, though, the same "not a
 //! resolver" scope this module already commits to on the parsing side.
@@ -309,7 +309,7 @@ pub fn encode_qname(hostname: &str, out: &mut Vec<u8>) -> Result<(), &'static st
 /// not a general multi-question query builder, matching this module's
 /// own standing "not a resolver" scope on the parsing side.
 ///
-/// Fase 126: `qtype` is now caller-chosen (`DNS_TYPE_A` or
+/// Fase 127: `qtype` is now caller-chosen (`DNS_TYPE_A` or
 /// `DNS_TYPE_AAAA`) rather than always `DNS_TYPE_A` - otherwise Fase
 /// 124's own `parse_first_aaaa_record` could never actually be reached
 /// by a real query this kernel sends, only by a synthetic self-test

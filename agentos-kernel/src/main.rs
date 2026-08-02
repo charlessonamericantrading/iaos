@@ -2242,7 +2242,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // mis-encoded, the same discipline the answer-parse self-test above
     // already established with its own corrupted-fixture cases.
     //
-    // Fase 126: build_query's own QTYPE is now caller-chosen rather
+    // Fase 127: build_query's own QTYPE is now caller-chosen rather
     // than always DNS_TYPE_A - aaaa_query_matches_known_bytes proves a
     // real AAAA query encodes correctly too (the same fixture as
     // EXPECTED_EXAMPLE_COM_QUERY, differing only in the QTYPE field),
