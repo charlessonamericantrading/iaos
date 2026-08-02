@@ -1334,6 +1334,27 @@ pub fn tcp_syn_test(
                         );
                         return Ok(info);
                     }
+                    // Fase 128: TCP_FLAG_RST was defined but never
+                    // checked anywhere in this codebase - a real reset
+                    // for this exact connection attempt (matching both
+                    // ports) is a distinct, immediate outcome ("refused")
+                    // from "not our reply yet, keep polling" and deserves
+                    // its own error rather than silently absorbing it and
+                    // waiting out the full ~90-tick timeout. Does NOT
+                    // require matching ack_num the way a SYN-ACK does,
+                    // since a real RST-to-SYN is not required to carry
+                    // ACK at all.
+                    if info.flags & tcp::TCP_FLAG_RST != 0
+                        && info.source_port == target_port
+                        && info.dest_port == SRC_PORT
+                    {
+                        serial_println!(
+                            "[E1000] tcp_syn_test target={:?} port={} connection_reset=true",
+                            target_ip,
+                            target_port
+                        );
+                        return Err("tcp_syn_test: connection reset (RST) by peer");
+                    }
                 }
 
                 // Not our reply - rearm this same descriptor and keep
@@ -1682,6 +1703,12 @@ pub fn tcp_echo_test(
     // nothing further to wait for, whether or not the frame turns out
     // to be the expected reply.
     let mut peer_isn: Option<u32> = None;
+    // Fase 128: distinguishes a real RST for this exact connection
+    // attempt from a genuine timeout - see tcp_syn_test's own analogous
+    // check for why this is a real, distinct outcome ("refused") worth
+    // its own error rather than falling into the generic timeout
+    // message below.
+    let mut reset_received = false;
     let rx_start_tick = crate::interrupts::timer_ticks();
     unsafe {
         loop {
@@ -1697,6 +1724,11 @@ pub fn tcp_echo_test(
                         && info.ack_num == initial_seq.wrapping_add(1);
                     if is_syn_ack {
                         peer_isn = Some(info.seq_num);
+                    } else if info.flags & tcp::TCP_FLAG_RST != 0
+                        && info.source_port == target_port
+                        && info.dest_port == src_port
+                    {
+                        reset_received = true;
                     }
                 }
                 break;
@@ -1706,6 +1738,14 @@ pub fn tcp_echo_test(
             }
             x86_64::instructions::hlt();
         }
+    }
+    if reset_received {
+        serial_println!(
+            "[E1000] tcp_echo_test target={:?} port={} connection_reset=true",
+            target_ip,
+            target_port
+        );
+        return Err("tcp_echo_test: connection reset (RST) by peer");
     }
     let peer_isn =
         peer_isn.ok_or("tcp_echo_test: timed out waiting for a genuine SYN-ACK reply")?;
