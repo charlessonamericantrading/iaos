@@ -194,6 +194,29 @@ pub fn syscall_int_count() -> u64 {
     SYSCALL_INT_COUNT.load(Ordering::Relaxed)
 }
 
+/// Registers a DPL=3 interrupt gate - a real, controlled entry point
+/// FROM ring-3 code, unlike every other IDT entry in this kernel (all
+/// default to DPL=0). Uses `set_handler_addr`, NOT `set_handler_fn` -
+/// see e.g. `syscall_entry_asm`'s own doc for why: this needs raw
+/// register access `extern "x86-interrupt"` handlers can't provide.
+/// Fase 121 factors out what had been 7 near-identical hand-copied
+/// `unsafe` blocks (one per ring-3 entry vector) into this one shared
+/// helper - real duplication in the registration CODE itself, distinct
+/// from each vector's own doc explaining why it's a separate, dedicated
+/// vector (that reasoning stays real and untouched at each call site).
+///
+/// # Safety
+/// `handler_addr` must be the address of a real naked-asm entry stub
+/// that itself upholds whatever calling convention this vector's own
+/// callers expect (saving/restoring every register a raw `int` gate
+/// leaves live) - the same contract each of this function's own call
+/// sites already independently upheld before this Fase unified them.
+unsafe fn arm_dpl3_gate(idt: &mut InterruptDescriptorTable, vector: u8, handler_addr: u64) {
+    idt[vector]
+        .set_handler_addr(VirtAddr::new(handler_addr))
+        .set_privilege_level(PrivilegeLevel::Ring3);
+}
+
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
@@ -231,70 +254,68 @@ lazy_static! {
         // this needs raw register access `extern "x86-interrupt"`
         // handlers can't provide.
         unsafe {
-            idt[SYSCALL_INT_VECTOR]
-                .set_handler_addr(VirtAddr::new(syscall_entry_asm as *const () as u64))
-                .set_privilege_level(PrivilegeLevel::Ring3);
+            arm_dpl3_gate(&mut idt, SYSCALL_INT_VECTOR, syscall_entry_asm as *const () as u64);
         }
         // Same reasoning as SYSCALL_INT_VECTOR above (DPL=3, raw
         // set_handler_addr) - see RING3_EXIT_INT_VECTOR's own doc for
         // why this is a second, dedicated vector rather than folded
         // into the syscall dispatcher above.
         unsafe {
-            idt[RING3_EXIT_INT_VECTOR]
-                .set_handler_addr(VirtAddr::new(
-                    crate::ring3::ring3_exit_entry_asm as *const () as u64,
-                ))
-                .set_privilege_level(PrivilegeLevel::Ring3);
+            arm_dpl3_gate(
+                &mut idt,
+                RING3_EXIT_INT_VECTOR,
+                crate::ring3::ring3_exit_entry_asm as *const () as u64,
+            );
         }
         // Same reasoning (DPL=3, raw set_handler_addr) - see
         // RING3_TASK_EXIT_INT_VECTOR's own doc for why this is a THIRD,
         // dedicated vector rather than folded into either handler above.
         unsafe {
-            idt[RING3_TASK_EXIT_INT_VECTOR]
-                .set_handler_addr(VirtAddr::new(
-                    crate::ring3::ring3_task_exit_entry_asm as *const () as u64,
-                ))
-                .set_privilege_level(PrivilegeLevel::Ring3);
+            arm_dpl3_gate(
+                &mut idt,
+                RING3_TASK_EXIT_INT_VECTOR,
+                crate::ring3::ring3_task_exit_entry_asm as *const () as u64,
+            );
         }
         // Same reasoning (DPL=3, raw set_handler_addr) - see
         // RING3_COOP_YIELD_INT_VECTOR's own doc for why this is a
         // FOURTH, dedicated vector.
         unsafe {
-            idt[RING3_COOP_YIELD_INT_VECTOR]
-                .set_handler_addr(VirtAddr::new(
-                    crate::ring3::ring3_coop_yield_entry_asm as *const () as u64,
-                ))
-                .set_privilege_level(PrivilegeLevel::Ring3);
+            arm_dpl3_gate(
+                &mut idt,
+                RING3_COOP_YIELD_INT_VECTOR,
+                crate::ring3::ring3_coop_yield_entry_asm as *const () as u64,
+            );
         }
         // Same reasoning (DPL=3, raw set_handler_addr) - see
         // RING3_MT_TASK_DONE_INT_VECTOR's own doc for why this is a
         // FIFTH, dedicated vector.
         unsafe {
-            idt[RING3_MT_TASK_DONE_INT_VECTOR]
-                .set_handler_addr(VirtAddr::new(
-                    crate::ring3::ring3_mt_task_done_entry_asm as *const () as u64,
-                ))
-                .set_privilege_level(PrivilegeLevel::Ring3);
+            arm_dpl3_gate(
+                &mut idt,
+                RING3_MT_TASK_DONE_INT_VECTOR,
+                crate::ring3::ring3_mt_task_done_entry_asm as *const () as u64,
+            );
         }
         // Same reasoning (DPL=3, raw set_handler_addr) - see
         // RING3_COOP_TASK_DONE_INT_VECTOR's own doc for why this is a
         // SIXTH, dedicated vector.
         unsafe {
-            idt[RING3_COOP_TASK_DONE_INT_VECTOR]
-                .set_handler_addr(VirtAddr::new(
-                    crate::ring3::ring3_coop_task_done_entry_asm as *const () as u64,
-                ))
-                .set_privilege_level(PrivilegeLevel::Ring3);
+            arm_dpl3_gate(
+                &mut idt,
+                RING3_COOP_TASK_DONE_INT_VECTOR,
+                crate::ring3::ring3_coop_task_done_entry_asm as *const () as u64,
+            );
         }
         // Same reasoning (DPL=3, raw set_handler_addr) - see
         // RING3_MT_YIELD_INT_VECTOR's own doc for why this is a
         // SEVENTH, dedicated vector.
         unsafe {
-            idt[RING3_MT_YIELD_INT_VECTOR]
-                .set_handler_addr(VirtAddr::new(
-                    crate::ring3::ring3_mt_yield_entry_asm as *const () as u64,
-                ))
-                .set_privilege_level(PrivilegeLevel::Ring3);
+            arm_dpl3_gate(
+                &mut idt,
+                RING3_MT_YIELD_INT_VECTOR,
+                crate::ring3::ring3_mt_yield_entry_asm as *const () as u64,
+            );
         }
         idt
     };
