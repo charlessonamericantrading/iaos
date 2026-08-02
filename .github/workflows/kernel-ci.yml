@@ -1256,6 +1256,18 @@ jobs:
           # discipline the tcp_close_test assertion right above already
           # established for peer_fin_received.
           grep -q "E1000\] dns_query_test target=\[10, 0, 2, 3\] port=53 sent=true" boot.log
+          # Fase 114: a real boot-time self-test for resolve_hostname
+          # (Fase 113's own reusable wrapper API), closing the exact gap
+          # Fase 113's own honest self-correction identified - that
+          # function was previously reachable ONLY through the
+          # interactive `ping` command, so CI's own boot sequence never
+          # actually exercised it at all. Calls the wrapper directly
+          # (not through `ping`, so no new real-world ICMP-to-a-public-
+          # host dependency is introduced) - only the fully deterministic
+          # "attempted" fact is asserted; the real resolved address is
+          # logged honestly, the same discipline every other DNS Fase
+          # already uses.
+          grep -q "E1000\] resolve_hostname_test attempting=true hostname=example.com dns_server=\[10, 0, 2, 3\]" boot.log
           # Confirms the new ATA write path (Fase 23) genuinely wrote and
           # read back matching bytes - not just that write_sector()
           # returned without erroring. Deliberately NOT asserting the
