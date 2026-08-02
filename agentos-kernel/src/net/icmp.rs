@@ -9,13 +9,24 @@
 //! drops a packet with no visible error at all (the receiving stack just
 //! never replies, an even harder symptom to root-cause than a crash).
 //!
-//! Deliberately NOT wired to `net::e1000`'s TX/RX yet - that needs a real
-//! destination MAC address (ARP resolution, which doesn't exist yet
-//! either) and touches the already fully-proven, CI-asserted TX/RX code
-//! paths from Fase 44-46. Proving these header/checksum primitives are
-//! correct in isolation first, before anything depends on them, is the
-//! same order Fase 37/38's VFAT entry-building or Fase 21's frame
-//! allocator both followed.
+//! At the time this module was first written (Fase 47), it was
+//! deliberately NOT wired to `net::e1000`'s TX/RX - that needed a real
+//! destination MAC address (ARP resolution, which didn't exist yet
+//! either) and would have touched the already fully-proven, CI-asserted
+//! TX/RX code paths from Fase 44-46. Proving these header/checksum
+//! primitives were correct in isolation first, before anything depended
+//! on them, followed the same order Fase 37/38's VFAT entry-building or
+//! Fase 21's frame allocator both used.
+//!
+//! That gap closed at Fase 48/49: `net::e1000::arp_resolve` resolves a
+//! real destination MAC, and `net::e1000::ping` converges it with this
+//! module's own `build_ipv4_header`/`build_icmp_echo` into a real,
+//! routable ICMP echo sent over real hardware. `tcp_syn_test`,
+//! `tcp_echo_test`, and `dns_query_test` (Fase 89/90/106) all reuse this
+//! module's `build_ethernet_header`/`build_ipv4_header`/
+//! `checksum_is_valid` directly too - this remains the one place IPv4/
+//! Ethernet header assembly and RFC 1071 checksums are implemented,
+//! rather than a permanently-unused, isolated primitive.
 
 use alloc::vec::Vec;
 

@@ -4,7 +4,7 @@
 //! vendor:device 8086:100e - confirmed present via `pci.rs`'s real
 //! enumeration (see README/Fase 11).
 //!
-//! Five stages so far:
+//! Stages so far:
 //! - `probe()` (Fase 19): find the device, reach its registers, read a
 //!   couple back (STATUS, MAC via RAL0/RAH0) - proof this kernel can
 //!   genuinely talk to real device MMIO at all.
@@ -26,6 +26,16 @@
 //! - `ping()` (Fase 49): converges `arp_resolve` and `net::icmp` - the
 //!   first complete, real, routable IP packet this kernel has ever
 //!   assembled and sent, not just a raw Ethernet-level test frame.
+//! - `tcp_syn_test()`/`tcp_echo_test()` (Fase 89/90, graceful FIN close
+//!   added Fase 102): a real TCP three-way handshake, data exchange, and
+//!   connection close over `net::tcp`, reusing this module's own
+//!   `arp_resolve`-then-send-real-IP-packet pattern.
+//! - `dns_query_test()` (Fase 106): a real UDP round trip carrying a DNS
+//!   query over `net::dns`/`net::udp`, the same pattern again one layer
+//!   up the stack.
+//! - `resolve_hostname()` (Fase 113): wraps `dns_query_test`'s own
+//!   underlying round trip into a name -> `[u8; 4]` API, reused by the
+//!   `ping <hostname>` shell command.
 //!
 //! ## Why no new page-table mapping code was needed
 //! The e1000's BAR0 is a *memory-mapped* register window (not I/O-port

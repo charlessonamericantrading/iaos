@@ -325,7 +325,7 @@ pub fn init_idt() {
     IDT.load();
     kprintln!("[IDT] Native IDT Loaded into CPU Register (LIDT)");
     serial_println!("[IDT] Native IDT Loaded into CPU Register (LIDT)");
-    kprintln!("[IDT] Handlers armed: breakpoint, double-fault(IST), page-fault, GPF, divide-error, invalid-opcode, timer(IRQ0), keyboard(IRQ1), ata-primary(IRQ14), syscall-int(0x80,DPL=3)");
+    kprintln!("[IDT] Handlers armed: breakpoint, double-fault(IST), page-fault, GPF, divide-error, invalid-opcode, timer(IRQ0), keyboard(IRQ1), ata-primary(IRQ14), syscall-int(0x80,DPL=3), ring3-exit(0x81,DPL=3), ring3-task-exit(0x82,DPL=3), ring3-coop-yield(0x83,DPL=3), ring3-mt-task-done(0x84,DPL=3), ring3-coop-task-done(0x85,DPL=3), ring3-mt-yield(0x86,DPL=3)");
 }
 
 /// Remaps the 8259 PIC to `PIC_1_OFFSET..PIC_2_OFFSET+8` and unmasks IRQs.

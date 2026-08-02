@@ -1819,13 +1819,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("netcheck");
 
     // 7b-6. Test real IPv4 + ICMP echo (ping) protocol construction and
-    // parsing (net::icmp, Fase 47) - pure byte-buffer logic, deliberately
-    // NOT wired to e1000's TX/RX yet (that needs a real destination MAC,
-    // i.e. ARP resolution, which doesn't exist yet either - separate,
-    // larger scope). Proves the primitive is correct in isolation first,
-    // the same order Fase 21's frame allocator or Fase 37/38's VFAT
-    // entry-building both used before anything downstream depended on
-    // them.
+    // parsing (net::icmp, Fase 47) - pure byte-buffer logic. At Fase 47
+    // this was deliberately NOT wired to e1000's TX/RX yet (that needed a
+    // real destination MAC, i.e. ARP resolution, which didn't exist yet
+    // either); Fase 48/49 closed that gap for real (net::e1000::
+    // arp_resolve + net::e1000::ping below reuse these exact primitives
+    // over real hardware). Proving the primitive was correct in isolation
+    // first, before that dependency existed, followed the same order
+    // Fase 21's frame allocator or Fase 37/38's VFAT entry-building both
+    // used.
     //
     // checksum_even_case_ok/checksum_odd_case_ok are hand-computed
     // vectors, NOT round-trip checks - a round-trip test (build then
