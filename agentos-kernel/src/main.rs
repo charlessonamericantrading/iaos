@@ -2894,6 +2894,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ring3_switchto_code
     );
 
+    // Fase 83: two ring-3 tasks cooperatively interleaving via a new
+    // voluntary yield vector (0x83) - the lower-risk stepping stone
+    // toward genuine ring-3 scheduling this kernel's own ring-0 history
+    // already validated (cooperative before preemptive). Zero changes to
+    // the timer interrupt path; reuses Fase 81's own switch_to-bootstrap
+    // mechanism entirely. Spawns no PCB entries either, same as Fase 81.
+    kprintln!(
+        "[KERNEL INIT] Testing two ring-3 tasks cooperatively interleaving via a new yield vector..."
+    );
+    let (ring3_coop_code, ring3_coop_sig) = ring3::run_ring3_cooperative_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - cooperative test returned exit_code={} signature={:02x?}",
+        ring3_coop_code,
+        ring3_coop_sig
+    );
+
     kprintln!("==================================================");
     kprintln!("  [SUCCESS] AgentOS Native Kernel Boot Sequence Complete ");
     kprintln!("  [SHELL] AgentOS Native Console Ready. Type commands: ");

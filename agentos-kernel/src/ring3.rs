@@ -988,3 +988,330 @@ pub fn run_ring3_switchto_bootstrap_test() -> u64 {
 
     exit_code
 }
+
+// ---- Fase 83: COOPERATIVE ring-3 multi-tasking - two ring-3 programs
+// voluntarily interleaving via a NEW yield vector, neither ever running
+// to completion in one shot the way every ring-3 mechanism above does ----
+//
+// Mirrors this kernel's OWN ring-0 scheduling history: cooperative
+// multi-tasking (Fase 15/28) came BEFORE preemptive, timer-driven
+// multi-tasking (Fase 31/32) - genuine mid-flight, ASYNCHRONOUS
+// preemption of ring-3 code (interrupted at an arbitrary point by a
+// timer tick, not a point the program itself chose) remains real,
+// separate, substantially larger follow-on work (it needs the timer
+// handler itself to become a full-GPR-saving naked stub, not just the
+// `bool` flag Fase 79/80 threaded through the existing one). This Fase
+// takes the SAME lower-risk path the ring-0 scheduler's own history
+// already validated: prove VOLUNTARY, COOPERATIVE interleaving first,
+// entirely by reusing Fase 81's own already-proven switch_to-bootstrap
+// mechanism, with ZERO changes to the timer interrupt path at all.
+//
+// The mechanism: a FOURTH dedicated DPL=3 vector (`RING3_COOP_YIELD_INT_
+// VECTOR` = 0x83, interrupts.rs) whose handler, `ring3_coop_yield_entry_
+// asm`, does exactly what `switch_to` itself does (push 6 callee-saved
+// registers, save the resulting RSP, load a NEW RSP, pop that task's own
+// 6 registers, `ret`) - except it ALSO pushes a "return address" of
+// `ring3_entry_trampoline` first (the SAME trampoline Fase 81's own
+// `prepare_ring3_initial_stack` targets), since unlike an ordinary
+// `switch_to` call site (which already has a real return address on the
+// stack from its own `call` instruction), a raw interrupt entry has none
+// - manufacturing one here means a YIELDED task's own saved stack ends
+// up in the EXACT SAME 12-quadword shape (6 GPRs + trampoline address +
+// 5-field iretq frame) a FRESHLY bootstrapped one already has, so the
+// SAME resume path (switch_to landing on the trampoline's bare `iretq`)
+// correctly handles EITHER case with no special-casing.
+//
+// Only the SAME 6 registers `switch_to` already guarantees (rbp, rbx,
+// r12-r15) survive a yield - deliberately NOT a full-GPR save (that
+// remains real, separate follow-on work for genuine async preemption,
+// where the interrupted program never got a chance to arrange its own
+// live values into "safe" registers the way voluntary-yield code can).
+// The test's own two ring-3 "programs" are written with this convention
+// in mind: `bl` (the task's own identity, 0 or 1) and `r12` (a shared
+// buffer address) are the only state that needs to survive a yield, and
+// both are deliberately kept in the preserved set.
+
+static mut RING3_COOP_TASK_RSP: [u64; 2] = [0, 0];
+static mut RING3_COOP_CURRENT: usize = 0;
+
+/// Entry point for vector 0x83 - a ring-3 task's voluntary "let someone
+/// else run for a while" signal. Structurally its own thing, not a
+/// variant of `ring3_task_exit_entry_asm` (0x82): that one discards the
+/// yielding context entirely and resumes a plain Rust caller; this one
+/// PRESERVES the yielding context (by manufacturing the same fake
+/// "return-to-trampoline" frame `prepare_ring3_initial_stack` already
+/// establishes for fresh tasks - see this section's own doc) and resumes
+/// a DIFFERENT ring-3 task instead of ring-0 at all.
+///
+/// `mov rdi, rsp` / `call {helper}` mid-sequence is the same "call an
+/// ordinary Rust function from within a naked stub" pattern `syscall_
+/// entry_asm` already established (Fase 72) - `ring3_coop_yield_helper`
+/// below is a completely normal (non-naked) function, so all the
+/// bookkeeping logic (which task is current, updating the saved-RSP
+/// table) is exactly as safe to write as any other Rust in this
+/// codebase; only the raw register save/restore around it is naked asm.
+/// Stack alignment verified by hand before writing this, the same
+/// discipline `syscall_entry_asm`'s own doc already established: the
+/// CPU's own cross-privilege interrupt entry pushes 5 fields (40 bytes),
+/// this stub then pushes 7 more (trampoline address + 6 GPRs, 56 bytes) -
+/// 96 bytes total, an exact multiple of 16, so the SysV-required
+/// 16-byte-aligned-before-`call` invariant holds given RSP0's own
+/// configured top is itself 16-aligned (already relied upon, proven
+/// working, by `syscall_entry_asm`'s own identical reasoning).
+#[unsafe(naked)]
+pub(crate) extern "C" fn ring3_coop_yield_entry_asm() {
+    naked_asm!(
+        "lea rax, [rip + {trampoline}]",
+        "push rax",
+        "push rbp",
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "call {helper}",
+        "mov rsp, rax",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+        trampoline = sym ring3_entry_trampoline,
+        helper = sym ring3_coop_yield_helper,
+    );
+}
+
+/// Copies the yielding task's own just-built 96-byte snapshot (6 GPRs +
+/// trampoline address + 5-field iretq frame - built by the naked stub
+/// above, in the exact same shape a fresh `prepare_ring3_initial_stack`
+/// bootstrap already uses) OFF of RSP0 and into that task's OWN fixed,
+/// dedicated parking location (`RING3_COOP_TASK_RSP[cur]`, set ONCE at
+/// startup to that task's own `prepare_ring3_initial_stack`-returned
+/// address and never changed afterward), alternates `RING3_COOP_CURRENT`
+/// between the only two slots this first proof supports, and returns the
+/// OTHER task's own fixed location - either holding a previously-yielded
+/// snapshot in that same shape (copied there by ITS OWN earlier yield),
+/// or, the first time it's ever resumed, its own still-untouched fresh
+/// bootstrap.
+///
+/// **A real bug, caught by the very first boot test, not assumed
+/// correct**: the first version of this function saved `current_rsp`
+/// itself (a pointer INTO RSP0) into `RING3_COOP_TASK_RSP[cur]`, instead
+/// of copying the bytes it points at anywhere else. That's broken
+/// because RSP0 is NOT a per-task resource - the CPU reloads it fresh
+/// from the TSS's own fixed field on EVERY ring3->ring0 transition
+/// (never from wherever a previous handler happened to leave RSP), so a
+/// SECOND task's own yield reuses the EXACT SAME memory the first task's
+/// "saved" pointer still referred to, silently overwriting it before it
+/// was ever read back. Caught directly by this Fase's own signature-byte
+/// test: the expected `[0x41, 0x42, 0x43]` ("ABC") came back
+/// `[0x41, 0x42, 0x44]` - task 0's resume showed `bl=1` (task 1's own
+/// value) instead of its own `bl=0`, exactly what reading task 1's own
+/// (RSP0-overlapping) snapshot instead of task 0's would produce. Fixed
+/// by copying the 96 bytes into each task's own dedicated, never-shared
+/// kernel stack memory (the exact fix this doc now describes) rather
+/// than just remembering where they transiently were.
+///
+/// Deliberately hardcoded to exactly 2 tasks, alternating unconditionally.
+/// A real N-task ring-3 scheduler (priority, more than 2 tasks, one task
+/// exiting while another keeps running) is real, separate, more
+/// substantial follow-on work; this function's only job is proving the
+/// mechanism itself is correct.
+extern "C" fn ring3_coop_yield_helper(current_rsp: u64) -> u64 {
+    unsafe {
+        let current_ptr = core::ptr::addr_of_mut!(RING3_COOP_CURRENT);
+        let cur = *current_ptr;
+        let tasks = core::ptr::addr_of!(RING3_COOP_TASK_RSP);
+        let dest = (*tasks)[cur];
+        core::ptr::copy_nonoverlapping(current_rsp as *const u8, dest as *mut u8, 96);
+        let next = 1 - cur;
+        *current_ptr = next;
+        (*tasks)[next]
+    }
+}
+
+/// Proves two ring-3 "tasks" can genuinely interleave via voluntary
+/// yields, not just enter-and-run-to-completion one at a time. Both
+/// tasks share the SAME instruction bytes (the same "N tasks, shared
+/// code, distinct identity" shape `scheduler::preemptive`'s own
+/// `preempt_task_body(id)` already established for ring-0) - each has a
+/// tiny, distinct prologue (loading its own task id into `bl` and a
+/// shared signature-buffer address into `r12`) before jumping into
+/// shared logic, rather than needing a genuinely second user-accessible
+/// code page (real, separate follow-on work - `memory::user_page`'s own
+/// doc already notes this kernel has exactly one such page).
+///
+/// Real proof of correct interleaving, not just "nothing crashed": task
+/// 0 enters first (via the ordinary Fase 81 switch_to-bootstrap), writes
+/// `'A'` (0x41) to the shared buffer, then yields (int 0x83) - resuming
+/// task 1 for the very first time (its own fresh bootstrap, reached ONLY
+/// via a yield, never a direct switch_to call from Rust - proving the
+/// yield path itself can originate a task's first run, not merely
+/// hand off between two already-started ones). Task 1 writes `'B'`
+/// (0x42, its own id folded into the same shared instruction via `bl`),
+/// then yields BACK - resuming task 0 exactly where it left off. Task
+/// 0's second run writes `'C'` (0x43) - real proof `bl` (its own task
+/// id) survived the full round trip through task 1 and back - then
+/// exits via the existing Fase 81 vector with `exit_code=42`. Task 1 is
+/// deliberately never resumed again after its own single yield (its
+/// kernel-side bootstrap stack is simply abandoned, freed once this
+/// function returns) - a real N-task scheduler that keeps every task
+/// alive indefinitely is the separate, more substantial follow-on work
+/// this Fase's own module doc already names.
+///
+///   Task 0 entry (offset 0):  mov r12, sig_addr -> 49 BC + imm64
+///                             mov bl, 0         -> B3 00
+///                             jmp +0x12         -> EB 12  (-> offset 32)
+///   Task 1 entry (offset 16): mov r12, sig_addr -> 49 BC + imm64
+///                             mov bl, 1         -> B3 01
+///                             jmp +0x02         -> EB 02  (-> offset 32)
+///   Shared body (offset 32):  mov al, bl        -> 8A C3
+///                             add al, 0x41      -> 04 41
+///                             mov [r12+rbx], al -> 41 88 04 1C
+///                             int 0x83 (yield)  -> CD 83
+///                             mov al, bl        -> 8A C3
+///                             add al, 0x43      -> 04 43
+///                             mov [r12+2], al   -> 41 88 44 24 02
+///                             mov eax, 42       -> B8 2A 00 00 00
+///                             int 0x82 (exit)   -> CD 82
+pub fn run_ring3_cooperative_test() -> (u64, [u8; 3]) {
+    let info = gdt::ring3_info();
+    let user_cs = info.user_code_selector as u64;
+    let user_ss = info.user_data_selector as u64;
+
+    let code_addr = USER_TEST_PAGE_ADDR;
+    const SIG_OFFSET: u64 = 600;
+    let sig_addr = code_addr + SIG_OFFSET;
+    let sig_bytes = sig_addr.to_le_bytes();
+
+    let mut program = [0u8; 58];
+    program[0] = 0x49;
+    program[1] = 0xBC; // mov r12, imm64
+    program[2..10].copy_from_slice(&sig_bytes);
+    program[10] = 0xB3;
+    program[11] = 0x00; // mov bl, 0
+    program[12] = 0xEB;
+    program[13] = 0x12; // jmp +0x12 -> offset 32
+    program[16] = 0x49;
+    program[17] = 0xBC; // mov r12, imm64
+    program[18..26].copy_from_slice(&sig_bytes);
+    program[26] = 0xB3;
+    program[27] = 0x01; // mov bl, 1
+    program[28] = 0xEB;
+    program[29] = 0x02; // jmp +0x02 -> offset 32
+    program[32] = 0x8A;
+    program[33] = 0xC3; // mov al, bl
+    program[34] = 0x04;
+    program[35] = 0x41; // add al, 0x41
+    program[36] = 0x41;
+    program[37] = 0x88;
+    program[38] = 0x04;
+    program[39] = 0x1C; // mov [r12+rbx], al
+    program[40] = 0xCD;
+    program[41] = 0x83; // int 0x83 (yield)
+    program[42] = 0x8A;
+    program[43] = 0xC3; // mov al, bl
+    program[44] = 0x04;
+    program[45] = 0x43; // add al, 0x43
+    program[46] = 0x41;
+    program[47] = 0x88;
+    program[48] = 0x44;
+    program[49] = 0x24;
+    program[50] = 0x02; // mov [r12+2], al
+    program[51] = 0xB8;
+    program[52] = 0x2A;
+    program[53] = 0x00;
+    program[54] = 0x00;
+    program[55] = 0x00; // mov eax, 42
+    program[56] = 0xCD;
+    program[57] = 0x82; // int 0x82 (exit)
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(program.as_ptr(), code_addr as *mut u8, program.len());
+        core::ptr::write_bytes(sig_addr as *mut u8, 0, 3);
+    }
+
+    let task0_entry = code_addr;
+    let task1_entry = code_addr + 16;
+    let task0_stack_top = code_addr + 2048;
+    let task1_stack_top = code_addr + 3072;
+
+    let mut kernel_stack0 = alloc::boxed::Box::new([0u8; 16 * 1024]);
+    let mut kernel_stack1 = alloc::boxed::Box::new([0u8; 16 * 1024]);
+    let k0_top = unsafe { kernel_stack0.as_mut_ptr().add(16 * 1024) };
+    let k1_top = unsafe { kernel_stack1.as_mut_ptr().add(16 * 1024) };
+
+    let rsp0 = unsafe {
+        prepare_ring3_initial_stack(
+            k0_top,
+            task0_entry,
+            user_cs,
+            user_ss,
+            task0_stack_top,
+            RING3_TEST_RFLAGS,
+        )
+    };
+    let rsp1 = unsafe {
+        prepare_ring3_initial_stack(
+            k1_top,
+            task1_entry,
+            user_cs,
+            user_ss,
+            task1_stack_top,
+            RING3_TEST_RFLAGS,
+        )
+    };
+
+    unsafe {
+        let tasks = core::ptr::addr_of_mut!(RING3_COOP_TASK_RSP);
+        (*tasks)[0] = rsp0;
+        (*tasks)[1] = rsp1;
+        *core::ptr::addr_of_mut!(RING3_COOP_CURRENT) = 0;
+    }
+
+    kprintln!(
+        "[RING3] Attempting two ring-3 tasks cooperatively interleaving via a new yield vector (0x83)..."
+    );
+    serial_println!(
+        "[RING3] ring3_cooperative_test task0_entry={:#x} task1_entry={:#x} sig_addr={:#x}",
+        task0_entry,
+        task1_entry,
+        sig_addr
+    );
+
+    unsafe {
+        crate::scheduler::context_switch::switch_to(
+            core::ptr::addr_of_mut!(RING3_TASK_CALLER_RSP),
+            rsp0,
+        );
+    }
+    // Resumes HERE once task 0 exits via int 0x82, after its own real
+    // round trip through task 1 and back.
+
+    let exit_code = unsafe { core::ptr::addr_of!(RING3_TASK_EXIT_CODE).read() };
+    let mut sig = [0u8; 3];
+    unsafe {
+        sig[0] = core::ptr::read_volatile(sig_addr as *const u8);
+        sig[1] = core::ptr::read_volatile((sig_addr + 1) as *const u8);
+        sig[2] = core::ptr::read_volatile((sig_addr + 2) as *const u8);
+    }
+
+    drop(kernel_stack0);
+    drop(kernel_stack1);
+
+    kprintln!(
+        "[RING3] Back in ring-0 - cooperative test exit_code={} signature={:02x?} (expected [41, 42, 43] = \"ABC\")",
+        exit_code,
+        sig
+    );
+    serial_println!(
+        "[RING3] ring3_cooperative_test exit_code={} signature={:02x?}",
+        exit_code,
+        sig
+    );
+
+    (exit_code, sig)
+}

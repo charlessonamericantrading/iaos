@@ -110,6 +110,17 @@ pub const RING3_EXIT_INT_VECTOR: u8 = 0x81;
 /// against once; the same reasoning applies again here.
 pub const RING3_TASK_EXIT_INT_VECTOR: u8 = 0x82;
 
+/// A FOURTH DPL=3 vector (Fase 83) - a switch_to-bootstrapped ring-3
+/// task's voluntary YIELD signal (as opposed to RING3_TASK_EXIT_INT_
+/// VECTOR's own voluntary EXIT), letting two such tasks cooperatively
+/// interleave instead of always running to completion uninterrupted.
+/// Structurally different from every vector above it (this one resumes
+/// a DIFFERENT ring-3 task's own saved context, not a plain Rust caller
+/// via either convention those two already use) - same "one dedicated
+/// vector per structurally-different behavior" reasoning that already
+/// justified keeping 0x81/0x82 apart from 0x80 and from each other.
+pub const RING3_COOP_YIELD_INT_VECTOR: u8 = 0x83;
+
 /// Counts real invocations of the DPL=3 syscall gate - lets a self-test
 /// verify the gate genuinely fired (not just "the CPU didn't crash"),
 /// the same reasoning `TIMER_TICKS` already established for verifying
@@ -168,6 +179,16 @@ lazy_static! {
             idt[RING3_TASK_EXIT_INT_VECTOR]
                 .set_handler_addr(VirtAddr::new(
                     crate::ring3::ring3_task_exit_entry_asm as *const () as u64,
+                ))
+                .set_privilege_level(PrivilegeLevel::Ring3);
+        }
+        // Same reasoning (DPL=3, raw set_handler_addr) - see
+        // RING3_COOP_YIELD_INT_VECTOR's own doc for why this is a
+        // FOURTH, dedicated vector.
+        unsafe {
+            idt[RING3_COOP_YIELD_INT_VECTOR]
+                .set_handler_addr(VirtAddr::new(
+                    crate::ring3::ring3_coop_yield_entry_asm as *const () as u64,
                 ))
                 .set_privilege_level(PrivilegeLevel::Ring3);
         }
