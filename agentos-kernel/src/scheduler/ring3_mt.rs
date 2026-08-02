@@ -53,8 +53,16 @@
 //! original, unmodified `RING3_EXIT_INT_VECTOR` mechanism (see `run_
 //! multitasking`'s own doc for why this is what keeps the selection
 //! search from ever coming up empty).
+//!
+//! **Fase 97 moves `select_next` itself out to `scheduler::tier_select`**,
+//! shared with `ring3::coop_select_next`'s own former twin - the two were
+//! byte-for-byte identical, only ever parameterized on this module's own
+//! `RING3_MT_MAX_TASKS` vs `ring3.rs`'s separate `RING3_COOP_MAX_TASKS`.
+//! `tick` and `task_done` below call the shared version exactly as they
+//! called the old local one; no behavior changes here at all.
 
 use crate::scheduler::process::Priority;
+use crate::scheduler::tier_select::select_next;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Real, fixed headroom for how many ring-3 tasks this mechanism can
@@ -100,35 +108,6 @@ static mut RING3_MT_TASK_PRIORITY: [u8; RING3_MT_MAX_TASKS] = [0; RING3_MT_MAX_T
 /// exits through the separate, unmodified `RING3_EXIT_INT_VECTOR` path
 /// instead. Reset to all-`false` by every `run_multitasking` call.
 static mut RING3_MT_TASK_DONE: [bool; RING3_MT_MAX_TASKS] = [false; RING3_MT_MAX_TASKS];
-
-/// Shared by `tick` and `task_done` (Fase 93): finds the highest actual
-/// priority among ACTIVE, NOT-YET-DONE slots (lowest `Priority` enum
-/// value wins, matching `scheduler::preemptive`'s own convention), then
-/// round-robins only within that top tier, starting right after
-/// `current` and wrapping - identical to the tier search Fase 92
-/// introduced, just now also skipping any slot `done` already marks
-/// retired. Guaranteed to terminate having found a real candidate:
-/// task 0's own slot is never marked done (see `RING3_MT_TASK_DONE`'s
-/// own doc), so at least one non-done slot always exists as long as
-/// this mechanism is still enabled at all.
-fn select_next(
-    active_tasks: usize,
-    current: usize,
-    prios: &[u8; RING3_MT_MAX_TASKS],
-    done: &[bool; RING3_MT_MAX_TASKS],
-) -> usize {
-    let mut top = u8::MAX;
-    for i in 0..active_tasks {
-        if !done[i] && prios[i] < top {
-            top = prios[i];
-        }
-    }
-    let mut next = (current + 1) % active_tasks;
-    while done[next] || prios[next] != top {
-        next = (next + 1) % active_tasks;
-    }
-    next
-}
 
 /// Called from `interrupts::handle_timer_tick` for every tick that
 /// interrupts ring-3 code, chained immediately after `ring3_preempt::

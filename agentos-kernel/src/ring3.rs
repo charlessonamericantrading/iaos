@@ -1060,33 +1060,13 @@ static mut RING3_COOP_TASK_PRIORITY: [u8; RING3_COOP_MAX_TASKS] = [0; RING3_COOP
 /// OTHER mechanism.
 static mut RING3_COOP_TASK_DONE: [bool; RING3_COOP_MAX_TASKS] = [false; RING3_COOP_MAX_TASKS];
 
-/// Fase 96: shared by `ring3_coop_yield_helper` and `ring3_coop_task_
-/// done_helper` - the SAME tier-search-then-round-robin algorithm Fase
-/// 95 already ported from `scheduler::ring3_mt`, now also skipping any
-/// slot `done` marks retired, mirroring `scheduler::ring3_mt::select_
-/// next`'s own identical extension in Fase 93. Guaranteed to terminate
-/// having found a real candidate for the same reason that mechanism's
-/// own helper is: task 0's own slot is never marked done (see `RING3_
-/// COOP_TASK_DONE`'s own doc), so at least one non-done slot always
-/// exists as long as this mechanism is enabled at all.
-fn coop_select_next(
-    active_tasks: usize,
-    current: usize,
-    prios: &[u8; RING3_COOP_MAX_TASKS],
-    done: &[bool; RING3_COOP_MAX_TASKS],
-) -> usize {
-    let mut top = u8::MAX;
-    for i in 0..active_tasks {
-        if !done[i] && prios[i] < top {
-            top = prios[i];
-        }
-    }
-    let mut next = (current + 1) % active_tasks;
-    while done[next] || prios[next] != top {
-        next = (next + 1) % active_tasks;
-    }
-    next
-}
+// Fase 97: `ring3_coop_yield_helper` and `ring3_coop_task_done_helper`
+// below now call `scheduler::tier_select::select_next` directly - this
+// used to be its own local copy of that exact algorithm (ported from
+// `scheduler::ring3_mt::select_next` across Fase 95/96), byte-for-byte
+// identical except for which `MAX_TASKS` constant it closed over. See
+// `tier_select`'s own module doc for why that made it a real, safe
+// unification target rather than just a coincidence.
 
 /// Entry point for vector 0x83 - a ring-3 task's voluntary "let someone
 /// else run for a while" signal. Structurally its own thing, not a
@@ -1218,7 +1198,7 @@ extern "C" fn ring3_coop_yield_helper(current_rsp: u64) -> u64 {
         let active_tasks = *core::ptr::addr_of!(RING3_COOP_ACTIVE_TASKS);
         let prios: &[u8; RING3_COOP_MAX_TASKS] = &*core::ptr::addr_of!(RING3_COOP_TASK_PRIORITY);
         let done: &[bool; RING3_COOP_MAX_TASKS] = &*core::ptr::addr_of!(RING3_COOP_TASK_DONE);
-        let next = coop_select_next(active_tasks, cur, prios, done);
+        let next = crate::scheduler::tier_select::select_next(active_tasks, cur, prios, done);
         *current_ptr = next;
         (*tasks)[next]
     }
@@ -1286,7 +1266,7 @@ extern "C" fn ring3_coop_task_done_helper(current_rsp: u64) -> u64 {
         let active_tasks = *core::ptr::addr_of!(RING3_COOP_ACTIVE_TASKS);
         let prios: &[u8; RING3_COOP_MAX_TASKS] = &*core::ptr::addr_of!(RING3_COOP_TASK_PRIORITY);
         let done: &[bool; RING3_COOP_MAX_TASKS] = &*core::ptr::addr_of!(RING3_COOP_TASK_DONE);
-        let next = coop_select_next(active_tasks, cur, prios, done);
+        let next = crate::scheduler::tier_select::select_next(active_tasks, cur, prios, done);
 
         *current_ptr = next;
         (*tasks)[next]

@@ -4,3 +4,4 @@ pub mod preemptive;
 pub mod process;
 pub mod ring3_mt;
 pub mod ring3_preempt;
+pub mod tier_select;
