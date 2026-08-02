@@ -1206,7 +1206,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
-    // 5b-8. Test real GGUF Q8_K super-block quantized tensor decoding
+    // 5b-10. Test real GGUF Q8_K super-block quantized tensor decoding
     // (Fase 67) - the LAST defined K-quant, and, despite being numbered
     // last, structurally the simplest of the whole family: no bit-
     // packing at all, a plain f32 delta (not f16, unlike every other
@@ -2652,7 +2652,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("ls");
     shell::dispatch_command("cat KERNEL~1");
 
-    // 7b-4. Real ATA PIO sector write - prerequisite for any future FAT
+    // 7d-1. Real ATA PIO sector write - prerequisite for any future FAT
     // write support, same relationship Fase 21's frame allocator had to
     // e1000 TX. Writes a recognizable test pattern to a sector safely
     // within the FAT12 partition's likely-unused tail (well past where
@@ -2702,7 +2702,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // 7b-5. Real FAT12 file write, built on the ATA write primitive above
+    // 7d-2. Real FAT12 file write, built on the ATA write primitive above
     // - the simplest possible case: overwrite an EXISTING file's content
     // with new data of the exact same length, reusing its existing
     // cluster chain as-is (no FAT/directory-entry changes). Creating a
@@ -2791,7 +2791,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // 7b-6. Real FAT12 file CREATION - genuinely new, not an overwrite of
+    // 7d-3. Real FAT12 file CREATION - genuinely new, not an overwrite of
     // something that already existed (Fase 24 covered that case). Built
     // on new free-cluster/free-directory-entry search logic, scoped to
     // files that fit in one cluster with a short (8.3) name. Creates
@@ -2853,7 +2853,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
-    // 7b-7. Real FAT12 file DELETION - frees a file's whole cluster chain
+    // 7d-4. Real FAT12 file DELETION - frees a file's whole cluster chain
     // (each FAT entry set back to 0x000) and marks its directory entry
     // deleted (0xE5). Uses its own dedicated test file ("DELETEME.TXT")
     // rather than touching AGENTOS.TXT above, so this test's cleanup
@@ -2902,7 +2902,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
-    // 7b-8. Real shell-command-level file create/read/delete - proves the
+    // 7d-5. Real shell-command-level file create/read/delete - proves the
     // *interactive* path (dispatch_command parsing an actual typed line),
     // not just the underlying Fat12Info methods the tests above already
     // exercise directly. Before this, a real person at the AgentOS>
@@ -2917,7 +2917,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("cat SHELLNEW.TXT");
     shell::dispatch_command("ls");
 
-    // 7b-9. Real FAT12 MULTI-CLUSTER file creation - create_file previously
+    // 7d-6. Real FAT12 MULTI-CLUSTER file creation - create_file previously
     // only handled files that fit in a single cluster (1024 bytes on this
     // disk's 2-sector clusters); this proves it now allocates and chains
     // several. Content is a deterministic byte pattern (not a giant string
@@ -2989,7 +2989,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
-    // 7b-10. Real FAT12 file RESIZE (grow AND shrink) - write_file
+    // 7d-7. Real FAT12 file RESIZE (grow AND shrink) - write_file
     // previously only supported overwriting a file with exactly the same
     // amount of data; this proves it can now also grow (append new
     // clusters to the chain) and shrink (free trailing clusters) an
@@ -3067,7 +3067,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
-    // 7b-11. Real FAT12 subdirectory creation and listing - mkdir
+    // 7d-8. Real FAT12 subdirectory creation and listing - mkdir
     // allocates a real cluster holding "." (self) and ".." (parent,
     // cluster 0 meaning "the root") entries, the real FAT convention for
     // a directory - distinct from a plain file's cluster, which just
@@ -3088,7 +3088,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("ls");
     shell::dispatch_command("ls TESTDIR");
 
-    // 7b-12. Real FAT12 subdirectory DELETION - frees a directory's
+    // 7d-9. Real FAT12 subdirectory DELETION - frees a directory's
     // cluster and marks its root entry deleted, refusing to delete a
     // non-empty one (checked via its own "."/".." -only content). Uses
     // its own dedicated directory ("RMDTEST"), fully self-cleaning -
@@ -3101,7 +3101,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("ls");
     shell::dispatch_command("ls RMDTEST");
 
-    // 7b-14. Real FAT12 file I/O INSIDE a subdirectory - create_file/
+    // 7d-10. Real FAT12 file I/O INSIDE a subdirectory - create_file/
     // read_file/write_file/delete_file previously only ever operated on
     // the root directory; the new _in variants (create_file_in/
     // read_file_in/write_file_in/delete_file_in) target an arbitrary
@@ -3189,7 +3189,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
-    // 7b-15. Real shell-level file I/O via a DIR/FILE path - touch/cat/rm
+    // 7d-11. Real shell-level file I/O via a DIR/FILE path - touch/cat/rm
     // now understand "DIRNAME/FILENAME.EXT" (one level deep), reaching a
     // subdirectory's file through the REAL dispatch_command parsing path
     // (split_path + resolve_dir_cluster in shell.rs), not by calling
@@ -3205,7 +3205,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("rmdir PATHTEST");
     shell::dispatch_command("ls");
 
-    // 7b-16. Real NESTED FAT12 subdirectories - create_directory/
+    // 7d-12. Real NESTED FAT12 subdirectories - create_directory/
     // delete_directory now accept a parent directory location (root OR
     // another subdirectory's cluster), the exact same DirLocation
     // pattern Fase 34 used for file I/O. The one thing genuinely
@@ -3289,7 +3289,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
-    // 7b-17. Real FAT12 subdirectory GROWTH - create_file_in/
+    // 7d-13. Real FAT12 subdirectory GROWTH - create_file_in/
     // create_directory_in previously failed once a subdirectory's single
     // cluster ran out of free entry slots; find_free_entry_in now
     // allocates and chains a fresh cluster onto the directory
@@ -3382,7 +3382,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // 7b-2. Test VFAT Long File Names (create, display, lookup by EITHER
+    // 7e-1. Test VFAT Long File Names (create, display, lookup by EITHER
     // name, delete) "long name.txt" is exactly 13 characters - this
     // Fase's one-chunk limit, deliberately tested right at the boundary
     // rather than comfortably under it. Doesn't fit 8.3 (a space, and 9
@@ -3460,7 +3460,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
-    // 7b-3. Test Multi-Segment Shell Paths ("A/B/FILE", any number of
+    // 7e-2. Test Multi-Segment Shell Paths ("A/B/FILE", any number of
     // levels deep) - through the REAL dispatch_command parsing path, not
     // by calling Fat12Info's own already-nesting-capable _in methods
     // directly (Fase 36 proved those work; this proves the *shell* can
@@ -3486,7 +3486,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("rmdir MULTIOUT");
     shell::dispatch_command("ls");
 
-    // 7b-4. Test Multi-Chunk VFAT Long File Names (>13 characters, needing
+    // 7e-3. Test Multi-Chunk VFAT Long File Names (>13 characters, needing
     // several chained long-name entries instead of the one Fase 38 could
     // build). "a very long descriptive name.txt" is 32 characters - past
     // the old 13-character cap, needing ceil(32/13)=3 long entries
