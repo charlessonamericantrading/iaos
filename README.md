@@ -63,15 +63,17 @@ cargo build --release
 ./target/release/kernel-runner "../agentos-kernel/target/x86_64-unknown-none/release/agentos-kernel" "../agentos-kernel/target/disk-image"
 
 # 3. Boot it
-qemu-system-x86_64 -drive format=raw,file=../agentos-kernel/target/disk-image/agentos-bios.img
+qemu-system-x86_64 -drive format=raw,file=../agentos-kernel/target/disk-image/agentos-bios.img -netdev user,id=e1000net,guestfwd=tcp:10.0.2.100:9999-cmd:cat -device e1000,netdev=e1000net -netdev user,id=virtionet -device virtio-net-pci,netdev=virtionet
 ```
 
-Or just run [`agentos-kernel/boot_kernel.bat`](agentos-kernel/boot_kernel.bat), which automates all three steps and opens an interactive QEMU window.
+Or just run [`agentos-kernel/boot_kernel.bat`](agentos-kernel/boot_kernel.bat), which automates all three steps (including the same NIC flags above) and opens an interactive QEMU window.
+
+The `-netdev`/`-device` flags above attach the real e1000 and VirtIO-net devices this kernel's TCP/UDP/DNS/ARP/ping self-tests (see the status table above) depend on - without them the kernel still boots fine, but every one of those network self-tests reports a timeout instead, since no NIC is attached at all.
 
 For a headless run with serial output captured to your terminal instead:
 
 ```bash
-qemu-system-x86_64 -drive format=raw,file=agentos-kernel/target/disk-image/agentos-bios.img -serial stdio -display none -no-reboot -no-shutdown
+qemu-system-x86_64 -drive format=raw,file=agentos-kernel/target/disk-image/agentos-bios.img -serial stdio -display none -no-reboot -no-shutdown -netdev user,id=e1000net,guestfwd=tcp:10.0.2.100:9999-cmd:cat -device e1000,netdev=e1000net -netdev user,id=virtionet -device virtio-net-pci,netdev=virtionet
 ```
 
 ## Running the TypeScript dashboard simulator
