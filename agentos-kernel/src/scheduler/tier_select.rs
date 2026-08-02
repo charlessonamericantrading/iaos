@@ -48,3 +48,47 @@ pub fn select_next<const N: usize>(
     }
     next
 }
+
+/// Fase 111: a second slice of the same unification this module started
+/// in Fase 97 - the "arm" step both mechanisms need before a run starts
+/// turned out to be the identical shape too, once looked at directly
+/// rather than assumed different because the two mechanisms' own
+/// context formats are: write each task's own (opaque `u64` slot value,
+/// priority) pair into the parallel `slots`/`priorities` arrays, then
+/// zero the ENTIRE `done` array fresh (not just the first `tasks.len()`
+/// entries - a prior run in the same boot could have left later slots
+/// marked done, and nothing else ever clears them besides a fresh arm).
+///
+/// `ring3::arm_ring3_coop_tasks` (Fase 101) already took its `slots`
+/// value as an already-computed RSP (`prepare_ring3_initial_stack`
+/// builds it separately); `ring3_mt::run_multitasking` (Fase 91) instead
+/// boxes a fresh 160-byte context per task and passes each box's OWN
+/// address - genuinely different ownership/allocation stories, which is
+/// exactly why this function only ever takes an opaque `u64`, never a
+/// pointer type of its own, and leaves each caller responsible for
+/// building that value however its own mechanism needs to. Does NOT
+/// touch `active_tasks`/`current` (and `ring3_mt`'s own extra switch-
+/// count/enabled state) - both callers still reset those themselves
+/// immediately afterward, since those live in differently-typed storage
+/// (plain `static mut` for `ring3_coop`, `AtomicUsize`/`AtomicBool` for
+/// `ring3_mt`, a real difference this function deliberately stays
+/// agnostic to rather than papering over).
+pub fn arm_task_slots<const N: usize>(
+    slots: &mut [u64; N],
+    priorities: &mut [u8; N],
+    done: &mut [bool; N],
+    tasks: &[(u64, u8)],
+) {
+    assert!(
+        tasks.len() <= N,
+        "arm_task_slots: {} tasks requested, only {N} slots exist",
+        tasks.len()
+    );
+    for (i, (slot_val, prio)) in tasks.iter().enumerate() {
+        slots[i] = *slot_val;
+        priorities[i] = *prio;
+    }
+    for d in done.iter_mut() {
+        *d = false;
+    }
+}

@@ -62,7 +62,7 @@
 //! called the old local one; no behavior changes here at all.
 
 use crate::scheduler::process::Priority;
-use crate::scheduler::tier_select::select_next;
+use crate::scheduler::tier_select::{arm_task_slots, select_next};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Real, fixed headroom for how many ring-3 tasks this mechanism can
@@ -232,26 +232,33 @@ pub fn run_multitasking<F: FnOnce() -> u64>(
         "run_multitasking: {active_tasks} tasks requested, only {RING3_MT_MAX_TASKS} slots exist"
     );
 
+    // Fase 111: box every task's own fresh context first (this
+    // mechanism's own allocation story - `ring3_coop`'s equivalent arm
+    // step takes an already-computed RSP instead, genuinely different
+    // ownership, which is exactly why the shared helper below only ever
+    // takes an opaque `u64` slot value), then hand the resulting
+    // (address, priority) pairs to the SAME `tier_select::arm_task_
+    // slots` helper `ring3::arm_ring3_coop_tasks` also calls - the
+    // bounds-assert, slot/priority writes, and done-mask reset are now
+    // one real shared function instead of two hand-copied ones.
     let mut bufs: alloc::vec::Vec<alloc::boxed::Box<[u8; 160]>> =
         alloc::vec::Vec::with_capacity(active_tasks);
     bufs.push(alloc::boxed::Box::new([0u8; 160]));
     for (_, ctx) in other_tasks {
         bufs.push(alloc::boxed::Box::new(*ctx));
     }
+    let mut task_pairs: alloc::vec::Vec<(u64, u8)> = alloc::vec::Vec::with_capacity(active_tasks);
+    task_pairs.push((bufs[0].as_ptr() as u64, task0_priority as u8));
+    for (i, (p, _)) in other_tasks.iter().enumerate() {
+        task_pairs.push((bufs[i + 1].as_ptr() as u64, *p as u8));
+    }
     unsafe {
-        let slots = core::ptr::addr_of_mut!(RING3_MT_TASK_CTX);
-        for (i, buf) in bufs.iter_mut().enumerate() {
-            (*slots)[i] = buf.as_mut_ptr() as u64;
-        }
-        let prios = core::ptr::addr_of_mut!(RING3_MT_TASK_PRIORITY);
-        (*prios)[0] = task0_priority as u8;
-        for (i, (p, _)) in other_tasks.iter().enumerate() {
-            (*prios)[i + 1] = *p as u8;
-        }
-        let done = core::ptr::addr_of_mut!(RING3_MT_TASK_DONE);
-        for i in 0..RING3_MT_MAX_TASKS {
-            (*done)[i] = false;
-        }
+        arm_task_slots(
+            &mut *core::ptr::addr_of_mut!(RING3_MT_TASK_CTX),
+            &mut *core::ptr::addr_of_mut!(RING3_MT_TASK_PRIORITY),
+            &mut *core::ptr::addr_of_mut!(RING3_MT_TASK_DONE),
+            &task_pairs,
+        );
     }
     RING3_MT_ACTIVE_TASKS.store(active_tasks, Ordering::Relaxed);
     RING3_MT_CURRENT.store(0, Ordering::Relaxed);

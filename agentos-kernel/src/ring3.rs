@@ -1077,26 +1077,23 @@ static mut RING3_COOP_TASK_DONE: [bool; RING3_COOP_MAX_TASKS] = [false; RING3_CO
 /// for the OTHER mechanism. Does NOT touch `prepare_ring3_initial_stack`
 /// (which builds each RSP value) or any of the 3 tests' own different
 /// post-run read-back/cleanup logic - purely the shared setup slice.
+///
+/// Fase 111: the slot/priority-writing and done-mask-reset piece of this
+/// is now `scheduler::tier_select::arm_task_slots` - the SAME shape
+/// `ring3_mt::run_multitasking`'s own inline arm block already had,
+/// once compared directly (see that function's own updated doc). Only
+/// `RING3_COOP_ACTIVE_TASKS`/`RING3_COOP_CURRENT` stay local to this
+/// function, since they live in plain `static mut`s here versus
+/// `ring3_mt`'s own `AtomicUsize` pair - a real difference the shared
+/// helper deliberately stays agnostic to.
 fn arm_ring3_coop_tasks(tasks: &[(u64, u8)]) {
-    assert!(
-        tasks.len() <= RING3_COOP_MAX_TASKS,
-        "arm_ring3_coop_tasks: {} tasks requested, only {RING3_COOP_MAX_TASKS} slots exist",
-        tasks.len()
-    );
     unsafe {
-        let rsp_slots = core::ptr::addr_of_mut!(RING3_COOP_TASK_RSP);
-        let prio_slots = core::ptr::addr_of_mut!(RING3_COOP_TASK_PRIORITY);
-        for (i, (rsp, prio)) in tasks.iter().enumerate() {
-            (*rsp_slots)[i] = *rsp;
-            (*prio_slots)[i] = *prio;
-        }
-        // Reset the done-mask fresh for this test - shared static state
-        // a PRIOR test in the same boot could have left set, since
-        // nothing else ever clears it besides a fresh arm.
-        let done = core::ptr::addr_of_mut!(RING3_COOP_TASK_DONE);
-        for i in 0..RING3_COOP_MAX_TASKS {
-            (*done)[i] = false;
-        }
+        crate::scheduler::tier_select::arm_task_slots(
+            &mut *core::ptr::addr_of_mut!(RING3_COOP_TASK_RSP),
+            &mut *core::ptr::addr_of_mut!(RING3_COOP_TASK_PRIORITY),
+            &mut *core::ptr::addr_of_mut!(RING3_COOP_TASK_DONE),
+            tasks,
+        );
         *core::ptr::addr_of_mut!(RING3_COOP_ACTIVE_TASKS) = tasks.len();
         *core::ptr::addr_of_mut!(RING3_COOP_CURRENT) = 0;
     }
