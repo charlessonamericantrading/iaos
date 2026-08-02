@@ -3055,6 +3055,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         priority_coop_sig
     );
 
+    // Fase 96: proves a NON-task-0 cooperative-yield task can voluntarily
+    // retire for good instead of yielding-and-being-abandoned - the
+    // cooperative-mechanism equivalent of Fase 93's own ring3_mt early-
+    // exit test, completing the mirror of all 3 generalizations (N-task,
+    // priority, early-exit) onto both ring-3 scheduling mechanisms this
+    // arc has built - see ring3::run_early_exit_cooperative_test's own
+    // doc.
+    kprintln!(
+        "[KERNEL INIT] Testing voluntary early exit in the cooperative-yield mechanism (task1 retires via int 0x85 instead of yielding)..."
+    );
+    let (
+        early_exit_coop_code,
+        early_exit_coop_sig,
+        early_exit_coop_t0_done,
+        early_exit_coop_t1_done,
+        early_exit_coop_t2_done,
+    ) = ring3::run_early_exit_cooperative_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - early_exit_cooperative_test returned exit_code={} signature={:02x?} task0_done={} task1_done={} task2_done={}",
+        early_exit_coop_code,
+        early_exit_coop_sig,
+        early_exit_coop_t0_done,
+        early_exit_coop_t1_done,
+        early_exit_coop_t2_done
+    );
+
     // Fase 85: the first genuine, INVOLUNTARY (timer-driven) ring-3
     // preemption this kernel has ever attempted - a real hardware tick
     // saves this ring-3 program's COMPLETE register state and correctly

@@ -140,6 +140,21 @@ pub const RING3_COOP_YIELD_INT_VECTOR: u8 = 0x83;
 /// keeping 0x81/0x82/0x83 apart.
 pub const RING3_MT_TASK_DONE_INT_VECTOR: u8 = 0x84;
 
+/// A SIXTH DPL=3 vector (Fase 96) - a NON-task-0 cooperative-yield task's
+/// own voluntary "I'm done, stop scheduling me" signal, the cooperative-
+/// mechanism counterpart to `RING3_MT_TASK_DONE_INT_VECTOR` above. Reuses
+/// `ring3_coop_yield_entry_asm`'s exact 96-byte-context shape (6 callee-
+/// saved registers + a manufactured trampoline address + the CPU's own
+/// 5-field `iretq` frame) rather than `RING3_MT_TASK_DONE_INT_VECTOR`'s
+/// own 160-byte full-15-GPR one - the two "task done" vectors are
+/// structurally different for the exact same reason `RING3_COOP_YIELD_
+/// INT_VECTOR` and `RING3_MT_TASK_DONE_INT_VECTOR` already were: each
+/// cooperative-mechanism vector operates on `switch_to`'s own smaller
+/// convention, each involuntary-timer-mechanism vector on the timer
+/// stub's own full-register one. Calls `ring3::ring3_coop_task_done_
+/// helper` instead of `ring3::ring3_coop_yield_helper`.
+pub const RING3_COOP_TASK_DONE_INT_VECTOR: u8 = 0x85;
+
 /// Counts real invocations of the DPL=3 syscall gate - lets a self-test
 /// verify the gate genuinely fired (not just "the CPU didn't crash"),
 /// the same reasoning `TIMER_TICKS` already established for verifying
@@ -229,6 +244,16 @@ lazy_static! {
             idt[RING3_MT_TASK_DONE_INT_VECTOR]
                 .set_handler_addr(VirtAddr::new(
                     crate::ring3::ring3_mt_task_done_entry_asm as *const () as u64,
+                ))
+                .set_privilege_level(PrivilegeLevel::Ring3);
+        }
+        // Same reasoning (DPL=3, raw set_handler_addr) - see
+        // RING3_COOP_TASK_DONE_INT_VECTOR's own doc for why this is a
+        // SIXTH, dedicated vector.
+        unsafe {
+            idt[RING3_COOP_TASK_DONE_INT_VECTOR]
+                .set_handler_addr(VirtAddr::new(
+                    crate::ring3::ring3_coop_task_done_entry_asm as *const () as u64,
                 ))
                 .set_privilege_level(PrivilegeLevel::Ring3);
         }

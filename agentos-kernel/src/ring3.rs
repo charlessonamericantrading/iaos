@@ -1050,6 +1050,44 @@ static mut RING3_COOP_CURRENT: usize = 0;
 /// fresh by every test, read by the yield helper's own tier search.
 static mut RING3_COOP_TASK_PRIORITY: [u8; RING3_COOP_MAX_TASKS] = [0; RING3_COOP_MAX_TASKS];
 
+/// Fase 96: which slots have voluntarily retired for good via
+/// `ring3_coop_task_done_helper` below - task 0's own slot is NEVER set
+/// here, since task 0 always exits through the separate, unmodified
+/// `RING3_TASK_EXIT_INT_VECTOR` (`int 0x82`) path instead. Reset to all-
+/// `false` by every test, the same "task 0 never marked done, so the
+/// selection search can never come up empty" invariant `scheduler::
+/// ring3_mt::RING3_MT_TASK_DONE` (Fase 93) already established for the
+/// OTHER mechanism.
+static mut RING3_COOP_TASK_DONE: [bool; RING3_COOP_MAX_TASKS] = [false; RING3_COOP_MAX_TASKS];
+
+/// Fase 96: shared by `ring3_coop_yield_helper` and `ring3_coop_task_
+/// done_helper` - the SAME tier-search-then-round-robin algorithm Fase
+/// 95 already ported from `scheduler::ring3_mt`, now also skipping any
+/// slot `done` marks retired, mirroring `scheduler::ring3_mt::select_
+/// next`'s own identical extension in Fase 93. Guaranteed to terminate
+/// having found a real candidate for the same reason that mechanism's
+/// own helper is: task 0's own slot is never marked done (see `RING3_
+/// COOP_TASK_DONE`'s own doc), so at least one non-done slot always
+/// exists as long as this mechanism is enabled at all.
+fn coop_select_next(
+    active_tasks: usize,
+    current: usize,
+    prios: &[u8; RING3_COOP_MAX_TASKS],
+    done: &[bool; RING3_COOP_MAX_TASKS],
+) -> usize {
+    let mut top = u8::MAX;
+    for i in 0..active_tasks {
+        if !done[i] && prios[i] < top {
+            top = prios[i];
+        }
+    }
+    let mut next = (current + 1) % active_tasks;
+    while done[next] || prios[next] != top {
+        next = (next + 1) % active_tasks;
+    }
+    next
+}
+
 /// Entry point for vector 0x83 - a ring-3 task's voluntary "let someone
 /// else run for a while" signal. Structurally its own thing, not a
 /// variant of `ring3_task_exit_entry_asm` (0x82): that one discards the
@@ -1163,6 +1201,13 @@ pub(crate) extern "C" fn ring3_coop_yield_entry_asm() {
 /// a safe, immediate self-resume, not a hang. This is exactly the
 /// property `run_priority_cooperative_test` proves: yielding while
 /// holding the sole top priority never actually hands control away.
+///
+/// **Fase 96: now shares its tier-search-then-round-robin logic with
+/// `ring3_coop_task_done_helper` below** via `coop_select_next` - the
+/// same factoring `scheduler::ring3_mt`'s own `tick`/`task_done` pair
+/// already established in Fase 93, so this yield path and the new
+/// permanent-retirement path can never drift out of sync on how they
+/// pick the next task.
 extern "C" fn ring3_coop_yield_helper(current_rsp: u64) -> u64 {
     unsafe {
         let current_ptr = core::ptr::addr_of_mut!(RING3_COOP_CURRENT);
@@ -1172,16 +1217,77 @@ extern "C" fn ring3_coop_yield_helper(current_rsp: u64) -> u64 {
         core::ptr::copy_nonoverlapping(current_rsp as *const u8, dest as *mut u8, 96);
         let active_tasks = *core::ptr::addr_of!(RING3_COOP_ACTIVE_TASKS);
         let prios: &[u8; RING3_COOP_MAX_TASKS] = &*core::ptr::addr_of!(RING3_COOP_TASK_PRIORITY);
-        let mut top = prios[0];
-        for &p in &prios[1..active_tasks] {
-            if p < top {
-                top = p;
-            }
-        }
-        let mut next = (cur + 1) % active_tasks;
-        while prios[next] != top {
-            next = (next + 1) % active_tasks;
-        }
+        let done: &[bool; RING3_COOP_MAX_TASKS] = &*core::ptr::addr_of!(RING3_COOP_TASK_DONE);
+        let next = coop_select_next(active_tasks, cur, prios, done);
+        *current_ptr = next;
+        (*tasks)[next]
+    }
+}
+
+/// Fase 96: entry point for vector 0x85 - a NON-task-0 cooperative-yield
+/// task's voluntary "I'm done, stop scheduling me for good" signal, as
+/// opposed to `ring3_coop_yield_entry_asm`'s own voluntary YIELD (which
+/// resumes the SAME task again later). Byte-for-byte the same naked-asm
+/// shape as `ring3_coop_yield_entry_asm` (manufacture a trampoline
+/// return address, push the same 6 callee-saved registers, call a
+/// helper, adopt whatever RSP it returns, pop the same 6, `ret`) -
+/// reused verbatim since this vector's whole point is interoperating
+/// with the SAME 96-byte context format the yield path already uses,
+/// not `scheduler::ring3_mt`'s own 160-byte one.
+#[unsafe(naked)]
+pub(crate) extern "C" fn ring3_coop_task_done_entry_asm() {
+    naked_asm!(
+        "lea rax, [rip + {trampoline}]",
+        "push rax",
+        "push rbp",
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "call {helper}",
+        "mov rsp, rax",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+        trampoline = sym ring3_entry_trampoline,
+        helper = sym ring3_coop_task_done_helper,
+    );
+}
+
+/// Saves the retiring task's own 96-byte snapshot into its dedicated
+/// buffer (identical copy to `ring3_coop_yield_helper`'s own - no
+/// poisoning here, unlike `scheduler::ring3_mt`'s own `tick`/`task_done`,
+/// since this mechanism never relied on poisoning to catch a reuse bug
+/// the way that one's own RSP0 history did), marks it done in `RING3_
+/// COOP_TASK_DONE`, and picks the next task via the SAME `coop_select_
+/// next` the yield path uses - the one difference from a plain yield.
+/// Never called for task 0 (see `RING3_COOP_TASK_DONE`'s own doc for
+/// why task 0's slot must never be marked done) - by construction, only
+/// a ring-3 PROGRAM built to execute `int 0x85` can ever reach this at
+/// all, and no test in this codebase puts that instruction into task
+/// 0's own program.
+extern "C" fn ring3_coop_task_done_helper(current_rsp: u64) -> u64 {
+    unsafe {
+        let current_ptr = core::ptr::addr_of_mut!(RING3_COOP_CURRENT);
+        let cur = *current_ptr;
+        let tasks = core::ptr::addr_of!(RING3_COOP_TASK_RSP);
+        let dest = (*tasks)[cur];
+        core::ptr::copy_nonoverlapping(current_rsp as *const u8, dest as *mut u8, 96);
+
+        let done_slots = core::ptr::addr_of_mut!(RING3_COOP_TASK_DONE);
+        (*done_slots)[cur] = true;
+
+        let active_tasks = *core::ptr::addr_of!(RING3_COOP_ACTIVE_TASKS);
+        let prios: &[u8; RING3_COOP_MAX_TASKS] = &*core::ptr::addr_of!(RING3_COOP_TASK_PRIORITY);
+        let done: &[bool; RING3_COOP_MAX_TASKS] = &*core::ptr::addr_of!(RING3_COOP_TASK_DONE);
+        let next = coop_select_next(active_tasks, cur, prios, done);
+
         *current_ptr = next;
         (*tasks)[next]
     }
@@ -1413,6 +1519,13 @@ pub fn run_ring3_cooperative_test() -> (u64, [u8; 4]) {
         (*prios)[0] = Priority::Normal as u8;
         (*prios)[1] = Priority::Normal as u8;
         (*prios)[2] = Priority::Normal as u8;
+        // Fase 96: reset the done-mask fresh for this test - shared
+        // static state a PRIOR test in the same boot could have left
+        // set, since nothing else ever clears it besides a fresh setup.
+        let done = core::ptr::addr_of_mut!(RING3_COOP_TASK_DONE);
+        for i in 0..RING3_COOP_MAX_TASKS {
+            (*done)[i] = false;
+        }
         *core::ptr::addr_of_mut!(RING3_COOP_ACTIVE_TASKS) = 3;
         *core::ptr::addr_of_mut!(RING3_COOP_CURRENT) = 0;
     }
@@ -1564,6 +1677,13 @@ pub fn run_priority_cooperative_test() -> (u64, [u8; 4]) {
         (*prios)[0] = Priority::High as u8;
         (*prios)[1] = Priority::Background as u8;
         (*prios)[2] = Priority::Background as u8;
+        // Fase 96: reset the done-mask fresh for this test - see the
+        // identical reset in run_ring3_cooperative_test's own setup for
+        // why (shared static state a prior test could have left set).
+        let done = core::ptr::addr_of_mut!(RING3_COOP_TASK_DONE);
+        for i in 0..RING3_COOP_MAX_TASKS {
+            (*done)[i] = false;
+        }
         *core::ptr::addr_of_mut!(RING3_COOP_ACTIVE_TASKS) = 3;
         *core::ptr::addr_of_mut!(RING3_COOP_CURRENT) = 0;
     }
@@ -1611,6 +1731,207 @@ pub fn run_priority_cooperative_test() -> (u64, [u8; 4]) {
     );
 
     (exit_code, sig)
+}
+
+/// Fase 96: proves a NON-task-0 cooperative-yield task can voluntarily
+/// retire for good instead of yielding-and-being-abandoned - the
+/// cooperative-mechanism equivalent of `ring3::run_early_exit_ring3_mt_
+/// test` (Fase 93), completing the mirror of all 3 generalizations
+/// (N-task, priority, early-exit) onto BOTH ring-3 scheduling mechanisms
+/// this arc has built (Fase 91/94 for N-task, Fase 92/95 for priority,
+/// Fase 93/96 for early-exit).
+///
+/// Deliberately isolates this ONE new variable, the same discipline
+/// Fase 93 already established for the OTHER mechanism: all 3 tasks
+/// share `Priority::Normal` (priority is NOT under test here). Task 0
+/// and task 2 keep the EXACT SAME "yield body" `build_cooperative_test_
+/// program` already builds (write a char, `int 0x83`, and - only ever
+/// reachable for task 0, which is the one the round-robin brings back
+/// around to - write a completion marker and exit via `int 0x82`). Task
+/// 1 gets a genuinely different, SHORTER "retire body": write `'B'` to
+/// `sig[1]`, then `int 0x85` instead of `int 0x83` - there is no "second
+/// half" to reach, since retiring means this task never runs again.
+///
+/// Real, ordered proof: task 0 writes `'A'`, yields to task 1. Task 1
+/// writes `'B'`, then RETIRES (rather than yielding) - `coop_select_
+/// next` marks it done and picks the next NON-done slot, task 2 (NOT
+/// task 1 again - proof the retirement genuinely removed it from the
+/// rotation). Task 2 writes `'C'`, yields - wrapping around to task 0
+/// (correctly skipping the now-done task 1), which resumes and writes
+/// its own completion marker before exiting normally.
+///
+/// Verification is stronger than the signature alone (which numerically
+/// matches Fase 94/95's own round-robin result, `[41, 42, 43, 58]` -
+/// task 1 reached `'B'` either way): reading `RING3_COOP_TASK_DONE`
+/// directly after the call returns gives independent, structural proof
+/// task 1 genuinely retired (not merely yielded and happened to never
+/// be resumed again within this short test) - `done[1]=true` while
+/// `done[0]=false`/`done[2]=false` (task 0 exits through a completely
+/// separate mechanism; task 2 only ever yields, never retires).
+pub fn run_early_exit_cooperative_test() -> (u64, [u8; 4], bool, bool, bool) {
+    use crate::scheduler::process::Priority;
+
+    let info = gdt::ring3_info();
+    let user_cs = info.user_code_selector as u64;
+    let user_ss = info.user_data_selector as u64;
+
+    let code_addr = USER_TEST_PAGE_ADDR;
+    const SIG_OFFSET: u64 = 600;
+    let sig_addr = code_addr + SIG_OFFSET;
+
+    const YIELD_BODY_OFFSET: usize = 48;
+    const RETIRE_BODY_OFFSET: usize = 74;
+    let task0_entry_offset = RING3_COOP_TASK0_ENTRY_OFFSET;
+    let task1_entry_offset = RING3_COOP_TASK1_ENTRY_OFFSET;
+    let task2_entry_offset = RING3_COOP_TASK2_ENTRY_OFFSET;
+
+    let prologue0 = build_coop_task_prologue(0, sig_addr, task0_entry_offset, YIELD_BODY_OFFSET);
+    let prologue1 = build_coop_task_prologue(1, sig_addr, task1_entry_offset, RETIRE_BODY_OFFSET);
+    let prologue2 = build_coop_task_prologue(2, sig_addr, task2_entry_offset, YIELD_BODY_OFFSET);
+    let yield_body: [u8; 26] = [
+        0x8A, 0xC3, // mov al, bl
+        0x04, 0x41, // add al, 0x41
+        0x41, 0x88, 0x04, 0x1C, // mov [r12+rbx], al
+        0xCD, 0x83, // int 0x83 (yield)
+        0x8A, 0xC3, // mov al, bl
+        0x04, 0x58, // add al, 0x58
+        0x41, 0x88, 0x44, 0x24, 0x03, // mov [r12+3], al
+        0xB8, 0x2A, 0x00, 0x00, 0x00, // mov eax, 42
+        0xCD, 0x82, // int 0x82 (exit)
+    ];
+    let retire_body: [u8; 10] = [
+        0x8A, 0xC3, // mov al, bl
+        0x04, 0x41, // add al, 0x41
+        0x41, 0x88, 0x04, 0x1C, // mov [r12+rbx], al
+        0xCD, 0x85, // int 0x85 (retire for good)
+    ];
+
+    let mut program = [0u8; RETIRE_BODY_OFFSET + 10];
+    program[task0_entry_offset..task0_entry_offset + 16].copy_from_slice(&prologue0);
+    program[task1_entry_offset..task1_entry_offset + 16].copy_from_slice(&prologue1);
+    program[task2_entry_offset..task2_entry_offset + 16].copy_from_slice(&prologue2);
+    program[YIELD_BODY_OFFSET..YIELD_BODY_OFFSET + 26].copy_from_slice(&yield_body);
+    program[RETIRE_BODY_OFFSET..RETIRE_BODY_OFFSET + 10].copy_from_slice(&retire_body);
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(program.as_ptr(), code_addr as *mut u8, program.len());
+        core::ptr::write_bytes(sig_addr as *mut u8, 0, 4);
+    }
+
+    let task0_entry = code_addr + task0_entry_offset as u64;
+    let task1_entry = code_addr + task1_entry_offset as u64;
+    let task2_entry = code_addr + task2_entry_offset as u64;
+    let task0_stack_top = code_addr + 2048;
+    let task1_stack_top = code_addr + 3072;
+    let task2_stack_top = code_addr + 4096;
+
+    let mut kernel_stack0 = alloc::boxed::Box::new([0u8; 16 * 1024]);
+    let mut kernel_stack1 = alloc::boxed::Box::new([0u8; 16 * 1024]);
+    let mut kernel_stack2 = alloc::boxed::Box::new([0u8; 16 * 1024]);
+    let k0_top = unsafe { kernel_stack0.as_mut_ptr().add(16 * 1024) };
+    let k1_top = unsafe { kernel_stack1.as_mut_ptr().add(16 * 1024) };
+    let k2_top = unsafe { kernel_stack2.as_mut_ptr().add(16 * 1024) };
+
+    let rsp0 = unsafe {
+        prepare_ring3_initial_stack(
+            k0_top,
+            task0_entry,
+            user_cs,
+            user_ss,
+            task0_stack_top,
+            RING3_TEST_RFLAGS,
+        )
+    };
+    let rsp1 = unsafe {
+        prepare_ring3_initial_stack(
+            k1_top,
+            task1_entry,
+            user_cs,
+            user_ss,
+            task1_stack_top,
+            RING3_TEST_RFLAGS,
+        )
+    };
+    let rsp2 = unsafe {
+        prepare_ring3_initial_stack(
+            k2_top,
+            task2_entry,
+            user_cs,
+            user_ss,
+            task2_stack_top,
+            RING3_TEST_RFLAGS,
+        )
+    };
+
+    unsafe {
+        let tasks = core::ptr::addr_of_mut!(RING3_COOP_TASK_RSP);
+        (*tasks)[0] = rsp0;
+        (*tasks)[1] = rsp1;
+        (*tasks)[2] = rsp2;
+        let prios = core::ptr::addr_of_mut!(RING3_COOP_TASK_PRIORITY);
+        (*prios)[0] = Priority::Normal as u8;
+        (*prios)[1] = Priority::Normal as u8;
+        (*prios)[2] = Priority::Normal as u8;
+        let done = core::ptr::addr_of_mut!(RING3_COOP_TASK_DONE);
+        for i in 0..RING3_COOP_MAX_TASKS {
+            (*done)[i] = false;
+        }
+        *core::ptr::addr_of_mut!(RING3_COOP_ACTIVE_TASKS) = 3;
+        *core::ptr::addr_of_mut!(RING3_COOP_CURRENT) = 0;
+    }
+
+    kprintln!(
+        "[RING3] Testing voluntary early exit in the cooperative-yield mechanism (task1 retires via int 0x85 instead of yielding)..."
+    );
+    serial_println!(
+        "[RING3] early_exit_cooperative_test starting: task0=Normal(yields) task1=Normal(retires early) task2=Normal(yields) sig_addr={:#x}",
+        sig_addr
+    );
+
+    unsafe {
+        crate::scheduler::context_switch::switch_to(
+            core::ptr::addr_of_mut!(RING3_TASK_CALLER_RSP),
+            rsp0,
+        );
+    }
+    // Resumes HERE once task 0 exits via int 0x82, after its own real
+    // round trip through task 1 (retired early) and task 2 and back.
+
+    let exit_code = unsafe { core::ptr::addr_of!(RING3_TASK_EXIT_CODE).read() };
+    let mut sig = [0u8; 4];
+    unsafe {
+        sig[0] = core::ptr::read_volatile(sig_addr as *const u8);
+        sig[1] = core::ptr::read_volatile((sig_addr + 1) as *const u8);
+        sig[2] = core::ptr::read_volatile((sig_addr + 2) as *const u8);
+        sig[3] = core::ptr::read_volatile((sig_addr + 3) as *const u8);
+    }
+    let (task0_done, task1_done, task2_done) = unsafe {
+        let done: &[bool; RING3_COOP_MAX_TASKS] = &*core::ptr::addr_of!(RING3_COOP_TASK_DONE);
+        (done[0], done[1], done[2])
+    };
+
+    drop(kernel_stack0);
+    drop(kernel_stack1);
+    drop(kernel_stack2);
+
+    kprintln!(
+        "[RING3] Back in ring-0 - early_exit_cooperative_test exit_code={} signature={:02x?} task0_done={} task1_done={} task2_done={} (expected signature=[41, 42, 43, 58], task1_done=true, others false)",
+        exit_code,
+        sig,
+        task0_done,
+        task1_done,
+        task2_done
+    );
+    serial_println!(
+        "[RING3] early_exit_cooperative_test exit_code={} signature={:02x?} task0_done={} task1_done={} task2_done={}",
+        exit_code,
+        sig,
+        task0_done,
+        task1_done,
+        task2_done
+    );
+
+    (exit_code, sig, task0_done, task1_done, task2_done)
 }
 
 /// Fase 85: proves genuine, INVOLUNTARY (timer-driven) ring-3 preemption.

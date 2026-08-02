@@ -599,6 +599,23 @@ jobs:
           # Background, would write 'B'/'C') staying at their own
           # zero-fill is direct proof those tasks never ran even once.
           grep -q "RING3\] priority_cooperative_test exit_code=42 signature=\[41, 00, 00, 58\]" boot.log
+          # Fase 96: a NON-task-0 cooperative-yield task can now
+          # voluntarily retire for good instead of yielding-and-being-
+          # abandoned - the voluntary-yield equivalent of Fase 93's own
+          # ring3_mt early-exit test, completing the mirror of all 3
+          # generalizations (N-task, priority, early-exit) onto BOTH
+          # ring-3 scheduling mechanisms this arc has built. Task 1 gets
+          # a genuinely different, SHORTER "retire body" (write 'B', then
+          # `int 0x85` instead of `int 0x83` - no "second half" to reach,
+          # since retiring means it never runs again) while tasks 0/2
+          # keep the unchanged "yield body". `signature=[41, 42, 43, 58]`
+          # numerically matches the plain round-robin test above (task 1
+          # reaches 'B' either way) - the REAL, independent proof is
+          # `task1_done=true` while `task0_done=false`/`task2_done=false`
+          # (task 0 exits through a completely separate mechanism; task 2
+          # only ever yields, never retires), read directly out of the
+          # done-mask rather than merely inferred from the signature.
+          grep -q "RING3\] early_exit_cooperative_test exit_code=42 signature=\[41, 42, 43, 58\] task0_done=false task1_done=true task2_done=false" boot.log
           # Fase 85: the first genuine, INVOLUNTARY (timer-driven) ring-3
           # preemption this kernel has ever attempted - a real hardware
           # tick, landing at an arbitrary point this ring-3 program did
