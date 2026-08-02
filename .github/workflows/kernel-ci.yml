@@ -688,6 +688,17 @@ jobs:
           # after one last correct tick could also produce) - and that the
           # unrelated control task's own old behavior is untouched.
           grep -q "RING3\] early_exit_mt_test task0_checksum=0x10000004 task1_last_eax=0x20000004 task1_done=true task2_last_eax=0x30000004 task2_done=false" boot.log
+          # Fase 98: every ring-3 program before this one has been a
+          # kernel-source byte array, never bytes that flowed through the
+          # real filesystem. This test writes the SAME 15-byte program
+          # Fase 73's own ring3_exit_test uses to a real FAT12 file, reads
+          # it back, and executes THOSE returned bytes - roundtrip_ok=true
+          # proves the disk round trip was byte-for-byte exact, and
+          # exit_code=42 (the same value ring3_exit_test's own embedded
+          # copy already produces) proves the disk-loaded bytes are
+          # genuinely valid, executable ring-3 code, not just a matching
+          # byte count.
+          grep -q "RING3\] ring3_disk_loaded_test roundtrip_ok=true exit_code=42" boot.log
           # Fase 87: the preemptive (timer-driven) scheduler's own
           # `priority` field was tracked and displayed since Fase 31 but
           # never actually used by tick()'s own task-selection logic -

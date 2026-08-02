@@ -3162,6 +3162,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         early_exit_switches
     );
 
+    // Fase 98: proves a ring-3 program's machine code can flow through
+    // the real FAT12 filesystem (write, read back, delete) and still
+    // execute correctly, not just that a kernel-embedded byte array can -
+    // see ring3::run_ring3_disk_loaded_test's own doc. Spawns no PCB
+    // entry (a synchronous enter_ring3 call, same as Fase 73's own exit
+    // test), so it's safe to run here, before the PID-sensitive test
+    // below.
+    let (disk_loaded_roundtrip_ok, disk_loaded_exit_code) = ring3::run_ring3_disk_loaded_test();
+    kprintln!(
+        "[KERNEL INIT] Back from ring-3 - disk_loaded_test roundtrip_ok={} exit_code={}",
+        disk_loaded_roundtrip_ok,
+        disk_loaded_exit_code
+    );
+
     // Fase 87: proves the preemptive scheduler's own priority field is
     // now genuinely used, not cosmetic - see scheduler::preemptive::
     // run_priority_preemptive_test's own doc. Deliberately placed as the

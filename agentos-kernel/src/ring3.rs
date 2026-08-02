@@ -58,7 +58,7 @@
 //! command needed. See that section's own doc for the mechanism.
 
 use crate::memory::user_page::USER_TEST_PAGE_ADDR;
-use crate::{gdt, kprintln, serial_println};
+use crate::{fat12, gdt, kprintln, serial_println, shell};
 use core::arch::naked_asm;
 
 /// `cli` - see this module's own doc for why a single illegal
@@ -2605,4 +2605,98 @@ pub fn run_early_exit_ring3_mt_test() -> (u64, u32, bool, u32, bool, usize) {
         task2_done,
         switch_count,
     )
+}
+
+// ---- Fase 98: a ring-3 program whose machine code comes from a real
+// FAT12 file, not a kernel-source byte array ----
+//
+// Every ring-3 "program" this entire arc has ever run (Fase 71 through
+// 97) has been a `[u8; N]` constant compiled directly into this kernel's
+// own binary, `copy_nonoverlapping`'d straight into `USER_TEST_PAGE_ADDR`.
+// That has been the right call every time so far - each Fase needed to
+// isolate ONE new scheduling/privilege mechanism, and loading real files
+// would have been an unrelated, orthogonal risk to take on at the same
+// time. But it also means this kernel has never actually proven it CAN
+// run code that came from outside its own source - the real, substantial
+// gap standing between everything built so far and an actual "run this
+// program from disk" capability a real OS needs.
+//
+// This test closes that gap in the smallest possible way: writes the
+// EXACT SAME 15-byte program `run_ring3_exit_test` already uses (proven
+// correct since Fase 73) to a real file via `fat12::create_file`, reads
+// it back via `fat12::read_file` - the same write/read/delete round trip
+// `main.rs`'s own GGUF disk-load tests already established (Fase 41) -
+// and copies THOSE returned bytes, not the original constant, into the
+// user page before entering ring-3. If the disk round trip and the
+// ring-3 execution both produce exactly the results direct embedding
+// already does, that is real, independent proof that machine code
+// genuinely survives a trip through this kernel's own filesystem intact
+// and executable, not just that reading files and running ring-3 code
+// each separately still work (both already proven, separately, many
+// Fases ago).
+//
+// Deliberately does NOT attempt to build any kind of general program
+// loader (parsing an executable format, choosing where to place
+// multiple segments, allocating a fresh page per program instead of
+// reusing the one dedicated test page, ...) - that remains real,
+// substantially larger, separate follow-on work. This Fase only proves
+// the one new fact everything else would depend on: bytes read back
+// from a real file are byte-for-byte what was written, and the CPU
+// treats them as valid ring-3 code when copied into an executable page.
+pub fn run_ring3_disk_loaded_test() -> (bool, u64) {
+    const PROGRAM: [u8; 15] = [
+        0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xCD, 0x81, 0xFA,
+    ];
+
+    let loaded = match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                let write_ok = fs.create_file("RING3.BIN", &PROGRAM).is_ok();
+                let read_back = fs.read_file("RING3.BIN").ok();
+                let _ = fs.delete_file("RING3.BIN");
+                if write_ok {
+                    read_back
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+
+    let roundtrip_ok = loaded.as_deref() == Some(PROGRAM.as_slice());
+    if !roundtrip_ok {
+        // No real destination address to distrust here - simply never
+        // enter ring-3 at all rather than execute whatever stale bytes
+        // happen to already be sitting in the shared test page.
+        serial_println!(
+            "[RING3] ring3_disk_loaded_test roundtrip_ok=false - skipping ring-3 entry"
+        );
+        return (false, 0);
+    }
+    let loaded = loaded.unwrap();
+
+    let info = gdt::ring3_info();
+    let user_cs = info.user_code_selector as u64;
+    let user_ss = info.user_data_selector as u64;
+    let code_addr = USER_TEST_PAGE_ADDR;
+    let stack_top = USER_TEST_PAGE_ADDR + 4096;
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(loaded.as_ptr(), code_addr as *mut u8, loaded.len());
+    }
+
+    kprintln!(
+        "[KERNEL INIT] Testing a ring-3 program loaded from a real FAT12 file instead of a kernel-embedded array..."
+    );
+    let exit_code =
+        unsafe { enter_ring3(code_addr, user_cs, user_ss, stack_top, RING3_TEST_RFLAGS) };
+
+    serial_println!(
+        "[RING3] ring3_disk_loaded_test roundtrip_ok=true exit_code={}",
+        exit_code
+    );
+
+    (true, exit_code)
 }
