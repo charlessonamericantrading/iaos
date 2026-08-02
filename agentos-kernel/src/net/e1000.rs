@@ -2259,3 +2259,26 @@ pub fn dns_query_test(target_ip: [u8; 4], hostname: &str) -> DnsQueryResult {
 
     Ok((reply_received, qr_bit_set, answer_count, parsed_a_record))
 }
+
+/// Fase 113: wraps `dns_query_test` into a clean, reusable resolver API -
+/// closes the "reusable hostname-lookup API" item the DNS-resolver
+/// thread's own doc has flagged open since Fase 107. Queries
+/// `dns_server` for `hostname`'s A record and returns just the resolved
+/// IPv4 address, collapsing `dns_query_test`'s own full diagnostic
+/// tuple (built for a boot self-test/interactive `dns` command that
+/// wants to SEE every field) down to the one value an actual CALLER -
+/// something that just wants an address to use, not to inspect the
+/// protocol - needs. Still not a general resolver: single question, A
+/// records only, the same standing scope this whole DNS arc has kept
+/// since Fase 106 - this closes the "usable by other kernel code" gap
+/// specifically, not the general-resolution gap (multiple answers, full
+/// name-compression chains, other record types all remain separate,
+/// larger follow-on work if ever needed).
+pub fn resolve_hostname(hostname: &str, dns_server: [u8; 4]) -> Result<[u8; 4], &'static str> {
+    let (reply_received, qr_bit_set, _answer_count, parsed_a_record) =
+        dns_query_test(dns_server, hostname)?;
+    if !reply_received || !qr_bit_set {
+        return Err("resolve_hostname: no valid DNS reply received");
+    }
+    parsed_a_record.ok_or("resolve_hostname: reply contained no parseable A record")
+}

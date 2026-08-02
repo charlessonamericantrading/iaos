@@ -342,21 +342,60 @@ pub fn dispatch_command(line: &str) {
             }
         }
         "ping" => {
-            let ip_str = parts.next().unwrap_or("");
-            match parse_ipv4(ip_str) {
-                Some(target_ip) => match crate::net::e1000::ping(target_ip) {
+            let target_str = parts.next().unwrap_or("");
+            // Fase 113: `target_str` no longer has to be a raw dotted-
+            // quad - if it isn't one, try resolving it as a hostname via
+            // `net::e1000::resolve_hostname` (SLIRP's own always-on DNS
+            // proxy, 10.0.2.3 - the same fixed server the `dns` command/
+            // boot self-test already use) before giving up on it
+            // entirely. The first time this kernel has ever consumed a
+            // DNS resolution for something other than testing DNS
+            // itself - closes the "reusable hostname-lookup API" gap
+            // the DNS-resolver thread's own doc flagged open since Fase
+            // 107, by actually putting that API to real use.
+            let resolved = match parse_ipv4(target_str) {
+                Some(ip) => Ok(ip),
+                None if !target_str.is_empty() => {
+                    match crate::net::e1000::resolve_hostname(target_str, [10, 0, 2, 3]) {
+                        Ok(ip) => {
+                            kprintln!(
+                                "ping: resolved {} to {}.{}.{}.{}",
+                                target_str,
+                                ip[0],
+                                ip[1],
+                                ip[2],
+                                ip[3]
+                            );
+                            serial_println!(
+                                "[SHELL] ping resolve_hostname({}) -> {:?}",
+                                target_str,
+                                ip
+                            );
+                            Ok(ip)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                None => Err("usage: ping A.B.C.D | ping hostname"),
+            };
+            match resolved {
+                Ok(target_ip) => match crate::net::e1000::ping(target_ip) {
                     Ok(()) => {
-                        kprintln!("Ping to {}: real ICMP echo reply received.", ip_str);
-                        serial_println!("[SHELL] ping {} -> ok", ip_str);
+                        kprintln!("Ping to {}: real ICMP echo reply received.", target_str);
+                        serial_println!("[SHELL] ping {} -> ok", target_str);
                     }
                     Err(e) => {
                         kprintln!("ping: {}", e);
-                        serial_println!("[SHELL] ping {} -> FAILED: {}", ip_str, e);
+                        serial_println!("[SHELL] ping {} -> FAILED: {}", target_str, e);
                     }
                 },
-                None => {
-                    kprintln!("ping: usage: ping A.B.C.D");
-                    serial_println!("[SHELL] ping -> invalid or missing IP: '{}'", ip_str);
+                Err(e) => {
+                    kprintln!("ping: {}", e);
+                    serial_println!(
+                        "[SHELL] ping -> invalid or missing target: '{}' ({})",
+                        target_str,
+                        e
+                    );
                 }
             }
         }
