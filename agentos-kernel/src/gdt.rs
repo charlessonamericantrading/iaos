@@ -44,17 +44,20 @@ lazy_static! {
         let kernel_code_selector = gdt.append(Descriptor::kernel_code_segment());
         let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
         // Ring-3 (user-mode) code/data segments - the foundational piece
-        // every real ring-3 transition needs before anything else, laid
-        // down here but not yet USED by any code: no IDT gate has DPL=3
-        // yet, no page is marked USER-accessible yet, and nothing
-        // performs the actual privilege-lowering control transfer
-        // (an `iretq`-to-ring-3, or `sysret`) yet - each is real,
-        // substantial follow-on work of its own. Appended in the
-        // conventional data-then-code order (matches what `sysret`'s
-        // STAR MSR would expect later, computing user SS/CS as fixed
-        // offsets from a single base selector) even though this Fase
-        // doesn't use `syscall`/`sysret` yet - cheap to get right now,
-        // expensive to silently rely on the wrong order later.
+        // every real ring-3 transition needs before anything else. Laid
+        // down here at Fase 68, before any of it was actually used -
+        // Fase 69 added the first real DPL=3 IDT gate, Fase 70 the
+        // first real USER-accessible page, and Fase 71 the actual
+        // privilege-lowering control transfer (`ring3.rs`'s own
+        // `iretq`-to-ring-3) - all three real, substantial pieces of
+        // follow-on work this comment once described as not yet
+        // started, shipped and exercised by dozens of self-tests since.
+        // Appended in the conventional data-then-code order (matches
+        // what `sysret`'s STAR MSR would expect, computing user SS/CS
+        // as fixed offsets from a single base selector) even though
+        // this Fase didn't use `syscall`/`sysret` yet - cheap to get
+        // right at the time, expensive to silently rely on the wrong
+        // order later.
         let user_data_selector = gdt.append(Descriptor::user_data_segment());
         let user_code_selector = gdt.append(Descriptor::user_code_segment());
         (
@@ -79,10 +82,12 @@ struct Selectors {
 /// Real ring-3 selectors + the TSS's own RSP0, exposed for the self-test
 /// (Fase 68) to verify this Fase's actual, checkable claims: both
 /// selectors' DPL is genuinely Ring 3 (not just "some nonzero value"),
-/// and RSP0 is a real, non-null kernel stack address - not yet proof
-/// ring-3 code can actually run (that's real, separate follow-on work),
-/// but proof the GDT/TSS infrastructure it will need is genuinely in
-/// place, not merely compiled without erroring.
+/// and RSP0 is a real, non-null kernel stack address. At the time this
+/// was written, proof the GDT/TSS infrastructure was genuinely in
+/// place (not merely compiled without erroring) was all that could be
+/// claimed - proof ring-3 code can actually run came later, real and
+/// substantial (Fase 71's own `ring3.rs`, now thousands of lines and
+/// dozens of self-tests deep).
 pub struct Ring3Info {
     pub user_code_selector: u16,
     pub user_data_selector: u16,
