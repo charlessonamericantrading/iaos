@@ -1098,6 +1098,20 @@ jobs:
           # asserted on below, for the identical reason its own
           # reply_received/qr_bit_set/answer_count fields aren't either.
           grep -q "DNS\] answer_parse_selftest a_record_parsed_ok=true zero_answers_rejected=true non_a_record_rejected=true uncompressed_name_rejected=true" boot.log
+          # Fase 110: DNS query building (net::dns::build_query /
+          # encode_qname) - pure logic, no hardware dependency, the
+          # encoding-side mirror of the answer-parsing self-test right
+          # above. Closes the gap dns_query_test's own doc used to flag:
+          # a fixed "example.com" query was the only content it could
+          # ever send, since there was no general-purpose builder yet.
+          # valid_query_matches_known_bytes rebuilds Fase 106's own
+          # original hand-built 29-byte query through the new builder
+          # and confirms byte-for-byte identity - the real proof this is
+          # a genuine generalization. The other three each confirm a
+          # genuinely invalid hostname (empty, a label over 63 bytes, an
+          # empty label from a doubled '.') is rejected rather than
+          # silently mis-encoded.
+          grep -q "DNS\] build_query_selftest valid_query_matches_known_bytes=true empty_hostname_rejected=true over_long_label_rejected=true empty_label_rejected=true" boot.log
           # Confirms generalized ARP resolution (Fase 48, net::e1000::
           # arp_resolve) - a new, independent function (does not touch
           # send_test_frame/receive_test_frame, whose exact log output is

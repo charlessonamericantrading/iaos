@@ -366,43 +366,58 @@ pub fn dispatch_command(line: &str) {
             // interactively, on demand, rather than only ever at boot -
             // the same "prove the API first, then expose it via shell"
             // pattern netcheck/ping themselves already established back
-            // in Fase 46/49. Zero changes to net::e1000/net::dns
-            // themselves - both are already fully proven, reused here
-            // as a black box, unlike netcheck/ping this always queries
-            // port 53 (DNS is a fixed-port protocol, not a caller
-            // choice) and always sends the SAME fixed "A? example.com"
-            // query the boot self-test itself already sends - this
-            // command's only real job is letting a user pick a
-            // DIFFERENT target DNS server interactively.
+            // in Fase 46/49. Always queries port 53 (DNS is a
+            // fixed-port protocol, not a caller choice).
+            //
+            // Fase 110: the hostname is now a second, real argument
+            // instead of always being the boot self-test's own fixed
+            // "example.com" - net::dns::build_query encodes whatever
+            // the caller types here onto the wire (net::e1000/net::dns
+            // themselves needed no further changes beyond accepting
+            // this parameter, both already fully proven as of Fase
+            // 106/107). An invalid hostname (empty, an empty label, or
+            // a label over 63 bytes) surfaces as the same `Err` path
+            // below, exactly like an unparsable IP already does.
             let ip_str = parts.next().unwrap_or("");
+            let hostname = parts.next().unwrap_or("");
             match parse_ipv4(ip_str) {
-                Some(target_ip) => match crate::net::e1000::dns_query_test(target_ip) {
-                    Ok((reply_received, qr_bit_set, answer_count, parsed_a_record)) => {
-                        kprintln!(
-                            "DNS query to {}:53 - reply_received={} qr_bit_set={} answer_count={} parsed_a_record={:?}",
-                            ip_str,
-                            reply_received,
-                            qr_bit_set,
-                            answer_count,
-                            parsed_a_record
-                        );
-                        serial_println!(
-                            "[SHELL] dns {} -> reply_received={} qr_bit_set={} answer_count={} parsed_a_record={:?}",
-                            ip_str,
-                            reply_received,
-                            qr_bit_set,
-                            answer_count,
-                            parsed_a_record
-                        );
+                Some(target_ip) if !hostname.is_empty() => {
+                    match crate::net::e1000::dns_query_test(target_ip, hostname) {
+                        Ok((reply_received, qr_bit_set, answer_count, parsed_a_record)) => {
+                            kprintln!(
+                                "DNS query to {}:53 for {} - reply_received={} qr_bit_set={} answer_count={} parsed_a_record={:?}",
+                                ip_str,
+                                hostname,
+                                reply_received,
+                                qr_bit_set,
+                                answer_count,
+                                parsed_a_record
+                            );
+                            serial_println!(
+                                "[SHELL] dns {} {} -> reply_received={} qr_bit_set={} answer_count={} parsed_a_record={:?}",
+                                ip_str,
+                                hostname,
+                                reply_received,
+                                qr_bit_set,
+                                answer_count,
+                                parsed_a_record
+                            );
+                        }
+                        Err(e) => {
+                            kprintln!("dns: {}", e);
+                            serial_println!("[SHELL] dns {} {} -> FAILED: {}", ip_str, hostname, e);
+                        }
                     }
-                    Err(e) => {
-                        kprintln!("dns: {}", e);
-                        serial_println!("[SHELL] dns {} -> FAILED: {}", ip_str, e);
-                    }
-                },
-                None => {
-                    kprintln!("dns: usage: dns A.B.C.D  (queries that DNS server's own port 53)");
-                    serial_println!("[SHELL] dns -> invalid or missing IP: '{}'", ip_str);
+                }
+                _ => {
+                    kprintln!(
+                        "dns: usage: dns A.B.C.D hostname  (queries that DNS server's own port 53)"
+                    );
+                    serial_println!(
+                        "[SHELL] dns -> invalid or missing IP/hostname: '{}' '{}'",
+                        ip_str,
+                        hostname
+                    );
                 }
             }
         }

@@ -1940,14 +1940,17 @@ pub fn tcp_echo_test(
 /// user` instance with zero extra QEMU flags - the one real, always-on
 /// UDP peer genuinely available here.
 ///
-/// This does NOT implement a DNS resolver - `DNS_QUERY` is one fixed,
-/// hand-built 29-byte "A? example.com" query (transaction ID `0x1234`),
-/// used purely as real payload content a real UDP peer will genuinely
-/// reply to. Parsing the reply only reads the 12-byte DNS header far
-/// enough to confirm it's genuinely OUR reply (matching transaction ID)
-/// and genuinely A reply (the QR bit) - never any resource-record data,
-/// which would be real, separate, substantially larger DNS-client work
-/// this Fase deliberately does not attempt.
+/// This does NOT implement a DNS resolver - `net::dns::build_query`
+/// (generalized in Fase 110; originally one fixed, hand-built 29-byte
+/// "A? example.com" query with transaction ID `0x1234`) builds a real
+/// single-question A-record query for whatever `hostname` the caller
+/// supplies, used purely as real payload content a real UDP peer will
+/// genuinely reply to. Parsing the reply only reads the 12-byte DNS
+/// header far enough to confirm it's genuinely OUR reply (matching
+/// transaction ID) and genuinely A reply (the QR bit) - never any
+/// resource-record data beyond the first answer (see `parsed_a_record`
+/// below), which would be real, separate, substantially larger DNS-
+/// client work this Fase deliberately does not attempt.
 ///
 /// **Genuinely, deliberately uncertain going in, the same honest posture
 /// Fase 89/90/102 themselves used**: SLIRP's DNS proxy forwards to
@@ -1970,43 +1973,28 @@ pub fn tcp_echo_test(
 /// records), so `parsed_a_record` is expected to stay `None` here on
 /// this machine - genuinely environment-dependent, logged honestly
 /// rather than assumed either way.
+///
+/// Fase 110: `hostname` replaces the old fixed "example.com" query
+/// content - a caller-supplied name is now genuinely encoded onto the
+/// wire via `dns::build_query`/`dns::encode_qname`, rather than only
+/// the target DNS *server* being a parameter. An invalid hostname
+/// (empty, an empty label, or a label over 63 bytes) is rejected by
+/// `build_query` and propagated here as `Err` before anything is ever
+/// sent - the same "fail before touching hardware" discipline this
+/// function already used for `arp_resolve`'s own `?`.
 /// `(reply_received, qr_bit_set, answer_count, parsed_a_record)`.
 pub type DnsQueryResult = Result<(bool, bool, u16, Option<[u8; 4]>), &'static str>;
 
-pub fn dns_query_test(target_ip: [u8; 4]) -> DnsQueryResult {
+pub fn dns_query_test(target_ip: [u8; 4], hostname: &str) -> DnsQueryResult {
     use crate::net::{dns, icmp, udp};
 
-    // A hand-built, fixed DNS query: "A? example.com", transaction ID
-    // 0x1234. Every offset hand-verified by sequential counting, the
-    // same discipline this kernel's own hand-assembled ring-3 programs
-    // already use for machine code - here applied to a wire-protocol
-    // message instead.
-    //
-    //  0.. 2: transaction ID = 0x1234
-    //  2.. 4: flags = 0x0100 (standard query, recursion desired)
-    //  4.. 6: QDCOUNT = 1
-    //  6.. 8: ANCOUNT = 0
-    //  8..10: NSCOUNT = 0
-    // 10..12: ARCOUNT = 0
-    // 12..20: QNAME label "example" (length-prefixed: 0x07 + 7 bytes)
-    // 20..24: QNAME label "com" (length-prefixed: 0x03 + 3 bytes)
-    //     24: QNAME terminator (0x00)
-    // 25..27: QTYPE = 1 (A)
-    // 27..29: QCLASS = 1 (IN)
-    const DNS_QUERY: [u8; 29] = [
-        0x12, 0x34, // transaction ID
-        0x01, 0x00, // flags: standard query, recursion desired
-        0x00, 0x01, // QDCOUNT = 1
-        0x00, 0x00, // ANCOUNT = 0
-        0x00, 0x00, // NSCOUNT = 0
-        0x00, 0x00, // ARCOUNT = 0
-        0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', // "example"
-        0x03, b'c', b'o', b'm', // "com"
-        0x00, // QNAME terminator
-        0x00, 0x01, // QTYPE = A
-        0x00, 0x01, // QCLASS = IN
-    ];
-    const DNS_TRANSACTION_ID: [u8; 2] = [0x12, 0x34];
+    // Fase 110: the query content itself is now built for an arbitrary
+    // hostname via dns::build_query rather than being one fixed 29-byte
+    // array - see that function's own doc for the exact wire layout
+    // (unchanged from Fase 106's original hand-built bytes when
+    // hostname="example.com" and transaction_id=0x1234).
+    const DNS_TRANSACTION_ID: u16 = 0x1234;
+    let query = dns::build_query(DNS_TRANSACTION_ID, hostname)?;
 
     let dest_mac = arp_resolve(target_ip)?;
     let (dev, mmio_base) = find_mmio_base()?;
@@ -2016,24 +2004,24 @@ pub fn dns_query_test(target_ip: [u8; 4]) -> DnsQueryResult {
     const SRC_PORT: u16 = 45678;
     const DEST_PORT: u16 = 53;
 
-    let udp_header = udp::build_udp_header(SRC_IP, target_ip, SRC_PORT, DEST_PORT, &DNS_QUERY);
+    let udp_header = udp::build_udp_header(SRC_IP, target_ip, SRC_PORT, DEST_PORT, &query);
     let ipv4_header = icmp::build_ipv4_header(
         1,
         64,
         udp::IP_PROTOCOL_UDP,
         SRC_IP,
         target_ip,
-        udp_header.len() + DNS_QUERY.len(),
+        udp_header.len() + query.len(),
     );
     let eth_header = icmp::build_ethernet_header(dest_mac, src_mac, icmp::ETHERTYPE_IPV4);
 
     let mut frame: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(
-        icmp::ETHERNET_HEADER_LEN + icmp::IPV4_HEADER_LEN + udp_header.len() + DNS_QUERY.len(),
+        icmp::ETHERNET_HEADER_LEN + icmp::IPV4_HEADER_LEN + udp_header.len() + query.len(),
     );
     frame.extend_from_slice(&eth_header);
     frame.extend_from_slice(&ipv4_header);
     frame.extend_from_slice(&udp_header);
-    frame.extend_from_slice(&DNS_QUERY);
+    frame.extend_from_slice(&query);
 
     let rx_ring_frame = crate::memory::frame_allocator::allocate_frame();
     let rx_buf_frame = crate::memory::frame_allocator::allocate_frame();
@@ -2195,14 +2183,14 @@ pub fn dns_query_test(target_ip: [u8; 4]) -> DnsQueryResult {
                         if info.dest_port == SRC_PORT
                             && info.source_port == DEST_PORT
                             && dns_start + 8 <= udp_end
-                            && data[dns_start..dns_start + 2] == DNS_TRANSACTION_ID
+                            && data[dns_start..dns_start + 2] == DNS_TRANSACTION_ID.to_be_bytes()
                         {
                             reply_received = true;
                             qr_bit_set = data[dns_start + 2] & 0x80 != 0;
                             answer_count =
                                 u16::from_be_bytes([data[dns_start + 6], data[dns_start + 7]]);
                             if answer_count > 0 {
-                                let question_len = DNS_QUERY.len() - dns::DNS_HEADER_LEN;
+                                let question_len = query.len() - dns::DNS_HEADER_LEN;
                                 parsed_a_record = dns::parse_first_a_record(
                                     &data[dns_start..udp_end],
                                     question_len,
@@ -2237,20 +2225,22 @@ pub fn dns_query_test(target_ip: [u8; 4]) -> DnsQueryResult {
     }
 
     kprintln!(
-        "[E1000] dns_query_test to {:?}:53 - sent=true reply_received={} qr_bit_set={} answer_count={} parsed_a_record={:?}",
+        "[E1000] dns_query_test to {:?}:53 (hostname={}) - sent=true reply_received={} qr_bit_set={} answer_count={} parsed_a_record={:?}",
         target_ip,
+        hostname,
         reply_received,
         qr_bit_set,
         answer_count,
         parsed_a_record
     );
     serial_println!(
-        "[E1000] dns_query_test target={:?} port=53 sent=true reply_received={} qr_bit_set={} answer_count={} parsed_a_record={:?}",
+        "[E1000] dns_query_test target={:?} port=53 sent=true reply_received={} qr_bit_set={} answer_count={} parsed_a_record={:?} hostname={}",
         target_ip,
         reply_received,
         qr_bit_set,
         answer_count,
-        parsed_a_record
+        parsed_a_record,
+        hostname
     );
 
     Ok((reply_received, qr_bit_set, answer_count, parsed_a_record))

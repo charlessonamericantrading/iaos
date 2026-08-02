@@ -2039,6 +2039,61 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // Fase 110: test real DNS query building (net::dns::build_query /
+    // encode_qname) - the encoding-side mirror of the answer-parsing
+    // self-test right above, closing the gap dns_query_test's own doc
+    // used to flag (a fixed "example.com" query was the only content it
+    // could ever send, since there was no general-purpose builder yet).
+    // Pure logic, no hardware dependency, same "protocol layer first"
+    // order.
+    //
+    // valid_query_matches_known_bytes rebuilds Fase 106's own original
+    // hand-built 29-byte "A? example.com" query (transaction ID 0x1234)
+    // through the new general-purpose builder and confirms the output
+    // is byte-for-byte identical - the actual proof this is a real
+    // generalization, not just a different-shaped function that happens
+    // to also produce SOME query. The other three cases each confirm a
+    // genuinely invalid hostname is rejected rather than silently
+    // mis-encoded, the same discipline the answer-parse self-test above
+    // already established with its own corrupted-fixture cases.
+    kprintln!("[KERNEL INIT] Testing real DNS query building (net::dns::build_query)...");
+    {
+        use net::dns;
+
+        #[rustfmt::skip]
+        const EXPECTED_EXAMPLE_COM_QUERY: [u8; 29] = [
+            0x12, 0x34, // transaction ID
+            0x01, 0x00, // flags: standard query, recursion desired
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, // ANCOUNT = 0
+            0x00, 0x00, // NSCOUNT = 0
+            0x00, 0x00, // ARCOUNT = 0
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', // "example"
+            0x03, b'c', b'o', b'm', // "com"
+            0x00, // QNAME terminator
+            0x00, 0x01, // QTYPE = A
+            0x00, 0x01, // QCLASS = IN
+        ];
+        let valid_query_matches_known_bytes =
+            dns::build_query(0x1234, "example.com") == Ok(EXPECTED_EXAMPLE_COM_QUERY.to_vec());
+
+        let empty_hostname_rejected = dns::build_query(0x1234, "").is_err();
+
+        let over_long_label = "a".repeat(64);
+        let over_long_label_rejected = dns::build_query(0x1234, &over_long_label).is_err();
+
+        let empty_label_rejected = dns::build_query(0x1234, "a..b").is_err();
+
+        kprintln!(
+            "[DNS] query-build self-test: valid_query_matches_known_bytes={} empty_hostname_rejected={} over_long_label_rejected={} empty_label_rejected={}",
+            valid_query_matches_known_bytes, empty_hostname_rejected, over_long_label_rejected, empty_label_rejected
+        );
+        serial_println!(
+            "[DNS] build_query_selftest valid_query_matches_known_bytes={} empty_hostname_rejected={} over_long_label_rejected={} empty_label_rejected={}",
+            valid_query_matches_known_bytes, empty_hostname_rejected, over_long_label_rejected, empty_label_rejected
+        );
+    }
+
     // 7b-7. Test real, generalized ARP resolution (Fase 48) - arp_resolve
     // sends a real ARP request for an arbitrary target IP and resolves its
     // MAC via the same TX+RX mechanics send_test_frame/receive_test_frame
@@ -2150,7 +2205,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!(
         "[KERNEL INIT] Testing real UDP round trip via SLIRP's DNS proxy (net::e1000::dns_query_test)..."
     );
-    match net::e1000::dns_query_test([10, 0, 2, 3]) {
+    match net::e1000::dns_query_test([10, 0, 2, 3], "example.com") {
         Ok(_) => {}
         Err(e) => {
             kprintln!("[E1000] dns_query_test(10.0.2.3:53): {}", e);
