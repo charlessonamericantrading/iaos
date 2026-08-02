@@ -1918,6 +1918,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // netcheck (Fase 46).
     shell::dispatch_command("ping 10.0.2.2");
 
+    // 7b-9b. Test the first real TCP round trip this kernel has ever
+    // attempted (Fase 89, net::e1000::tcp_syn_test) - sends a genuine
+    // SYN to a `guestfwd` target (see boot_kernel.bat/kernel-ci.yml's
+    // own `-netdev ...,guestfwd=tcp:10.0.2.100:9999-cmd:cat`, added this
+    // same Fase and verified in isolation to cause zero regression
+    // before becoming a standing part of the boot command) and polls
+    // for a genuine, fully-validated SYN-ACK reply - QEMU's own SLIRP
+    // terminates the connection with its own real TCP stack, entirely
+    // locally, with zero dependency on real network reachability, the
+    // same testing philosophy `arp_resolve`/`ping` already established
+    // against SLIRP's own fixed gateway. Honestly uncertain going in
+    // whether this actually produces a real SYN-ACK (never attempted
+    // before this Fase, and `guestfwd` itself was new research this
+    // Fase) - see net::e1000::tcp_syn_test's own doc for why this is
+    // expected to work, not assumed.
+    kprintln!(
+        "[KERNEL INIT] Testing a real TCP SYN/SYN-ACK round trip (net::e1000::tcp_syn_test)..."
+    );
+    match net::e1000::tcp_syn_test([10, 0, 2, 100], 9999) {
+        Ok(_) => {}
+        Err(e) => {
+            kprintln!("[E1000] tcp_syn_test(10.0.2.100:9999): {}", e);
+            serial_println!("[E1000] tcp_syn_test_result -> FAILED: {}", e);
+        }
+    }
+
     shell::dispatch_command("disk");
     shell::dispatch_command("ls");
     shell::dispatch_command("cat KERNEL~1");

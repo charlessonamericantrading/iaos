@@ -76,7 +76,7 @@ jobs:
           timeout 25 qemu-system-x86_64 \
             -drive format=raw,file=agentos-kernel/target/disk-image/agentos-bios.img \
             -serial stdio -display none -no-reboot -no-shutdown \
-            -netdev user,id=e1000net -device e1000,netdev=e1000net \
+            -netdev user,id=e1000net,guestfwd=tcp:10.0.2.100:9999-cmd:cat -device e1000,netdev=e1000net \
             -netdev user,id=virtionet -device virtio-net-pci,netdev=virtionet \
             | tee boot.log || true
           echo "----- full boot.log -----"
@@ -907,6 +907,26 @@ jobs:
             exit 1
           fi
           grep -q "SHELL\] ping 10.0.2.2 -> ok" boot.log
+          # Fase 89: the first real TCP round trip this kernel has ever
+          # completed - a genuine SYN sent to a `guestfwd` target (see
+          # this same job's own -netdev ...,guestfwd=tcp:10.0.2.100:9999-
+          # cmd:cat, added this Fase and verified beforehand to cause
+          # zero regression), with a real, fully-validated SYN-ACK
+          # received back: checksum verified, flags exactly SYN|ACK,
+          # ports and acknowledgment number all matching what was sent.
+          # A real bug surfaced and got fixed getting here, found via a
+          # real packet capture (the same -object filter-dump technique
+          # that resolved the VirtIO RX mystery, Fase 82): SLIRP's own
+          # real TCP stack's SYN-ACK carries the standard MSS option
+          # (making its own data_offset 6, not 5) plus Ethernet padding
+          # up to the 60-byte minimum frame size - net::tcp::parse_tcp_
+          # segment originally rejected any options at all (fine for
+          # Fase 88's own pure, options-free unit test, wrong for a real
+          # reply), and tcp_syn_test itself was feeding it the ENTIRE
+          # remaining receive buffer instead of trimming to the real
+          # segment length the IP header's own Total Length field
+          # declares - both fixed this same Fase.
+          grep -q "E1000\] tcp_syn_test target=\[10, 0, 2, 100\] port=9999 syn_ack_received=true ack_matches=true" boot.log
           # Confirms the new ATA write path (Fase 23) genuinely wrote and
           # read back matching bytes - not just that write_sector()
           # returned without erroring. Deliberately NOT asserting the

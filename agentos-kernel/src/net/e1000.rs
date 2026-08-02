@@ -1111,3 +1111,278 @@ pub fn ping(target_ip: [u8; 4]) -> Result<(), &'static str> {
     }
     Err("ping: timed out waiting for a genuine ICMP echo reply")
 }
+
+/// Fase 89: the first real TCP round trip this kernel has ever
+/// attempted, sending a genuine SYN segment (`net::tcp::build_tcp_
+/// header`) to `target_ip:target_port` and polling for a genuine
+/// SYN-ACK reply, validating it fully: checksum, flags, ports, and that
+/// the acknowledgment number is really our own sequence number plus one,
+/// not just "some TCP-shaped bytes arrived". Mirrors `ping`'s own
+/// structure line for line (own RX/TX ring setup, `arp_resolve` for the
+/// destination MAC, the same TX-poll-DD/RX-poll-and-rearm shape), the
+/// same "duplicate the proven ring-setup shape rather than risk
+/// touching it" reasoning `arp_resolve`/`ping` themselves already
+/// established, now extended to a third protocol.
+///
+/// Deliberately targets a `guestfwd` address (see `boot_kernel.bat`/
+/// `kernel-ci.yml`'s own `-netdev ...,guestfwd=tcp:10.0.2.100:9999-cmd:
+/// cat`), not a real external server: QEMU's own SLIRP terminates the
+/// TCP connection itself with its own real, standards-compliant stack,
+/// piping the resulting byte stream to a spawned `cat` process on the
+/// host - genuinely real TCP protocol behavior, entirely local, with
+/// zero dependency on real network reachability (this kernel's own
+/// established testing philosophy - see e.g. `arp_resolve`/`ping`
+/// against SLIRP's own fixed gateway, never a real external address).
+///
+/// Does NOT yet send the final ACK to complete the 3-way handshake, or
+/// track any ongoing connection state - this Fase proves the send/
+/// receive/validate primitives are correct in isolation first, the same
+/// order e1000 TX (Fase 22/53) preceded RX (Fase 45) by a full Fase gap.
+pub fn tcp_syn_test(
+    target_ip: [u8; 4],
+    target_port: u16,
+) -> Result<crate::net::tcp::TcpSegmentInfo, &'static str> {
+    use crate::net::{icmp, tcp};
+
+    let dest_mac = arp_resolve(target_ip)?;
+    let (dev, mmio_base) = find_mmio_base()?;
+    dev.enable_bus_mastering();
+    let src_mac = read_mac(mmio_base);
+    const SRC_IP: [u8; 4] = [10, 0, 2, 15]; // SLIRP guest default
+    const SRC_PORT: u16 = 54321;
+    const INITIAL_SEQ: u32 = 0x1000_0000;
+
+    let tcp_header = tcp::build_tcp_header(
+        SRC_IP,
+        target_ip,
+        SRC_PORT,
+        target_port,
+        INITIAL_SEQ,
+        0,
+        tcp::TCP_FLAG_SYN,
+        65535,
+        &[],
+    );
+    let ipv4_header = icmp::build_ipv4_header(
+        1,
+        64,
+        tcp::IP_PROTOCOL_TCP,
+        SRC_IP,
+        target_ip,
+        tcp_header.len(),
+    );
+    let eth_header = icmp::build_ethernet_header(dest_mac, src_mac, icmp::ETHERTYPE_IPV4);
+
+    let mut frame: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(
+        icmp::ETHERNET_HEADER_LEN + icmp::IPV4_HEADER_LEN + tcp_header.len(),
+    );
+    frame.extend_from_slice(&eth_header);
+    frame.extend_from_slice(&ipv4_header);
+    frame.extend_from_slice(&tcp_header);
+
+    let rx_ring_frame = crate::memory::frame_allocator::allocate_frame();
+    let rx_buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let tx_ring_frame = crate::memory::frame_allocator::allocate_frame();
+    let tx_buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let phys_offset = PHYS_MEM_OFFSET.load(Ordering::Relaxed);
+    let rx_ring_virt = (phys_offset + rx_ring_frame.start_address().as_u64()) as *mut RxDescriptor;
+    let tx_ring_virt = (phys_offset + tx_ring_frame.start_address().as_u64()) as *mut TxDescriptor;
+    let tx_buf_virt = (phys_offset + tx_buf_frame.start_address().as_u64()) as *mut u8;
+
+    // Arm RX first, same ordering reasoning as arp_resolve/ping.
+    unsafe {
+        let empty_rx = RxDescriptor {
+            addr: 0,
+            length: 0,
+            checksum: 0,
+            status: 0,
+            errors: 0,
+            special: 0,
+        };
+        for i in 0..NUM_RX_DESCRIPTORS {
+            core::ptr::write_volatile(rx_ring_virt.add(i), empty_rx);
+        }
+        core::ptr::write_volatile(
+            rx_ring_virt,
+            RxDescriptor {
+                addr: rx_buf_frame.start_address().as_u64(),
+                length: 0,
+                checksum: 0,
+                status: 0,
+                errors: 0,
+                special: 0,
+            },
+        );
+        let rx_ring_phys = rx_ring_frame.start_address().as_u64();
+        write_reg(mmio_base, REG_RDBAL, (rx_ring_phys & 0xFFFF_FFFF) as u32);
+        write_reg(mmio_base, REG_RDBAH, (rx_ring_phys >> 32) as u32);
+        write_reg(mmio_base, REG_RDLEN, (NUM_RX_DESCRIPTORS * 16) as u32);
+        write_reg(mmio_base, REG_RDH, 0);
+        write_reg(mmio_base, REG_RDT, 1);
+        write_reg(mmio_base, REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(frame.as_ptr(), tx_buf_virt, frame.len());
+
+        let empty_tx = TxDescriptor {
+            addr: 0,
+            length: 0,
+            cso: 0,
+            cmd: 0,
+            status: 0,
+            css: 0,
+            special: 0,
+        };
+        for i in 0..NUM_TX_DESCRIPTORS {
+            core::ptr::write_volatile(tx_ring_virt.add(i), empty_tx);
+        }
+        core::ptr::write_volatile(
+            tx_ring_virt,
+            TxDescriptor {
+                addr: tx_buf_frame.start_address().as_u64(),
+                length: frame.len() as u16,
+                cso: 0,
+                cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
+                status: 0,
+                css: 0,
+                special: 0,
+            },
+        );
+
+        let ctrl = read_reg(mmio_base, REG_CTRL);
+        write_reg(mmio_base, REG_CTRL, ctrl | CTRL_SLU);
+
+        let tx_ring_phys = tx_ring_frame.start_address().as_u64();
+        write_reg(mmio_base, REG_TDBAL, (tx_ring_phys & 0xFFFF_FFFF) as u32);
+        write_reg(mmio_base, REG_TDBAH, (tx_ring_phys >> 32) as u32);
+        write_reg(mmio_base, REG_TDLEN, (NUM_TX_DESCRIPTORS * 16) as u32);
+        write_reg(mmio_base, REG_TDH, 0);
+        write_reg(mmio_base, REG_TDT, 0);
+        write_reg(mmio_base, REG_TIPG, TIPG_DEFAULT);
+        write_reg(
+            mmio_base,
+            REG_TCTL,
+            TCTL_EN | TCTL_PSP | TCTL_CT_DEFAULT | TCTL_COLD_FULL_DUPLEX,
+        );
+        write_reg(mmio_base, REG_TDT, 1);
+    }
+
+    let tx_start_tick = crate::interrupts::timer_ticks();
+    let mut tx_ok = false;
+    unsafe {
+        loop {
+            let status = core::ptr::read_volatile(core::ptr::addr_of!((*tx_ring_virt).status));
+            if status & TXD_STATUS_DD != 0 {
+                tx_ok = true;
+                break;
+            }
+            if crate::interrupts::timer_ticks() - tx_start_tick > 90 {
+                break;
+            }
+            x86_64::instructions::hlt();
+        }
+    }
+    if !tx_ok {
+        return Err("tcp_syn_test: TX timed out waiting for descriptor DD");
+    }
+
+    let rx_start_tick = crate::interrupts::timer_ticks();
+    unsafe {
+        loop {
+            let status = core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).status));
+            if status & RXD_STAT_DD != 0 {
+                let length =
+                    core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).length)) as usize;
+                let buf_virt = (phys_offset + rx_buf_frame.start_address().as_u64()) as *const u8;
+                let data = core::slice::from_raw_parts(buf_virt, length);
+
+                // Ethernet: EtherType IPv4. IPv4: protocol TCP, header
+                // checksum valid, source address is the guestfwd target
+                // (its reply, addressed back to us) - the same
+                // independent-checks shape ping's own is_our_reply
+                // check already established, just for TCP instead of
+                // ICMP.
+                let ip_start = icmp::ETHERNET_HEADER_LEN;
+                let tcp_start = ip_start + icmp::IPV4_HEADER_LEN;
+                let is_our_reply = data.len() > tcp_start
+                    && data[12] == 0x08
+                    && data[13] == 0x00
+                    && data[ip_start + 9] == tcp::IP_PROTOCOL_TCP
+                    && icmp::checksum_is_valid(&data[ip_start..tcp_start])
+                    && data[ip_start + 12..ip_start + 16] == target_ip;
+
+                // Fase 89's own real-world bug, caught by this exact
+                // test's first boot (confirmed via a real packet
+                // capture, not guessed): the received buffer's own
+                // length is NOT the same as the real TCP segment's own
+                // length - a real reply is very likely padded up to
+                // Ethernet's 60-byte minimum frame size, and a real TCP
+                // stack's own SYN-ACK almost always carries the
+                // standard MSS option too, both adding real, extra
+                // bytes beyond a bare 20-byte header that must NOT be
+                // fed into the checksum sum (the ORIGINAL sender never
+                // included them in its own tcp_len calculation). The
+                // IPv4 header's own Total Length field is the one
+                // authoritative source for how many bytes past the IP
+                // header genuinely belong to this packet - trimming to
+                // exactly that, not "everything left in the receive
+                // buffer", is what let parse_tcp_segment's own checksum
+                // verification agree with the real sender's.
+                let ip_total_len = if is_our_reply {
+                    u16::from_be_bytes([data[ip_start + 2], data[ip_start + 3]]) as usize
+                } else {
+                    0
+                };
+                let real_tcp_len = ip_total_len.saturating_sub(icmp::IPV4_HEADER_LEN);
+                let tcp_end = (tcp_start + real_tcp_len).min(data.len());
+
+                if is_our_reply {
+                    if let Ok(info) =
+                        tcp::parse_tcp_segment(target_ip, SRC_IP, &data[tcp_start..tcp_end])
+                    {
+                        let is_syn_ack = info.flags == (tcp::TCP_FLAG_SYN | tcp::TCP_FLAG_ACK)
+                            && info.source_port == target_port
+                            && info.dest_port == SRC_PORT
+                            && info.ack_num == INITIAL_SEQ.wrapping_add(1);
+                        if is_syn_ack {
+                            kprintln!(
+                                "[E1000] tcp_syn_test to {:?}:{}: real SYN-ACK received (seq={:#x} ack={:#x})",
+                                target_ip,
+                                target_port,
+                                info.seq_num,
+                                info.ack_num
+                            );
+                            serial_println!(
+                                "[E1000] tcp_syn_test target={:?} port={} syn_ack_received=true ack_matches=true",
+                                target_ip,
+                                target_port
+                            );
+                            return Ok(info);
+                        }
+                    }
+                }
+
+                // Not our reply - rearm this same descriptor and keep
+                // polling, same reasoning as arp_resolve/ping.
+                core::ptr::write_volatile(
+                    rx_ring_virt,
+                    RxDescriptor {
+                        addr: rx_buf_frame.start_address().as_u64(),
+                        length: 0,
+                        checksum: 0,
+                        status: 0,
+                        errors: 0,
+                        special: 0,
+                    },
+                );
+                write_reg(mmio_base, REG_RDT, 1);
+            }
+            if crate::interrupts::timer_ticks() - rx_start_tick > 90 {
+                break;
+            }
+            x86_64::instructions::hlt();
+        }
+    }
+    Err("tcp_syn_test: timed out waiting for a genuine SYN-ACK reply")
+}

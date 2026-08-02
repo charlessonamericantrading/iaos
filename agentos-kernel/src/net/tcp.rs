@@ -108,11 +108,29 @@ pub struct TcpSegmentInfo {
 /// Parses `segment`'s header fields, having first verified its
 /// pseudo-header checksum against the given source/dest IPs - a caller
 /// only ever gets back a result it can trust, covering a too-short
-/// buffer, a header with options (unsupported - `data_offset != 5`), and
-/// a checksum mismatch all as `Err`. `segment` is the TCP header
-/// followed by its payload (if any) - unlike ICMP, the checksum here
-/// depends on IPs the segment bytes alone don't carry, so they're
-/// required parameters, not optional context.
+/// buffer, an impossible data offset, and a checksum mismatch all as
+/// `Err`. `segment` must be EXACTLY the real TCP portion (header,
+/// options if any, and payload if any) - the caller is responsible for
+/// trimming it to the length the IP header's own Total Length field
+/// declares, never just "everything left in a receive buffer" (which
+/// may include Ethernet-level padding up to the 60-byte minimum frame
+/// size - real, extra bytes on the wire that are NOT part of the TCP
+/// segment and would otherwise corrupt the checksum sum).
+///
+/// Fase 89's own first real-world use caught a real gap here: this
+/// function originally rejected anything but a bare, options-free
+/// 20-byte header (`data_offset != 5`) - reasonable for Fase 88's own
+/// pure, hand-built unit test, but WRONG for a genuine reply from a
+/// real TCP stack, which (confirmed via a real packet capture) almost
+/// always includes at least the standard MSS option, making its own
+/// `data_offset` 6 (24 bytes), not 5. The 6 fixed fields this function
+/// reads (ports, sequence/ack numbers, flags, window) all live in the
+/// first 20 bytes regardless of whether options follow - options are
+/// simply skipped, not parsed, so accepting `data_offset >= 5` (an
+/// impossible/truncated header stays rejected) costs nothing here.
+/// `segment` is the TCP header followed by its payload (if any) - unlike
+/// ICMP, the checksum here depends on IPs the segment bytes alone don't
+/// carry, so they're required parameters, not optional context.
 pub fn parse_tcp_segment(
     source_ip: [u8; 4],
     dest_ip: [u8; 4],
@@ -122,8 +140,8 @@ pub fn parse_tcp_segment(
         return Err("TCP segment shorter than the 20-byte header");
     }
     let data_offset_words = segment[12] >> 4;
-    if data_offset_words != 5 {
-        return Err("TCP header has options (data offset != 5) - unsupported");
+    if data_offset_words < 5 {
+        return Err("TCP header claims an impossible data offset (< 5)");
     }
     if !tcp_checksum_is_valid(source_ip, dest_ip, segment) {
         return Err("TCP checksum mismatch - segment is corrupt or IPs don't match");
