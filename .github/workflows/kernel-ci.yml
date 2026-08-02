@@ -927,6 +927,23 @@ jobs:
           # segment length the IP header's own Total Length field
           # declares - both fixed this same Fase.
           grep -q "E1000\] tcp_syn_test target=\[10, 0, 2, 100\] port=9999 syn_ack_received=true ack_matches=true" boot.log
+          # Fase 90: completes the handshake tcp_syn_test deliberately
+          # left open (its own doc: "does NOT yet send the final ACK")
+          # and proves the connection is genuinely usable - a real final
+          # ACK, then a real PSH|ACK data segment, then a genuine echoed
+          # reply from the guestfwd target's own `cat` process carrying
+          # the exact same bytes back. Verified locally via a real
+          # packet capture that this kernel's own SYN/final-ACK/data
+          # segments are all correct (right seq/ack numbers throughout);
+          # the actual echo could not be exercised on this repo's local
+          # Windows dev machine because that QEMU build's `guestfwd`
+          # helper-process spawning is itself broken there (logs
+          # `Slirp: fork_exec: Failed to execute helper program`, a
+          # POSIX-fork-shaped feature with no Windows equivalent) - this
+          # Linux CI runner has a real `cat` and native fork/exec, so
+          # this is the first real environment where the full round
+          # trip - including the echo - can actually complete.
+          grep -q "E1000\] tcp_echo_test target=\[10, 0, 2, 100\] port=9999 handshake_complete=true echo_len=24 echo_matches=true" boot.log
           # Confirms the new ATA write path (Fase 23) genuinely wrote and
           # read back matching bytes - not just that write_sector()
           # returned without erroring. Deliberately NOT asserting the

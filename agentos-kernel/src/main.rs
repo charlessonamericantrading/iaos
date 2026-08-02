@@ -1944,6 +1944,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // 7b-9c. Fase 90: complete the handshake tcp_syn_test deliberately
+    // left open (its own doc comment: "does NOT yet send the final
+    // ACK ... or track any ongoing connection state") and prove the
+    // resulting connection is genuinely usable - a real final ACK, a
+    // real PSH|ACK data segment, and (since the guestfwd target is
+    // `cat`) a genuine echoed reply carrying the exact same bytes back.
+    // See net::e1000::tcp_echo_test's own doc for the full sequence and
+    // why a distinct source port from tcp_syn_test's own self-test
+    // avoids any leftover half-open-handshake ambiguity.
+    kprintln!(
+        "[KERNEL INIT] Testing TCP handshake completion + real data echo (net::e1000::tcp_echo_test)..."
+    );
+    match net::e1000::tcp_echo_test([10, 0, 2, 100], 9999, b"AgentOS Fase90 TCP echo\n") {
+        Ok(_) => {}
+        Err(e) => {
+            kprintln!("[E1000] tcp_echo_test(10.0.2.100:9999): {}", e);
+            serial_println!("[E1000] tcp_echo_test_result -> FAILED: {}", e);
+        }
+    }
+
     shell::dispatch_command("disk");
     shell::dispatch_command("ls");
     shell::dispatch_command("cat KERNEL~1");

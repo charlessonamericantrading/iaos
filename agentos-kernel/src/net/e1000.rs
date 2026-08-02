@@ -1386,3 +1386,437 @@ pub fn tcp_syn_test(
     }
     Err("tcp_syn_test: timed out waiting for a genuine SYN-ACK reply")
 }
+
+/// Assembles a full Ethernet+IPv4+TCP frame (the header already carrying
+/// a correct checksum over `payload` too, per `tcp::build_tcp_header`'s
+/// own contract). A small private helper shared by `tcp_echo_test`'s
+/// three distinct sends (SYN, final ACK, PSH|ACK data) so the frame-
+/// assembly logic `tcp_syn_test` already proved correct isn't hand-
+/// copied three times in one function.
+fn build_tcp_frame(
+    dest_mac: [u8; 6],
+    src_mac: [u8; 6],
+    src_ip: [u8; 4],
+    dest_ip: [u8; 4],
+    tcp_header: [u8; crate::net::tcp::TCP_HEADER_LEN],
+    payload: &[u8],
+) -> alloc::vec::Vec<u8> {
+    use crate::net::icmp;
+    let ipv4_header = icmp::build_ipv4_header(
+        1,
+        64,
+        crate::net::tcp::IP_PROTOCOL_TCP,
+        src_ip,
+        dest_ip,
+        tcp_header.len() + payload.len(),
+    );
+    let eth_header = icmp::build_ethernet_header(dest_mac, src_mac, icmp::ETHERTYPE_IPV4);
+    let mut frame: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(
+        icmp::ETHERNET_HEADER_LEN + icmp::IPV4_HEADER_LEN + tcp_header.len() + payload.len(),
+    );
+    frame.extend_from_slice(&eth_header);
+    frame.extend_from_slice(&ipv4_header);
+    frame.extend_from_slice(&tcp_header);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Fase 90: picks up exactly where `tcp_syn_test` deliberately stopped
+/// (its own doc comment: "does NOT yet send the final ACK ... or track
+/// any ongoing connection state") and proves the resulting connection
+/// is genuinely usable - not just "the peer accepted our SYN" but "the
+/// peer accepts real application data over this connection and answers
+/// back on it".
+///
+/// Sequence, against the same `guestfwd` target `tcp_syn_test` already
+/// established (SLIRP's own real TCP stack, piping the byte stream to a
+/// spawned `cat` process - see `boot_kernel.bat`/`kernel-ci.yml`):
+///   1. SYN (own ISN `INITIAL_SEQ`) - same as `tcp_syn_test`.
+///   2. Receive + validate the real SYN-ACK, capturing the peer's own
+///      ISN (`info.seq_num`) - the one piece of state a genuine
+///      handshake cannot skip, since the final ACK's own ack-number
+///      depends on a value only the peer chose.
+///   3. Final ACK (seq = `INITIAL_SEQ`+1, ack = peer ISN+1, no
+///      payload): the segment `tcp_syn_test` never sent. Completes
+///      the handshake; SLIRP now considers the connection
+///      ESTABLISHED. No reply is expected for a bare ACK, so this
+///      step doesn't wait on RX.
+///   4. A real PSH|ACK data segment carrying `payload`.
+///   5. Poll RX for `cat`'s own echoed reply - skipping any bare
+///      (payload-less) ACK the stack may send first to acknowledge step
+///      4 before `cat` itself has actually written the echo back - and
+///      return the echoed bytes so the caller can compare them byte for
+///      byte against what was sent.
+///
+/// Uses three separate TX descriptors (one per send) at fixed 256-byte
+/// offsets within a single shared TX buffer page, rather than reusing
+/// descriptor 0 three times: once a descriptor's DD bit is set the NIC
+/// itself is done with it, but the ring's own tail pointer has already
+/// advanced past it, so re-arming the same slot would need to wait for
+/// a full wraparound. Advancing to a fresh descriptor index each time
+/// (0, 1, 2 - well within this ring's 8-descriptor capacity) is the
+/// standard, unambiguous way to queue several sends in sequence.
+/// Assumes `payload` is short enough (well under the 256-byte slot
+/// stride, once its own headers are counted) to share the same buffer
+/// page as the SYN/ACK slots - true for this Fase's own self-test, not
+/// a general-purpose send API yet.
+///
+/// Fase 90's own local verification hit a real, environment-specific
+/// limit worth recording: on this machine's Windows QEMU build, the
+/// `guestfwd=...-cmd:cat` helper process fails to spawn at all (QEMU
+/// itself logs `Slirp: fork_exec: Failed to execute helper program`,
+/// a POSIX-`fork()`-shaped feature with no real Windows equivalent).
+/// Confirmed via a real packet capture that this does NOT indict this
+/// function's own logic: the SYN, real SYN-ACK, final ACK (correct
+/// seq/ack numbers), and PSH|ACK data segment all appear on the wire
+/// exactly as intended - SLIRP's own stack simply tears the connection
+/// down (FIN, then RST once more data arrives) because there is no
+/// helper process on the other end to hand the bytes to, not because
+/// anything this function sent was wrong. CI runs on `ubuntu-latest`,
+/// where `cat` and POSIX `fork()`/`exec()` are native, so the full
+/// round trip (including the real echo) is expected to complete there
+/// even though it cannot locally on this machine.
+pub fn tcp_echo_test(
+    target_ip: [u8; 4],
+    target_port: u16,
+    payload: &[u8],
+) -> Result<alloc::vec::Vec<u8>, &'static str> {
+    use crate::net::{icmp, tcp};
+
+    let dest_mac = arp_resolve(target_ip)?;
+    let (dev, mmio_base) = find_mmio_base()?;
+    dev.enable_bus_mastering();
+    let src_mac = read_mac(mmio_base);
+    const SRC_IP: [u8; 4] = [10, 0, 2, 15]; // SLIRP guest default
+    const SRC_PORT: u16 = 54322; // distinct from tcp_syn_test's own 54321, so a leftover half-open handshake from that test can never be confused with this one's fresh 4-tuple
+    const INITIAL_SEQ: u32 = 0x3000_0000;
+
+    let syn_header = tcp::build_tcp_header(
+        SRC_IP,
+        target_ip,
+        SRC_PORT,
+        target_port,
+        INITIAL_SEQ,
+        0,
+        tcp::TCP_FLAG_SYN,
+        65535,
+        &[],
+    );
+    let syn_frame = build_tcp_frame(dest_mac, src_mac, SRC_IP, target_ip, syn_header, &[]);
+
+    let rx_ring_frame = crate::memory::frame_allocator::allocate_frame();
+    let rx_buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let tx_ring_frame = crate::memory::frame_allocator::allocate_frame();
+    let tx_buf_frame = crate::memory::frame_allocator::allocate_frame();
+    let phys_offset = PHYS_MEM_OFFSET.load(Ordering::Relaxed);
+    let rx_ring_virt = (phys_offset + rx_ring_frame.start_address().as_u64()) as *mut RxDescriptor;
+    let tx_ring_virt = (phys_offset + tx_ring_frame.start_address().as_u64()) as *mut TxDescriptor;
+    let tx_buf_virt = (phys_offset + tx_buf_frame.start_address().as_u64()) as *mut u8;
+    let tx_buf_phys = tx_buf_frame.start_address().as_u64();
+    const TX_SLOT_STRIDE: u64 = 256; // comfortably bigger than any single SYN/ACK/DATA frame here (<= 54 + payload.len() bytes)
+
+    // Arm RX first, same ordering reasoning as arp_resolve/ping/tcp_syn_test.
+    unsafe {
+        let empty_rx = RxDescriptor {
+            addr: 0,
+            length: 0,
+            checksum: 0,
+            status: 0,
+            errors: 0,
+            special: 0,
+        };
+        for i in 0..NUM_RX_DESCRIPTORS {
+            core::ptr::write_volatile(rx_ring_virt.add(i), empty_rx);
+        }
+        core::ptr::write_volatile(
+            rx_ring_virt,
+            RxDescriptor {
+                addr: rx_buf_frame.start_address().as_u64(),
+                length: 0,
+                checksum: 0,
+                status: 0,
+                errors: 0,
+                special: 0,
+            },
+        );
+        let rx_ring_phys = rx_ring_frame.start_address().as_u64();
+        write_reg(mmio_base, REG_RDBAL, (rx_ring_phys & 0xFFFF_FFFF) as u32);
+        write_reg(mmio_base, REG_RDBAH, (rx_ring_phys >> 32) as u32);
+        write_reg(mmio_base, REG_RDLEN, (NUM_RX_DESCRIPTORS * 16) as u32);
+        write_reg(mmio_base, REG_RDH, 0);
+        write_reg(mmio_base, REG_RDT, 1);
+        write_reg(mmio_base, REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
+    }
+
+    unsafe {
+        let empty_tx = TxDescriptor {
+            addr: 0,
+            length: 0,
+            cso: 0,
+            cmd: 0,
+            status: 0,
+            css: 0,
+            special: 0,
+        };
+        for i in 0..NUM_TX_DESCRIPTORS {
+            core::ptr::write_volatile(tx_ring_virt.add(i), empty_tx);
+        }
+
+        let ctrl = read_reg(mmio_base, REG_CTRL);
+        write_reg(mmio_base, REG_CTRL, ctrl | CTRL_SLU);
+
+        let tx_ring_phys = tx_ring_frame.start_address().as_u64();
+        write_reg(mmio_base, REG_TDBAL, (tx_ring_phys & 0xFFFF_FFFF) as u32);
+        write_reg(mmio_base, REG_TDBAH, (tx_ring_phys >> 32) as u32);
+        write_reg(mmio_base, REG_TDLEN, (NUM_TX_DESCRIPTORS * 16) as u32);
+        write_reg(mmio_base, REG_TDH, 0);
+        write_reg(mmio_base, REG_TDT, 0);
+        write_reg(mmio_base, REG_TIPG, TIPG_DEFAULT);
+        write_reg(
+            mmio_base,
+            REG_TCTL,
+            TCTL_EN | TCTL_PSP | TCTL_CT_DEFAULT | TCTL_COLD_FULL_DUPLEX,
+        );
+    }
+
+    // Queues `frame` into TX descriptor `slot`, bumps TDT to `slot + 1`,
+    // and waits for that descriptor's own DD bit - `tcp_syn_test`'s
+    // existing TX-wait shape, parameterized over which slot/buffer
+    // offset this particular send uses.
+    let send_and_wait = move |slot: usize, frame: &[u8]| -> Result<(), &'static str> {
+        unsafe {
+            let buf_ptr = tx_buf_virt.add(slot * TX_SLOT_STRIDE as usize);
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), buf_ptr, frame.len());
+            core::ptr::write_volatile(
+                tx_ring_virt.add(slot),
+                TxDescriptor {
+                    addr: tx_buf_phys + (slot as u64) * TX_SLOT_STRIDE,
+                    length: frame.len() as u16,
+                    cso: 0,
+                    cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
+                    status: 0,
+                    css: 0,
+                    special: 0,
+                },
+            );
+            write_reg(mmio_base, REG_TDT, (slot + 1) as u32);
+
+            let start_tick = crate::interrupts::timer_ticks();
+            loop {
+                let status =
+                    core::ptr::read_volatile(core::ptr::addr_of!((*tx_ring_virt.add(slot)).status));
+                if status & TXD_STATUS_DD != 0 {
+                    return Ok(());
+                }
+                if crate::interrupts::timer_ticks() - start_tick > 90 {
+                    return Err("tcp_echo_test: TX timed out waiting for descriptor DD");
+                }
+                x86_64::instructions::hlt();
+            }
+        }
+    };
+
+    send_and_wait(0, &syn_frame)?;
+
+    // Phase 1: receive + validate the real SYN-ACK - the same
+    // independent checks (EtherType, IP protocol, IP header checksum,
+    // source IP, Total-Length-based trim before the TCP checksum)
+    // `tcp_syn_test` itself established.
+    let mut peer_isn: Option<u32> = None;
+    let rx_start_tick = crate::interrupts::timer_ticks();
+    unsafe {
+        loop {
+            let status = core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).status));
+            if status & RXD_STAT_DD != 0 {
+                let length =
+                    core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).length)) as usize;
+                let buf_virt = (phys_offset + rx_buf_frame.start_address().as_u64()) as *const u8;
+                let data = core::slice::from_raw_parts(buf_virt, length);
+
+                let ip_start = icmp::ETHERNET_HEADER_LEN;
+                let tcp_start = ip_start + icmp::IPV4_HEADER_LEN;
+                let is_our_reply = data.len() > tcp_start
+                    && data[12] == 0x08
+                    && data[13] == 0x00
+                    && data[ip_start + 9] == tcp::IP_PROTOCOL_TCP
+                    && icmp::checksum_is_valid(&data[ip_start..tcp_start])
+                    && data[ip_start + 12..ip_start + 16] == target_ip;
+
+                let ip_total_len = if is_our_reply {
+                    u16::from_be_bytes([data[ip_start + 2], data[ip_start + 3]]) as usize
+                } else {
+                    0
+                };
+                let real_tcp_len = ip_total_len.saturating_sub(icmp::IPV4_HEADER_LEN);
+                let tcp_end = (tcp_start + real_tcp_len).min(data.len());
+
+                if is_our_reply {
+                    if let Ok(info) =
+                        tcp::parse_tcp_segment(target_ip, SRC_IP, &data[tcp_start..tcp_end])
+                    {
+                        let is_syn_ack = info.flags == (tcp::TCP_FLAG_SYN | tcp::TCP_FLAG_ACK)
+                            && info.source_port == target_port
+                            && info.dest_port == SRC_PORT
+                            && info.ack_num == INITIAL_SEQ.wrapping_add(1);
+                        if is_syn_ack {
+                            peer_isn = Some(info.seq_num);
+                        }
+                    }
+                }
+
+                // Rearm regardless of match - either this phase is done
+                // and phase 4 needs a fresh descriptor, or this frame
+                // wasn't our SYN-ACK and we keep waiting, same
+                // reasoning as tcp_syn_test/arp_resolve.
+                core::ptr::write_volatile(
+                    rx_ring_virt,
+                    RxDescriptor {
+                        addr: rx_buf_frame.start_address().as_u64(),
+                        length: 0,
+                        checksum: 0,
+                        status: 0,
+                        errors: 0,
+                        special: 0,
+                    },
+                );
+                write_reg(mmio_base, REG_RDT, 1);
+
+                if peer_isn.is_some() {
+                    break;
+                }
+            }
+            if crate::interrupts::timer_ticks() - rx_start_tick > 90 {
+                break;
+            }
+            x86_64::instructions::hlt();
+        }
+    }
+    let peer_isn =
+        peer_isn.ok_or("tcp_echo_test: timed out waiting for a genuine SYN-ACK reply")?;
+
+    kprintln!(
+        "[E1000] tcp_echo_test to {:?}:{}: real SYN-ACK received (peer_isn={:#x}), completing handshake",
+        target_ip,
+        target_port,
+        peer_isn
+    );
+
+    // Phase 2: the final ACK - completes the handshake. No payload, so
+    // no reply is expected; SLIRP considers the connection ESTABLISHED
+    // from this point on.
+    let ack_header = tcp::build_tcp_header(
+        SRC_IP,
+        target_ip,
+        SRC_PORT,
+        target_port,
+        INITIAL_SEQ.wrapping_add(1),
+        peer_isn.wrapping_add(1),
+        tcp::TCP_FLAG_ACK,
+        65535,
+        &[],
+    );
+    let ack_frame = build_tcp_frame(dest_mac, src_mac, SRC_IP, target_ip, ack_header, &[]);
+    send_and_wait(1, &ack_frame)?;
+
+    // Phase 3: the real application-data segment.
+    let data_header = tcp::build_tcp_header(
+        SRC_IP,
+        target_ip,
+        SRC_PORT,
+        target_port,
+        INITIAL_SEQ.wrapping_add(1),
+        peer_isn.wrapping_add(1),
+        tcp::TCP_FLAG_PSH | tcp::TCP_FLAG_ACK,
+        65535,
+        payload,
+    );
+    let data_frame = build_tcp_frame(dest_mac, src_mac, SRC_IP, target_ip, data_header, payload);
+    send_and_wait(2, &data_frame)?;
+
+    let expected_ack = INITIAL_SEQ
+        .wrapping_add(1)
+        .wrapping_add(payload.len() as u32);
+
+    // Phase 4: poll for cat's own echoed reply, skipping any bare ACK
+    // the stack sends first to acknowledge phase 3 before cat itself
+    // has actually written the echo back.
+    let echo_start_tick = crate::interrupts::timer_ticks();
+    unsafe {
+        loop {
+            let status = core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).status));
+            if status & RXD_STAT_DD != 0 {
+                let length =
+                    core::ptr::read_volatile(core::ptr::addr_of!((*rx_ring_virt).length)) as usize;
+                let buf_virt = (phys_offset + rx_buf_frame.start_address().as_u64()) as *const u8;
+                let data = core::slice::from_raw_parts(buf_virt, length);
+
+                let ip_start = icmp::ETHERNET_HEADER_LEN;
+                let tcp_start = ip_start + icmp::IPV4_HEADER_LEN;
+                let is_our_reply = data.len() > tcp_start
+                    && data[12] == 0x08
+                    && data[13] == 0x00
+                    && data[ip_start + 9] == tcp::IP_PROTOCOL_TCP
+                    && icmp::checksum_is_valid(&data[ip_start..tcp_start])
+                    && data[ip_start + 12..ip_start + 16] == target_ip;
+
+                let ip_total_len = if is_our_reply {
+                    u16::from_be_bytes([data[ip_start + 2], data[ip_start + 3]]) as usize
+                } else {
+                    0
+                };
+                let real_tcp_len = ip_total_len.saturating_sub(icmp::IPV4_HEADER_LEN);
+                let tcp_end = (tcp_start + real_tcp_len).min(data.len());
+
+                if is_our_reply {
+                    if let Ok(info) =
+                        tcp::parse_tcp_segment(target_ip, SRC_IP, &data[tcp_start..tcp_end])
+                    {
+                        let data_offset_words = data[tcp_start + 12] >> 4;
+                        let payload_start = tcp_start + (data_offset_words as usize) * 4;
+                        let echoed = if payload_start <= tcp_end {
+                            &data[payload_start..tcp_end]
+                        } else {
+                            &[]
+                        };
+                        let is_echo = info.source_port == target_port
+                            && info.dest_port == SRC_PORT
+                            && info.ack_num == expected_ack
+                            && !echoed.is_empty();
+                        if is_echo {
+                            kprintln!(
+                                "[E1000] tcp_echo_test: real echo received ({} bytes)",
+                                echoed.len()
+                            );
+                            serial_println!(
+                                "[E1000] tcp_echo_test target={:?} port={} handshake_complete=true echo_len={} echo_matches={}",
+                                target_ip,
+                                target_port,
+                                echoed.len(),
+                                echoed == payload
+                            );
+                            return Ok(echoed.to_vec());
+                        }
+                    }
+                }
+
+                core::ptr::write_volatile(
+                    rx_ring_virt,
+                    RxDescriptor {
+                        addr: rx_buf_frame.start_address().as_u64(),
+                        length: 0,
+                        checksum: 0,
+                        status: 0,
+                        errors: 0,
+                        special: 0,
+                    },
+                );
+                write_reg(mmio_base, REG_RDT, 1);
+            }
+            if crate::interrupts::timer_ticks() - echo_start_tick > 90 {
+                break;
+            }
+            x86_64::instructions::hlt();
+        }
+    }
+    Err("tcp_echo_test: timed out waiting for the real echoed data")
+}
