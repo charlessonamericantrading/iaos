@@ -4,10 +4,12 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 /// Bytes allocated per KV cache block. Kept small (not a realistic
-/// token-cache size) because it comes out of the kernel's current 100 KiB
-/// demo heap (see memory/heap.rs) - a real model-serving KV cache would
-/// need a much larger heap first. `token_capacity` is still recorded on
-/// each block separately for whenever that distinction starts to matter.
+/// token-cache size) because it comes out of the kernel's current 1 MiB
+/// heap (see memory/heap.rs, raised from an original 100 KiB once a real
+/// file read proved that too small) - a real model-serving KV cache
+/// would need a much larger heap still. `token_capacity` is still
+/// recorded on each block separately for whenever that distinction
+/// starts to matter.
 pub const KV_CACHE_PAGE_SIZE: usize = 4096;
 
 #[allow(dead_code)]
