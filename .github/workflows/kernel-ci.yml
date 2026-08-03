@@ -494,8 +494,11 @@ jobs:
           # send_ipv4_packet twice so this specifically confirms the count
           # printed for the SECOND call reads 2, not just that a lone call
           # prints some number - real proof it accumulates rather than
-          # being a stray one-off increment.
-          grep -q "VIRTIO-NET\] Simulated TX 56 bytes tx_count=2" boot.log
+          # being a stray one-off increment. Byte count bumped 56 -> 64 at
+          # Fase 161, when send_ipv4_packet started building a real 8-byte
+          # UDP header instead of writing the payload directly after the
+          # IPv4 header (14 Ethernet + 20 IPv4 + 8 UDP + 22 payload bytes).
+          grep -q "VIRTIO-NET\] Simulated TX 64 bytes tx_count=2" boot.log
           # Fase 152: VirtIONetDriver::rx_packets_count existed since this
           # project's very first commit but had no incrementer at all -
           # unlike tx_packets_count (Fase 147), this driver never had a
