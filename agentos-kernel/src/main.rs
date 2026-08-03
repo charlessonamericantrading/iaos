@@ -3815,6 +3815,35 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("rmdir MULTIOUT");
     shell::dispatch_command("ls");
 
+    // Fase 164: closes the 15th Explore-agent survey's candidate #1 -
+    // resolve_dir_path treated a subdirectory's own ".." entry (real FAT
+    // convention: cluster 0 means "the parent is root", since root has
+    // no cluster number of its own - fat12.rs::create_directory_impl's
+    // own doc comment) as an ordinary data cluster (`Some(0)`) instead
+    // of translating it back to this shell's own `None` = root
+    // sentinel, so `ls DIR/..` fed cluster 0 straight into
+    // `cluster_to_lba`, whose own `cluster - 2` then underflows on a
+    // raw, unchecked u32 - the same "unchecked subtraction on an
+    // externally-controlled value" class Fase 132/159/163 already
+    // closed elsewhere, just reachable here via ordinary interactive
+    // shell text instead of a syscall argument. `list_fat_directory`
+    // itself needed a matching fix too - it was the only one of 6
+    // path-resolving commands that treated a `None` result as "not
+    // found" instead of falling back to `list_root_directory`, the same
+    // shape `read_fat_file`/`create_fat_file`/`delete_fat_file`/
+    // `create_fat_directory`/`delete_fat_directory` already use.
+    // Confirms `ls DOTTEST/..` reports one MORE entry than the root's
+    // own count beforehand (DOTTEST itself, freshly created) - proof it
+    // genuinely resolved back to the real root directory's real,
+    // current contents, not a wrapped/garbage cluster silently
+    // returning some other number.
+    kprintln!("[KERNEL INIT] Testing 'DIR/..' path resolution (must resolve to real root)...");
+    shell::dispatch_command("ls");
+    shell::dispatch_command("mkdir DOTTEST");
+    shell::dispatch_command("ls DOTTEST/..");
+    shell::dispatch_command("rmdir DOTTEST");
+    shell::dispatch_command("ls");
+
     // 7e-3. Test Multi-Chunk VFAT Long File Names (>13 characters, needing
     // several chained long-name entries instead of the one Fase 38 could
     // build). "a very long descriptive name.txt" is 32 characters - past

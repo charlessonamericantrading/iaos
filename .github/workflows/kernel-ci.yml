@@ -1745,6 +1745,25 @@ jobs:
           grep -q "SHELL\] cat MULTIOUT/MULTIIN/DEEP.TXT -> FAILED: FAT12: file not found in directory" boot.log
           grep -q "SHELL\] rmdir MULTIOUT/MULTIIN -> deleted" boot.log
           grep -q "SHELL\] rmdir MULTIOUT -> deleted" boot.log
+          # Fase 164: closes the 15th Explore-agent survey's candidate #1
+          # - resolve_dir_path treated a subdirectory's own ".." entry
+          # (real FAT convention: cluster 0 means "the parent is root")
+          # as an ordinary data cluster (Some(0)) instead of translating
+          # it back to this shell's own None = root sentinel, so `ls
+          # DIR/..` fed cluster 0 straight into cluster_to_lba, whose own
+          # `cluster - 2` then underflows on a raw, unchecked u32 - the
+          # same "unchecked subtraction on an externally-controlled
+          # value" class Fase 132/159/163 already closed elsewhere, just
+          # reachable here via ordinary interactive shell text instead of
+          # a syscall argument. list_fat_directory itself needed a
+          # matching fix too - it was the only one of 6 path-resolving
+          # commands that treated a None result as "not found" instead of
+          # falling back to list_root_directory. "6 entries" is the real
+          # root count plus one (DOTTEST itself, freshly created) - proof
+          # it genuinely resolved back to the real root directory's real
+          # contents, not a wrapped/garbage cluster silently returning
+          # some other number.
+          grep -q "SHELL\] ls DOTTEST/\.\. -> 6 entries" boot.log
           # Confirms MULTI-CHUNK VFAT LONG FILE NAMES (Fase 40) - a name
           # past Fase 38's original 13-character single-entry cap now
           # chains multiple long-name entries instead of being rejected.

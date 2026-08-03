@@ -724,7 +724,20 @@ fn resolve_dir_path(
         if !entry.is_dir {
             return Err("that's a file, not a directory");
         }
-        cluster = Some(entry.start_cluster);
+        // A subdirectory's own ".." entry uses cluster 0 as the real FAT
+        // convention for "the parent is the root directory"
+        // (fat12.rs::create_directory_impl writes it that way, since the
+        // root has no cluster number of its own to point back to) -
+        // `Some(0)` would otherwise reach `cluster_to_lba` as if it were
+        // a real data cluster and underflow on its own `cluster - 2`.
+        // Translate it back to this function's own `None` = root
+        // representation instead, the same sentinel every other caller
+        // here already expects.
+        cluster = if entry.start_cluster == 0 {
+            None
+        } else {
+            Some(entry.start_cluster)
+        };
     }
     Ok(cluster)
 }
@@ -839,9 +852,18 @@ fn list_fat_directory(name: &str) -> Result<(), &'static str> {
     }
     let fs = crate::fat12::read_bpb(&partition)?;
     let segments = split_segments(name)?;
-    let cluster = resolve_dir_path(&fs, &segments)?.ok_or("no file or directory with that name")?;
-
-    let sub_entries = fs.list_directory(cluster)?;
+    // A path ending in ".." can legitimately resolve back to the root
+    // itself (see resolve_dir_path's own None-for-cluster-0 handling) -
+    // mirrors every other path-resolving command's own match shape
+    // (read_fat_file/create_fat_file/delete_fat_file/
+    // create_fat_directory/delete_fat_directory) instead of
+    // unconditionally treating a `None` result as "not found", which
+    // only ever fit the case of bare `ls` (already intercepted before
+    // this function is even called).
+    let sub_entries = match resolve_dir_path(&fs, &segments)? {
+        None => fs.list_root_directory()?,
+        Some(cluster) => fs.list_directory(cluster)?,
+    };
     kprintln!("{} ({} entries):", name, sub_entries.len());
     serial_println!("[SHELL] ls {} -> {} entries", name, sub_entries.len());
     for e in &sub_entries {
