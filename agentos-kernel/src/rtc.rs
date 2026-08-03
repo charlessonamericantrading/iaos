@@ -45,6 +45,32 @@ fn read_register(reg: u8) -> u8 {
     }
 }
 
+/// One CMOS read of all 7 registers `read_time` needs, after waiting out
+/// any Update-In-Progress window. Waiting for UIP to *clear* before the
+/// first register read only proves an update wasn't already underway -
+/// it doesn't stop the *next* one-per-second update from beginning again
+/// while these 7 sequential port reads are still in flight, which would
+/// silently produce a torn value (some fields already advanced to the
+/// new second, others not). `read_time` calls this twice in a row and
+/// compares, retrying until two consecutive reads agree, the standard
+/// CMOS RTC read protocol - fixing the 10th Explore-agent survey's
+/// candidate #3, a real but rare/hard-to-force-in-CI gap distinct from
+/// the midnight-conversion bug Fase 144 already fixed in this same file.
+fn read_raw_registers() -> (u8, u8, u8, u8, u8, u8, u8) {
+    while read_register(REG_STATUS_A) & STATUS_A_UPDATE_IN_PROGRESS != 0 {
+        core::hint::spin_loop();
+    }
+    (
+        read_register(REG_SECONDS),
+        read_register(REG_MINUTES),
+        read_register(REG_HOURS),
+        read_register(REG_DAY),
+        read_register(REG_MONTH),
+        read_register(REG_YEAR),
+        read_register(REG_STATUS_B),
+    )
+}
+
 fn bcd_to_binary(value: u8) -> u8 {
     (value & 0x0F) + ((value >> 4) * 10)
 }
@@ -70,28 +96,26 @@ pub fn normalize_hours_12h(hours_raw: u8, hours_12: u8) -> u8 {
 
 /// Reads the current wall-clock time from the CMOS RTC.
 ///
-/// Waits out any in-progress hardware update first (Status Register A's
-/// Update-In-Progress bit) - the chip updates its registers roughly once
-/// a second, and reading mid-update can return a torn value (some fields
-/// already advanced to the new second, others not yet), a real if
-/// uncommon source of an occasional nonsensical read if ignored.
+/// Gets the 7 raw registers from `read_raw_registers` (which itself waits
+/// out any in-progress hardware update, then reads all 7) and retries
+/// until two consecutive reads agree, guarding against the update that
+/// can begin again mid-read - see that function's own doc comment for
+/// the full reasoning.
 ///
 /// Also checks Status Register B rather than assuming BCD/24-hour mode:
 /// real hardware and QEMU's emulation can both be configured either way,
 /// and getting this wrong silently would misread every value (e.g.
 /// treating BCD `0x59` as decimal 89).
 pub fn read_time() -> RtcTime {
-    while read_register(REG_STATUS_A) & STATUS_A_UPDATE_IN_PROGRESS != 0 {
-        core::hint::spin_loop();
+    let mut raw = read_raw_registers();
+    loop {
+        let raw_again = read_raw_registers();
+        if raw == raw_again {
+            break;
+        }
+        raw = raw_again;
     }
-
-    let seconds_raw = read_register(REG_SECONDS);
-    let minutes_raw = read_register(REG_MINUTES);
-    let hours_raw = read_register(REG_HOURS);
-    let day_raw = read_register(REG_DAY);
-    let month_raw = read_register(REG_MONTH);
-    let year_raw = read_register(REG_YEAR);
-    let status_b = read_register(REG_STATUS_B);
+    let (seconds_raw, minutes_raw, hours_raw, day_raw, month_raw, year_raw, status_b) = raw;
 
     let is_binary = status_b & STATUS_B_BINARY_MODE != 0;
     let is_24h = status_b & STATUS_B_24_HOUR != 0;
