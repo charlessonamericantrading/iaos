@@ -142,15 +142,68 @@ impl Fat32Info {
         Ok(entries)
     }
 
-    /// Finds `name` (case-insensitive, short 8.3 form) in the root
+    /// Finds `name` (case-insensitive; either its short 8.3 form or its
+    /// VFAT long name, if it has one) in the cluster chain starting at
+    /// `start_cluster`, without collecting every other entry into a
+    /// `Vec` the way `list_directory` does.
+    ///
+    /// Fase 139: previously `read_file` went through `list_directory`
+    /// (built on the shared `fat_common::parse_dir_sector`, which - like
+    /// any plain listing - keeps only ONE resolved name per entry: the
+    /// long name if present, else the short one) and matched only that
+    /// single resolved `DirEntry::name` - so a file with both a long and
+    /// a short name could never be found by its short alias, unlike
+    /// `fat12.rs`'s own `find_entry_location_in`, which always checked
+    /// both forms independently. This method uses the same
+    /// `fat_common::short_entry_if_matches` helper that function was
+    /// refactored to share, closing that gap here too.
+    fn find_entry(&self, start_cluster: u32, name: &str) -> Result<DirEntry, &'static str> {
+        let mut cluster = start_cluster;
+        let mut sector_buf = [0u8; 512];
+        let mut lfn = fat_common::LfnState::default();
+
+        loop {
+            let cluster_lba = self.cluster_to_lba(cluster);
+            for s in 0..self.sectors_per_cluster as u32 {
+                ata::read_sector(cluster_lba + s, &mut sector_buf)?;
+                for raw in sector_buf.as_chunks::<32>().0 {
+                    if raw[0] == 0x00 {
+                        return Err("FAT32: file not found in root directory");
+                    }
+                    if raw[0] == 0xE5 {
+                        lfn.reset();
+                        continue;
+                    }
+                    if raw[11] == 0x0F {
+                        lfn.push_long_entry(raw);
+                        continue;
+                    }
+                    if raw[11] & 0x08 != 0 {
+                        lfn.reset(); // volume label
+                        continue;
+                    }
+                    if let Some(entry) = fat_common::short_entry_if_matches(raw, &mut lfn, name) {
+                        return Ok(entry);
+                    }
+                }
+            }
+
+            match self.next_cluster(cluster)? {
+                Some(next) => cluster = next,
+                None => return Err("FAT32: file not found in root directory"),
+            }
+        }
+    }
+
+    /// Finds `name` (case-insensitive; either its short 8.3 form or its
+    /// VFAT long name, if it has one - see `find_entry`) in the root
     /// directory and reads its full contents by walking its cluster
     /// chain.
     pub fn read_file(&self, name: &str) -> Result<Vec<u8>, &'static str> {
-        let entries = self.list_directory(self.root_cluster)?;
-        let entry = entries
-            .iter()
-            .find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(name))
-            .ok_or("FAT32: file not found in root directory")?;
+        let entry = self.find_entry(self.root_cluster, name)?;
+        if entry.is_dir {
+            return Err("FAT32: file not found in root directory");
+        }
 
         if entry.size == 0 {
             return Ok(Vec::new());

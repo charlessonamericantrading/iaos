@@ -150,6 +150,52 @@ pub fn format_short_name(name: &[u8], ext: &[u8]) -> String {
     s
 }
 
+/// Checks one raw 32-byte short entry against `target_name`, matching
+/// either its VFAT long name (if `lfn` has one pending and checksum-
+/// verified) OR its own raw short (8.3) name - matching EITHER form is
+/// enough, since a file that has both a long and a short name must be
+/// look-up-able by either one. Returns the resolved `DirEntry` (using
+/// the long name if present, else the short one - the same precedence
+/// `parse_dir_sector` already uses when just listing) on a match, `None`
+/// otherwise. Caller still handles `0x00`/`0xE5`/volume-label/`0x0F`
+/// entries itself (a match check only makes sense once a real short
+/// entry is reached) and must drive the same `lfn` instance through
+/// every entry in on-disk order, exactly like `parse_dir_sector`.
+///
+/// Fase 139: extracted from `fat12.rs`'s own `find_entry_location_in`,
+/// which already checked both forms this way - `fat32.rs::read_file`
+/// did not, and so could never find a file by its short name once it
+/// also had a long one (it went through `list_directory`/
+/// `parse_dir_sector` instead, which - like any plain listing - only
+/// ever keeps ONE resolved name per entry, discarding whichever form
+/// lost). The two callers now share this exact matching logic instead
+/// of `fat32.rs` needing its own hand-duplicated copy.
+pub fn short_entry_if_matches(
+    raw: &[u8; 32],
+    lfn: &mut LfnState,
+    target_name: &str,
+) -> Option<DirEntry> {
+    let long_name = lfn.take_verified(&raw[0..11]);
+    let short_name = format_short_name(&raw[0..8], &raw[8..11]);
+    let matches = long_name
+        .as_deref()
+        .is_some_and(|n| n.eq_ignore_ascii_case(target_name))
+        || short_name.eq_ignore_ascii_case(target_name);
+    if !matches {
+        return None;
+    }
+    let is_dir = raw[11] & 0x10 != 0;
+    let hi = u16::from_le_bytes([raw[20], raw[21]]) as u32;
+    let lo = u16::from_le_bytes([raw[26], raw[27]]) as u32;
+    let size = u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]);
+    Some(DirEntry {
+        name: long_name.unwrap_or(short_name),
+        is_dir,
+        size,
+        start_cluster: (hi << 16) | lo,
+    })
+}
+
 /// Parses the 32-byte directory entries in one already-read sector,
 /// appending real ones to `entries`. Returns `true` if the "no more
 /// entries anywhere in this directory" marker (a first byte of `0x00`)

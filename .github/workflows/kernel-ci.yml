@@ -1623,6 +1623,20 @@ jobs:
           # a fresh CI image always takes this same fully-self-cleaning
           # path.
           grep -q "FAT12\] multi_chunk_vfat_test created=true shown=true long_read_ok=true alias_read_ok=true delete_ok=true gone_ok=true" boot.log
+          # Fase 139: confirms fat_common::short_entry_if_matches - the
+          # shared helper fat12.rs::find_entry_location_in was refactored
+          # to call instead of its own inline duplicate, and that
+          # fat32.rs::find_entry (new this Fase) also calls to fix a real
+          # gap (fat32.rs::read_file could never find a file by its short
+          # name once it also had a long one, unlike fat12.rs's own
+          # already-correct behavior proven by the two alias_read_ok
+          # assertions above). Disk-independent: hand-built raw VFAT
+          # entries prove a lookup succeeds by EITHER name and correctly
+          # fails when neither matches - fat32.rs's own cluster-walking
+          # integration around this shared logic remains unexercised by
+          # this project's real disk image (genuine FAT12 mislabeled
+          # FAT32, always rejected by fat32::read_bpb).
+          grep -q "FAT\] short_entry_if_matches_test by_long_name_ok=true by_short_name_ok=true mismatch_rejected=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.

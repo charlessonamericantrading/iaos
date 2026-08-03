@@ -868,27 +868,13 @@ impl Fat12Info {
                     continue;
                 }
 
-                let long_name = lfn.take_verified(&raw[0..11]);
-                let short_name = fat_common::format_short_name(&raw[0..8], &raw[8..11]);
-                let matches = long_name
-                    .as_deref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
-                    || short_name.eq_ignore_ascii_case(name);
-                if matches {
-                    let is_dir = raw[11] & 0x10 != 0;
-                    let hi = u16::from_le_bytes([raw[20], raw[21]]) as u32;
-                    let lo = u16::from_le_bytes([raw[26], raw[27]]) as u32;
-                    let size = u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]);
-                    return Ok((
-                        lba,
-                        i * 32,
-                        DirEntry {
-                            name: long_name.unwrap_or(short_name),
-                            is_dir,
-                            size,
-                            start_cluster: (hi << 16) | lo,
-                        },
-                    ));
+                // Fase 139: matching logic (checking both the long AND
+                // short name) moved into the shared
+                // `fat_common::short_entry_if_matches` - `fat32.rs`'s own
+                // `find_entry` now uses the exact same helper instead of
+                // hand-duplicating this again.
+                if let Some(entry) = fat_common::short_entry_if_matches(raw, &mut lfn, name) {
+                    return Ok((lba, i * 32, entry));
                 }
             }
         }

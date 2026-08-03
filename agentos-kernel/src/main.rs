@@ -3604,6 +3604,93 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
+    // 7f-1. Test fat_common::short_entry_if_matches directly (Fase 139) -
+    // no disk I/O at all, unlike every FAT test above. This is the exact
+    // shared helper `fat12.rs::find_entry_location_in` was just
+    // refactored to call instead of its own inline duplicate, and that
+    // `fat32.rs::find_entry` (new this Fase) now ALSO calls to fix a real
+    // gap: `fat32.rs::read_file` previously went through `list_directory`
+    // (built on `parse_dir_sector`, which - like any plain listing -
+    // keeps only ONE resolved name per entry) and so could never find a
+    // file by its short (8.3) name once it also had a long one, unlike
+    // `fat12.rs`'s own already-correct behavior (proven for real, on real
+    // disk, by `vfat_test`'s own `alias_read_ok`/`multi_chunk_vfat_test`'s
+    // own `alias_read_ok` above). `fat32.rs`'s own read path can never be
+    // exercised against this project's REAL disk image - it's genuine
+    // FAT12 mislabeled `0x0C` "FAT32 LBA", always correctly rejected by
+    // `fat32::read_bpb` (see that function's own doc) - so unlike every
+    // other FAT self-test in this file, there is no way to prove
+    // `fat32.rs::find_entry`'s own cluster-walking integration end to end
+    // without a new synthetic FAT32 disk fixture, deliberately out of
+    // scope for this Fase. What CAN be proven directly, without that
+    // fixture: the exact shared matching logic both `fat12.rs` and
+    // `fat32.rs` now rely on is correct - by hand-building one raw VFAT
+    // long-name entry plus its short entry (byte-for-byte the same
+    // on-disk shape `fat12.rs`'s own `build_lfn_entries`/`build_dir_entry`
+    // produce, verified by re-reading their exact field layout directly
+    // before writing this) and checking a lookup succeeds by EITHER name,
+    // and correctly fails when neither matches.
+    kprintln!(
+        "[KERNEL INIT] Testing fat_common::short_entry_if_matches (VFAT dual-name lookup)..."
+    );
+    {
+        const SHORT_NAME: &[u8; 11] = b"SHORTN~1TXT";
+        const LONG_NAME: &str = "unit test.txt"; // exactly 13 chars - one chunk, no terminator needed
+        let checksum = fat_common::lfn_checksum(SHORT_NAME);
+
+        // Hand-built long-name entry: sequence 0x41 (chunk 1, ORed with
+        // 0x40 since it's also the last/only chunk), chars split 5/6/2
+        // across the entry per the real VFAT layout (see
+        // `fat_common::LfnState::push_long_entry`'s own field offsets).
+        let mut long_entry = [0u8; 32];
+        long_entry[0] = 0x41;
+        let chars: [u8; 13] = *b"unit test.txt";
+        for (i, &c) in chars[0..5].iter().enumerate() {
+            long_entry[1 + i * 2] = c;
+        }
+        long_entry[11] = 0x0F; // ATTR_LONG_NAME
+        long_entry[13] = checksum;
+        for (i, &c) in chars[5..11].iter().enumerate() {
+            long_entry[14 + i * 2] = c;
+        }
+        for (i, &c) in chars[11..13].iter().enumerate() {
+            long_entry[28 + i * 2] = c;
+        }
+
+        let mut short_entry = [0u8; 32];
+        short_entry[0..11].copy_from_slice(SHORT_NAME);
+        short_entry[11] = 0x20; // ATTR_ARCHIVE - a plain file, not a directory
+
+        let mut lfn = fat_common::LfnState::default();
+        lfn.push_long_entry(&long_entry);
+        let by_long_name = fat_common::short_entry_if_matches(&short_entry, &mut lfn, LONG_NAME);
+        let by_long_name_ok = by_long_name.as_ref().is_some_and(|e| e.name == LONG_NAME);
+
+        let mut lfn2 = fat_common::LfnState::default();
+        lfn2.push_long_entry(&long_entry);
+        let by_short_name =
+            fat_common::short_entry_if_matches(&short_entry, &mut lfn2, "SHORTN~1.TXT");
+        // Resolves to the SAME (long) name either way - this proves the
+        // short-alias LOOKUP succeeded, not that the resolved name
+        // happens to equal the search term.
+        let by_short_name_ok = by_short_name.as_ref().is_some_and(|e| e.name == LONG_NAME);
+
+        let mut lfn3 = fat_common::LfnState::default();
+        lfn3.push_long_entry(&long_entry);
+        let mismatch_rejected =
+            fat_common::short_entry_if_matches(&short_entry, &mut lfn3, "nonexistent.txt")
+                .is_none();
+
+        kprintln!(
+            "[FAT] short_entry_if_matches_test: by_long_name_ok={} by_short_name_ok={} mismatch_rejected={}",
+            by_long_name_ok, by_short_name_ok, mismatch_rejected
+        );
+        serial_println!(
+            "[FAT] short_entry_if_matches_test by_long_name_ok={} by_short_name_ok={} mismatch_rejected={}",
+            by_long_name_ok, by_short_name_ok, mismatch_rejected
+        );
+    }
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real
