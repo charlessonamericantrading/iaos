@@ -62,9 +62,8 @@ impl GgufTensorInfo {
     /// at exactly 2 dimensions (matching this struct's own `[usize; 2]`
     /// shape). Returns the entry AND how many bytes it consumed, so a
     /// caller parsing several entries in sequence knows where the next
-    /// one starts - not exercised yet (this kernel only ever constructs
-    /// one), but free to support given the entry's own length is
-    /// already known once parsed.
+    /// one starts - `parse_many` below (Fase 51) is exactly that caller,
+    /// looping this function without changing it at all.
     pub fn parse(bytes: &[u8]) -> Result<(Self, usize), &'static str> {
         if bytes.len() < 4 {
             return Err("GGUF: tensor-info buffer too small for name length");
