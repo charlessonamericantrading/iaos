@@ -1580,6 +1580,23 @@ jobs:
           # failed with "hit a free (0) entry unexpectedly" - see README's
           # new FAT12 file deletion row for the full story.
           grep -q "FAT12\] delete_test existed_before=true gone_after=true" boot.log
+          # Fase 169: closes the 19th Explore-agent survey's candidate #1 -
+          # delete_file_impl's own `if entry.size > 0` guard meant a 0-byte
+          # file's single allocated cluster (create_file always allocates at
+          # least one, even for empty content, to anchor start_cluster) was
+          # never freed on delete - a silent, permanent per-file cluster leak
+          # reachable via the most ordinary touch/rm sequence imaginable, not
+          # some obscure edge case. delete_directory_impl already freed its
+          # own chain unconditionally, so this was an asymmetry between two
+          # sibling code paths - the same class Fase 76/77/131/167 already
+          # closed elsewhere. allocated_before=true proves create_file really
+          # did allocate a cluster for zero content; freed_after=true proves
+          # it's actually returned to the free pool, checked directly via
+          # the new cluster_is_free helper rather than relying on a second
+          # file's allocation happening to reuse the same cluster number,
+          # which isn't guaranteed by find_free_clusters's own scan order
+          # relative to this boot's full prior disk-state history.
+          grep -q "FAT12\] zero_len_cluster_test allocated_before=true delete_ok=true freed_after=true" boot.log
           # Confirms touch/rm (Fase 28) work through the REAL dispatch_command
           # parsing path, not just by calling Fat12Info's create_file/
           # delete_file directly the way the tests above do - before this,

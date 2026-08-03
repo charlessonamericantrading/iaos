@@ -140,6 +140,17 @@ impl Fat12Info {
         }
     }
 
+    /// Fase 169: exposes whether `cluster`'s own FAT entry currently reads
+    /// back as free (0), via `next_cluster`'s own error branch for that
+    /// exact case. Added purely so a self-test can directly prove a
+    /// specific cluster was really freed by `delete_file`/`delete_directory`.
+    /// A still-allocated end-of-chain cluster (entry `>= 0x0FF8`) reads
+    /// `false` here, not `true`, so this genuinely distinguishes "freed"
+    /// from "still holds a real, if empty, file's last cluster".
+    pub fn cluster_is_free(&self, cluster: u32) -> bool {
+        self.next_cluster(cluster).is_err()
+    }
+
     /// Returns the sector LBAs holding a directory's entries, in order -
     /// either the root's fixed range, or a subdirectory's cluster chain
     /// walked to completion. Unifies the root-vs-cluster-chain
@@ -904,15 +915,20 @@ impl Fat12Info {
             return Err("FAT12: delete_file does not support directories");
         }
 
-        if entry.size > 0 {
-            let mut cluster = Some(entry.start_cluster);
-            while let Some(c) = cluster {
-                // Capture the next link before zeroing this entry - once
-                // it's zeroed, the chain onward from here is lost.
-                let next = self.next_cluster(c)?;
-                self.write_fat_entry_to_disk(c, 0x0000)?;
-                cluster = next;
-            }
+        // Fase 169: no `entry.size > 0` guard here - create_file_impl always
+        // allocates at least one real cluster to anchor start_cluster, even
+        // for a 0-byte file (see its own "at least one cluster even for an
+        // empty file" comment), so a 0-byte file's chain still needs freeing.
+        // Matches delete_directory_impl's own unconditional free below,
+        // which never had this gap since every directory always has a real
+        // cluster for its `.`/`..` entries.
+        let mut cluster = Some(entry.start_cluster);
+        while let Some(c) = cluster {
+            // Capture the next link before zeroing this entry - once
+            // it's zeroed, the chain onward from here is lost.
+            let next = self.next_cluster(c)?;
+            self.write_fat_entry_to_disk(c, 0x0000)?;
+            cluster = next;
         }
 
         let mut sector_buf = [0u8; 512];

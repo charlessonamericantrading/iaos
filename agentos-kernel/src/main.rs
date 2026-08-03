@@ -3238,6 +3238,59 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
+    // 7d-4b. Fase 169: real FAT12 0-BYTE FILE cluster liberation - the 19th
+    // Explore-agent survey found delete_file_impl's own `if entry.size > 0`
+    // guard meant a 0-byte file's single allocated cluster (create_file
+    // always allocates at least one, even for empty content, to anchor
+    // start_cluster) was never actually freed on delete - a silent,
+    // permanent per-file cluster leak reachable via the most ordinary
+    // touch/rm sequence imaginable. Uses cluster_is_free (added specifically
+    // to make this provable) rather than a second file's own allocation
+    // happening to reuse the same cluster number, which isn't guaranteed by
+    // find_free_clusters's own scan order relative to this boot's full
+    // prior disk-state history.
+    kprintln!("[KERNEL INIT] Testing 0-byte file cluster liberation on delete...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                let _ = fs.create_file("ZEROLEN.TXT", &[]);
+                let zero_cluster = fs.list_root_directory().ok().and_then(|entries| {
+                    entries
+                        .into_iter()
+                        .find(|e| e.name.eq_ignore_ascii_case("ZEROLEN.TXT"))
+                        .map(|e| e.start_cluster)
+                });
+                let allocated_before = zero_cluster.is_some_and(|c| !fs.cluster_is_free(c));
+                let delete_ok = fs.delete_file("ZEROLEN.TXT").is_ok();
+                let freed_after = zero_cluster.is_some_and(|c| fs.cluster_is_free(c));
+                kprintln!(
+                    "[FAT12] zero_len_cluster_test allocated_before={} delete_ok={} freed_after={}",
+                    allocated_before,
+                    delete_ok,
+                    freed_after
+                );
+                serial_println!(
+                    "[FAT12] zero_len_cluster_test allocated_before={} delete_ok={} freed_after={}",
+                    allocated_before,
+                    delete_ok,
+                    freed_after
+                );
+            }
+            Err(e) => {
+                kprintln!("[FAT12] zero_len_cluster_test: not FAT12 ({})", e);
+                serial_println!("[FAT12] zero_len_cluster_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!(
+                "[FAT12] zero_len_cluster_test: couldn't find FAT partition: {}",
+                e
+            );
+            serial_println!("[FAT12] zero_len_cluster_test -> no partition: {}", e);
+        }
+    }
+    shell::dispatch_command("ls");
+
     // 7d-5. Real shell-command-level file create/read/delete - proves the
     // *interactive* path (dispatch_command parsing an actual typed line),
     // not just the underlying Fat12Info methods the tests above already
