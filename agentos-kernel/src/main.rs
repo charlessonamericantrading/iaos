@@ -3751,6 +3751,64 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 7f-2. Test that real FAT12 timestamps survive a write+read round
+    // trip (Fase 148) - `fat12.rs::build_dir_entry` has stamped a real
+    // CMOS-RTC-derived value into every file's creation/access/write
+    // fields since Fase 20, but nothing anywhere in this tree ever read
+    // those bytes back until `fat_common::DirEntry` gained `fat_time`/
+    // `fat_date` fields this Fase - the same "write-only, never wired to
+    // a real reader" gap Fase 136/137/138/143/147 already found and
+    // closed elsewhere, just never previously found in the FAT code.
+    // Brackets the file's real creation with an RTC read immediately
+    // before AND after (not a single read taken before or after) since a
+    // second/minute/hour boundary could genuinely tick over mid-test -
+    // accepting either bracket value, rather than exact equality against
+    // one arbitrary sample, is what makes this test not flaky by
+    // construction.
+    kprintln!("[KERNEL INIT] Testing FAT12 timestamp write+read round trip...");
+    match shell::find_fat_partition() {
+        Ok(partition) => {
+            match fat12::read_bpb(&partition) {
+                Ok(mut fs) => {
+                    const TS_NAME: &str = "TSTAMP.TXT";
+                    let before = fat12::to_fat_datetime(&rtc::read_time());
+                    let ts_created = fs.create_file(TS_NAME, b"timestamp test").is_ok();
+                    let after = fat12::to_fat_datetime(&rtc::read_time());
+
+                    let entries = fs.list_root_directory().unwrap_or_default();
+                    let entry = entries.iter().find(|e| e.name == TS_NAME);
+                    let ts_matches_bracket = entry
+                        .map(|e| {
+                            (e.fat_time, e.fat_date) == before || (e.fat_time, e.fat_date) == after
+                        })
+                        .unwrap_or(false);
+
+                    let ts_delete_ok = fs.delete_file(TS_NAME).is_ok();
+
+                    kprintln!(
+                    "[FAT12] timestamp round-trip test: created={} matches_bracket={} delete_ok={}",
+                    ts_created, ts_matches_bracket, ts_delete_ok
+                );
+                    serial_println!(
+                    "[FAT12] timestamp_roundtrip_test created={} matches_bracket={} delete_ok={}",
+                    ts_created, ts_matches_bracket, ts_delete_ok
+                );
+                }
+                Err(e) => {
+                    kprintln!("[FAT12] timestamp round-trip test: not FAT12 ({})", e);
+                    serial_println!("[FAT12] timestamp_roundtrip_test -> not fat12: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            kprintln!(
+                "[FAT12] timestamp round-trip test: couldn't find FAT partition: {}",
+                e
+            );
+            serial_println!("[FAT12] timestamp_roundtrip_test -> no partition: {}", e);
+        }
+    }
+
     // 7c. Test Backspace/Line-Editing by feeding a realistic PS/2 make+break
     // byte sequence through the real handle_scancode() - typing "pss" then
     // one backspace should leave "ps" (verified: this dispatches the real

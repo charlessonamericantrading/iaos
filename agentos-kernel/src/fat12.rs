@@ -657,9 +657,9 @@ impl Fat12Info {
         }
 
         // A real timestamp from the CMOS RTC (Fase 20) rather than a
-        // zeroed/fake one - nothing in this kernel reads FAT timestamps
-        // back yet, so this is honestly more about correctness/
-        // completeness than anything currently depended on.
+        // zeroed/fake one - genuinely read back too, via
+        // `fat_common::DirEntry`'s own `fat_time`/`fat_date` fields
+        // (Fase 148), not just written and left unverified.
         let time = crate::rtc::read_time();
         let (fat_time, fat_date) = to_fat_datetime(&time);
         let entry = build_dir_entry(
@@ -1205,8 +1205,10 @@ fn build_lfn_entries(name: &str, short_name: &[u8; 11]) -> alloc::vec::Vec<[u8; 
 
 /// Packs a `RtcTime` into FAT's on-disk time/date u16 formats: time is
 /// hours(5 bits):minutes(6 bits):seconds/2(5 bits); date is (year-1980)
-/// (7 bits):month(4 bits):day(5 bits).
-fn to_fat_datetime(t: &crate::rtc::RtcTime) -> (u16, u16) {
+/// (7 bits):month(4 bits):day(5 bits). `pub` (rather than private) so a
+/// self-test can compute the exact expected value independently, instead
+/// of just trusting that whatever got written reads back as itself.
+pub fn to_fat_datetime(t: &crate::rtc::RtcTime) -> (u16, u16) {
     let fat_time = ((t.hours as u16) << 11) | ((t.minutes as u16) << 5) | (t.seconds as u16 / 2);
     let year_offset = (t.year.saturating_sub(1980)).min(127);
     let fat_date = (year_offset << 9) | ((t.month as u16) << 5) | (t.day as u16);

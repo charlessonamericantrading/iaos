@@ -1679,6 +1679,19 @@ jobs:
           # this project's real disk image (genuine FAT12 mislabeled
           # FAT32, always rejected by fat32::read_bpb).
           grep -q "FAT\] short_entry_if_matches_test by_long_name_ok=true by_short_name_ok=true mismatch_rejected=true" boot.log
+          # Fase 148: fat12.rs::build_dir_entry has stamped a real CMOS-
+          # RTC-derived timestamp into every file's on-disk directory
+          # entry since Fase 20, but nothing anywhere in this tree ever
+          # read those bytes back until fat_common::DirEntry gained
+          # fat_time/fat_date fields this Fase - the same "write-only,
+          # never wired to a real reader" gap Fase 136/137/138/143/147
+          # already found and closed elsewhere, just never previously
+          # found in the FAT code. Brackets the real file creation with
+          # an RTC read immediately before AND after (matches_bracket
+          # accepts either), rather than exact equality against one
+          # arbitrary sample, so a second/minute/hour boundary ticking
+          # over mid-test can't make this flaky.
+          grep -q "FAT12\] timestamp_roundtrip_test created=true matches_bracket=true delete_ok=true" boot.log
           # Confirms the ATA PIO sector read got real bytes back, not just
           # that it returned without crashing - 0x55AA is only present at
           # 510-511 if the MBR was actually read correctly.

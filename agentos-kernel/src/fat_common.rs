@@ -21,6 +21,13 @@ pub struct DirEntry {
     pub is_dir: bool,
     pub size: u32,
     pub start_cluster: u32,
+    /// The on-disk "last write" time/date fields (offsets 22-25 of the raw
+    /// 32-byte entry), packed exactly as FAT itself stores them - see
+    /// `fat12.rs::to_fat_datetime` for the encoding. `fat12.rs::build_dir_entry`
+    /// stamps a real CMOS-RTC-derived value here (and, identically, into
+    /// creation/access) at create time; until now nothing ever read it back.
+    pub fat_time: u16,
+    pub fat_date: u16,
 }
 
 /// The standard VFAT short-name checksum (see the Linux kernel's own
@@ -188,11 +195,15 @@ pub fn short_entry_if_matches(
     let hi = u16::from_le_bytes([raw[20], raw[21]]) as u32;
     let lo = u16::from_le_bytes([raw[26], raw[27]]) as u32;
     let size = u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]);
+    let fat_time = u16::from_le_bytes([raw[22], raw[23]]);
+    let fat_date = u16::from_le_bytes([raw[24], raw[25]]);
     Some(DirEntry {
         name: long_name.unwrap_or(short_name),
         is_dir,
         size,
         start_cluster: (hi << 16) | lo,
+        fat_time,
+        fat_date,
     })
 }
 
@@ -234,12 +245,16 @@ pub fn parse_dir_sector(
         let hi = u16::from_le_bytes([raw[20], raw[21]]) as u32;
         let lo = u16::from_le_bytes([raw[26], raw[27]]) as u32;
         let size = u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]);
+        let fat_time = u16::from_le_bytes([raw[22], raw[23]]);
+        let fat_date = u16::from_le_bytes([raw[24], raw[25]]);
 
         entries.push(DirEntry {
             name,
             is_dir,
             size,
             start_cluster: (hi << 16) | lo,
+            fat_time,
+            fat_date,
         });
     }
     false
