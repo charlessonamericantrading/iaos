@@ -1355,7 +1355,23 @@ jobs:
           # encodes correctly too, making Fase 124's own
           # parse_first_aaaa_record reachable from a real query this
           # kernel could send, not just a synthetic reply fixture.
-          grep -q "DNS\] build_query_selftest valid_query_matches_known_bytes=true empty_hostname_rejected=true over_long_label_rejected=true empty_label_rejected=true aaaa_query_matches_known_bytes=true" boot.log
+          # Fase 167: closes the 17th Explore-agent survey's candidate #1
+          # - encode_qname capped each individual label at 63 bytes
+          # (MAX_LABEL_LEN) but never capped the TOTAL encoded name at
+          # RFC 1035's real 255-byte limit, so several valid-length
+          # labels could still add up past what dns_query_test copies
+          # into a single, fixed-size 4KiB physical frame - and since
+          # this kernel identity-maps all physical RAM, an oversized
+          # copy corrupts whatever real memory sits past that one frame
+          # instead of ever faulting cleanly. Reachable via ordinary
+          # `dns`/`ping` shell commands with a sufficiently long
+          # hostname; invisible to every existing self-test, which only
+          # ever used "example.com". over_long_total_name_rejected uses
+          # 5 labels of exactly MAX_LABEL_LEN bytes each (321 bytes
+          # encoded) - individually valid, so this exercises ONLY the
+          # new total-length check, not the pre-existing per-label one
+          # over_long_label_rejected already covers.
+          grep -q "DNS\] build_query_selftest valid_query_matches_known_bytes=true empty_hostname_rejected=true over_long_label_rejected=true empty_label_rejected=true over_long_total_name_rejected=true aaaa_query_matches_known_bytes=true" boot.log
           # Confirms generalized ARP resolution (Fase 48, net::e1000::
           # arp_resolve) - a new, independent function (does not touch
           # send_test_frame/receive_test_frame, whose exact log output is

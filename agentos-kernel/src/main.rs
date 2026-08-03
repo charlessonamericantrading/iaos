@@ -2689,6 +2689,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         let empty_label_rejected = dns::build_query(0x1234, "a..b", dns::DNS_TYPE_A).is_err();
 
+        // Fase 167: 5 labels of exactly MAX_LABEL_LEN (63) bytes each -
+        // every individual label is valid on its own, so this exercises
+        // ONLY the new total-encoded-length check (321 bytes encoded,
+        // over the 255-byte RFC 1035 cap), not the pre-existing
+        // per-label check `over_long_label_rejected` above already
+        // covers.
+        let over_long_total_name = alloc::vec!["a".repeat(dns::MAX_LABEL_LEN); 5].join(".");
+        let over_long_total_name_rejected =
+            dns::build_query(0x1234, &over_long_total_name, dns::DNS_TYPE_A).is_err();
+
         #[rustfmt::skip]
         const EXPECTED_EXAMPLE_COM_AAAA_QUERY: [u8; 29] = [
             0x12, 0x34, // transaction ID
@@ -2708,12 +2718,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 == Ok(EXPECTED_EXAMPLE_COM_AAAA_QUERY.to_vec());
 
         kprintln!(
-            "[DNS] query-build self-test: valid_query_matches_known_bytes={} empty_hostname_rejected={} over_long_label_rejected={} empty_label_rejected={} aaaa_query_matches_known_bytes={}",
-            valid_query_matches_known_bytes, empty_hostname_rejected, over_long_label_rejected, empty_label_rejected, aaaa_query_matches_known_bytes
+            "[DNS] query-build self-test: valid_query_matches_known_bytes={} empty_hostname_rejected={} over_long_label_rejected={} empty_label_rejected={} over_long_total_name_rejected={} aaaa_query_matches_known_bytes={}",
+            valid_query_matches_known_bytes, empty_hostname_rejected, over_long_label_rejected, empty_label_rejected, over_long_total_name_rejected, aaaa_query_matches_known_bytes
         );
         serial_println!(
-            "[DNS] build_query_selftest valid_query_matches_known_bytes={} empty_hostname_rejected={} over_long_label_rejected={} empty_label_rejected={} aaaa_query_matches_known_bytes={}",
-            valid_query_matches_known_bytes, empty_hostname_rejected, over_long_label_rejected, empty_label_rejected, aaaa_query_matches_known_bytes
+            "[DNS] build_query_selftest valid_query_matches_known_bytes={} empty_hostname_rejected={} over_long_label_rejected={} empty_label_rejected={} over_long_total_name_rejected={} aaaa_query_matches_known_bytes={}",
+            valid_query_matches_known_bytes, empty_hostname_rejected, over_long_label_rejected, empty_label_rejected, over_long_total_name_rejected, aaaa_query_matches_known_bytes
         );
     }
 

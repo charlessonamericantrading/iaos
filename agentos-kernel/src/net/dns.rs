@@ -80,6 +80,15 @@ pub const DNS_QCLASS_IN: u16 = 1;
 /// `parse_first_a_record` itself already checks for), so 63 is the
 /// largest length a real label can ever carry.
 pub const MAX_LABEL_LEN: usize = 63;
+/// RFC 1035 section 3.1: a domain name's total wire-encoded length (label
+/// length octets + label octets + the terminating zero-length octet) is
+/// restricted to 255 octets or less, independent of the existing
+/// per-label `MAX_LABEL_LEN` cap - several valid, individually-≤63-byte
+/// labels can still add up past this. `encode_qname` enforces it so a
+/// caller-supplied hostname can never grow the query past what
+/// `net::e1000::dns_query_test` copies into a single, fixed-size
+/// physical frame.
+pub const MAX_QNAME_ENCODED_LEN: usize = 255;
 
 /// Searches THROUGH a DNS response message's own answer records (Fase
 /// 115: up to `ancount` of them, not just the first) and returns the
@@ -287,12 +296,18 @@ pub fn encode_qname(hostname: &str, out: &mut Vec<u8>) -> Result<(), &'static st
     if hostname.is_empty() {
         return Err("hostname is empty");
     }
+    let mut encoded_len = 0usize;
     for label in hostname.split('.') {
         if label.is_empty() {
             return Err("hostname has an empty label (leading, trailing, or doubled '.')");
         }
         if label.len() > MAX_LABEL_LEN {
             return Err("hostname label exceeds 63 bytes");
+        }
+        encoded_len += 1 + label.len();
+        // +1 reserves room for the terminating zero-length octet pushed below.
+        if encoded_len + 1 > MAX_QNAME_ENCODED_LEN {
+            return Err("hostname exceeds 255 bytes when DNS-encoded");
         }
         out.push(label.len() as u8);
         out.extend_from_slice(label.as_bytes());

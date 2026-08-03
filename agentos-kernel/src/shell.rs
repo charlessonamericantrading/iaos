@@ -418,8 +418,9 @@ pub fn dispatch_command(line: &str) {
             // the caller types here onto the wire (net::e1000/net::dns
             // themselves needed no further changes beyond accepting
             // this parameter, both already fully proven as of Fase
-            // 106/107). An invalid hostname (empty, an empty label, or
-            // a label over 63 bytes) surfaces as the same `Err` path
+            // 106/107). An invalid hostname (empty, an empty label, a
+            // label over 63 bytes, or - Fase 167 - the whole encoded
+            // name over 255 bytes) surfaces as the same `Err` path
             // below, exactly like an unparsable IP already does.
             let ip_str = parts.next().unwrap_or("");
             let hostname = parts.next().unwrap_or("");
