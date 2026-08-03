@@ -410,29 +410,48 @@ impl Fat12Info {
         Ok(self.find_free_entry_run_in(dir, 1)?[0])
     }
 
-    /// Finds `count` *consecutive* free slots in a directory, all within
-    /// one sector - either truly never-used entries (first byte `0x00`,
-    /// meaning everything from here to the end of the directory is
-    /// unused too, per the FAT spec) or previously-deleted ones (`0xE5`,
-    /// safe to reuse). Returns each slot's absolute sector LBA and byte
-    /// offset within that sector, in order. `count` is 1 (a plain
-    /// short-name entry) or `N + 1` for an `N`-chunk VFAT name (`N` long
-    /// entries plus the short entry they describe - see
+    /// Finds `count` *consecutive* free slots in a directory - either
+    /// truly never-used entries (first byte `0x00`, meaning everything
+    /// from here to the end of the directory was unused the last time a
+    /// writer respected that convention) or previously-deleted ones
+    /// (`0xE5`, safe to reuse). Returns each slot's absolute sector LBA
+    /// and byte offset within that sector, in order. `count` is 1 (a
+    /// plain short-name entry) or `N + 1` for an `N`-chunk VFAT name (`N`
+    /// long entries plus the short entry they describe - see
     /// `build_name_entries`).
     ///
-    /// Restricting a run to a single sector (never straddling into the
-    /// next one) is a deliberate simplification: a sector holds
-    /// `ENTRIES_PER_SECTOR` (16) entries, so a run bumping into a
-    /// sector's last slot simply continues the search into the next
-    /// sector instead of splitting across both - avoiding the extra
-    /// complexity of a multi-sector write. `count` can therefore never
-    /// exceed 16 here; `build_name_entries` caps a VFAT name at 15
-    /// chunks (195 characters) specifically so `count` (chunks + 1)
-    /// never does either - checked explicitly below rather than left as
-    /// an implicit assumption, since silently exceeding it would compute
-    /// a byte offset past a single 512-byte `sector_buf` in the
-    /// `grow_directory` fallback below (a real, found-by-reasoning-
-    /// through-this-function's-own-limits gap, not a hypothetical one).
+    /// Fase 171 (21st Explore-agent survey, independently re-verifying
+    /// Fase 170's own discovery): the free-run search used to reset at
+    /// every sector boundary, so a run that didn't fit in the current
+    /// sector's remaining slots abandoned them and started over fresh in
+    /// the next sector - leaving an earlier, un-filled `0x00` sitting
+    /// before real data that now lived later in the directory. Every
+    /// reader in this codebase (`fat_common::parse_dir_sector`,
+    /// `find_entry_location_in`) treats the first `0x00` it sees as
+    /// "nothing else exists anywhere in this directory", per the real
+    /// FAT convention that byte is supposed to enforce directory-wide,
+    /// not per-sector - so anything placed past that abandoned gap
+    /// became permanently invisible to every subsequent listing or
+    /// lookup, including (as Fase 170 confirmed with a temporary raw
+    /// sector dump) this very disk's own root directory once enough
+    /// create/delete self-test churn filled its first sector. Fixed by
+    /// accumulating one continuous free run across the entire scan below
+    /// instead of resetting per sector, so a run starting near a
+    /// sector's end now correctly continues into the next sector's
+    /// leading slots rather than orphaning them - restoring the exact
+    /// invariant every reader already assumed was being upheld.
+    /// `write_name_entries` needed no change at all: it already reads
+    /// and rewrites each returned slot's own sector independently (see
+    /// its own doc comment), anticipating exactly this.
+    ///
+    /// `count` can never exceed 16 (one sector's worth) here regardless -
+    /// `build_name_entries` caps a VFAT name at 15 chunks (195 characters)
+    /// specifically so `count` (chunks + 1) never does either - checked
+    /// explicitly below rather than left as an implicit assumption, since
+    /// silently exceeding it would compute a byte offset past a single
+    /// 512-byte `sector_buf` in the `grow_directory` fallback below (a
+    /// real, found-by-reasoning-through-this-function's-own-limits gap,
+    /// not a hypothetical one).
     ///
     /// The root can never grow - it's a fixed-size range dictated by
     /// the BPB itself, not a cluster chain - so a full root is a real,
@@ -440,9 +459,10 @@ impl Fat12Info {
     /// extensible as a file's: `grow_directory` below appends a fresh
     /// cluster the same way `create_file`/`write_file` already do,
     /// rather than surfacing an avoidable "directory is full" error the
-    /// moment its one starting cluster's entries run out - and a freshly
-    /// zeroed cluster trivially contains a run of any `count` up to a
-    /// whole sector's worth, starting right at its first slot.
+    /// moment its existing clusters' entries run out - continuing
+    /// whatever partial run had already accumulated at the old chain's
+    /// tail into the freshly zeroed (and therefore entirely free)
+    /// cluster that follows it.
     fn find_free_entry_run_in(
         &mut self,
         dir: DirLocation,
@@ -453,17 +473,17 @@ impl Fat12Info {
             return Err("FAT12: cannot reserve that many consecutive directory-entry slots within one sector");
         }
         let mut sector_buf = [0u8; 512];
+        let mut run: Vec<(u32, usize)> = Vec::with_capacity(count);
         for lba in self.directory_sectors(dir)? {
             ata::read_sector(lba, &mut sector_buf)?;
-            let mut run_start: Option<usize> = None;
             for (i, raw) in sector_buf.as_chunks::<32>().0.iter().enumerate() {
                 if raw[0] == 0x00 || raw[0] == 0xE5 {
-                    let start = *run_start.get_or_insert(i);
-                    if i - start + 1 == count {
-                        return Ok((start..=i).map(|slot| (lba, slot * 32)).collect());
+                    run.push((lba, i * 32));
+                    if run.len() == count {
+                        return Ok(run);
                     }
                 } else {
-                    run_start = None;
+                    run.clear();
                 }
             }
         }
@@ -471,7 +491,11 @@ impl Fat12Info {
             DirLocation::Root => Err("FAT12: root directory is full, no free entry slot"),
             DirLocation::Cluster(start_cluster) => {
                 let (lba, offset) = self.grow_directory(start_cluster)?;
-                Ok((0..count).map(|slot| (lba, offset + slot * 32)).collect())
+                let base_slot = offset / 32;
+                for slot in 0..(count - run.len()) {
+                    run.push((lba, (base_slot + slot) * 32));
+                }
+                Ok(run)
             }
         }
     }
@@ -710,10 +734,12 @@ impl Fat12Info {
     /// `slots[0..long_entries.len()]` in order, the short entry always
     /// the last slot (`slots.len() == long_entries.len() + 1` always, by
     /// construction from every caller). Reads and rewrites each slot's
-    /// own sector independently rather than assuming they all share one
-    /// (true today, since `find_free_entry_run_in` never returns a run
-    /// spanning two sectors - but this way stays correct even if that
-    /// restriction is ever lifted).
+    /// own sector independently rather than assuming they all share one -
+    /// genuinely necessary since Fase 171, when `find_free_entry_run_in`
+    /// started returning runs that straddle a sector (or cluster)
+    /// boundary; this function needed no changes of its own to handle
+    /// that correctly, since it never assumed otherwise in the first
+    /// place.
     fn write_name_entries(
         &mut self,
         slots: &[(u32, usize)],
@@ -1029,12 +1055,15 @@ impl Fat12Info {
     /// internally, see `generate_short_alias`). Capped at 195 characters
     /// (15 long entries of 13 characters each) - not an arbitrary
     /// number, but the largest that still keeps a new entry's required
-    /// slots (long entries plus the one short entry, see
-    /// `find_free_entry_run_in`) within its own single-sector limit (16
-    /// entries). A name over that cap gets an honest "doesn't fit"
-    /// error rather than a silently truncated one; lifting it would mean
-    /// lifting the one-sector restriction too, letting a slot run span
-    /// sectors - real, additional complexity not attempted yet.
+    /// slots (long entries plus the one short entry) within
+    /// `find_free_entry_run_in`'s own `count <= ENTRIES_PER_SECTOR` (16)
+    /// bound. A name over that cap gets an honest "doesn't fit" error
+    /// rather than a silently truncated one. Fase 171 lifted
+    /// `find_free_entry_run_in`'s old single-sector restriction (a run
+    /// can now span sector/cluster boundaries), so this cap is no longer
+    /// forced by that limitation specifically - it remains simply
+    /// because no caller has ever needed a longer name, not because a
+    /// longer one would be unsafe to place.
     fn build_name_entries(
         &self,
         dir: DirLocation,

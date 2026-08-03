@@ -1862,6 +1862,32 @@ jobs:
           # no such history, making it the safe, minimal place to actually
           # exercise the collision-check fix this Fase is about.
           grep -q "FAT12\] dir_name_collision_test outer_created=true dir_created=true file_collision_rejected=true still_one_entry=true" boot.log
+          # Fase 171: closes the 21st Explore-agent survey's candidate #1 -
+          # an independent re-verification of the root-directory bug Fase
+          # 170 (above) discovered but deliberately left open.
+          # find_free_entry_run_in used to reset its free-slot search at
+          # every sector boundary, so a run that didn't fit in the current
+          # sector's remaining slots was silently placed in a LATER sector,
+          # leaving an earlier, un-filled 0x00 sitting before the real data
+          # that now lived past it. Every reader in this codebase
+          # (parse_dir_sector, find_entry_location_in) treats the first
+          # 0x00 it sees as "nothing else exists anywhere in this
+          # directory" - the real FAT convention that byte enforces
+          # directory-wide, not per-sector - so anything placed past an
+          # abandoned gap became permanently invisible. Fixed by
+          # accumulating one continuous free run across a directory's
+          # entire scan instead of resetting per sector. This test
+          # engineers the exact boundary directly: 13 filler files bring a
+          # fresh subdirectory's first sector to 15 of 16 slots used,
+          # leaving exactly one free slot - one short of the 2 slots a
+          # non-8.3-fitting name needs - forcing the search to continue
+          # right at that boundary. boundary_created alone would have been
+          # true even under the pre-Fase-171 bug (the entry really was
+          # written, just somewhere no reader could ever find it again);
+          # boundary_visible and count_ok are what actually depend on the
+          # fix, since both require list_directory to read past the old
+          # sector boundary.
+          grep -q "FAT12\] entry_run_spans_sector_test dir_created=true fillers_ok=true boundary_created=true boundary_visible=true count_ok=true cleanup_ok=true" boot.log
           # Fase 139: confirms fat_common::short_entry_if_matches - the
           # shared helper fat12.rs::find_entry_location_in was refactored
           # to call instead of its own inline duplicate, and that

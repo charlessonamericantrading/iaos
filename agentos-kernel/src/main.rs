@@ -4111,6 +4111,126 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
+    // 7e-4. Fase 171: closes the 21st Explore-agent survey's candidate #1
+    // - an independent re-verification of the root-directory bug Fase
+    // 170 (the 20th survey) discovered but deliberately left open:
+    // `find_free_entry_run_in` searched for a run of `count` consecutive
+    // free slots one sector at a time, abandoning any partial run and
+    // starting over fresh the moment it crossed into a new sector. A run
+    // that didn't fit in the current sector's remaining slots was
+    // silently placed in a LATER sector instead, leaving an earlier,
+    // un-filled `0x00` sitting before the real data that now lived past
+    // it. Every reader in this codebase (`fat_common::parse_dir_sector`,
+    // `find_entry_location_in`) treats the first `0x00` it sees as "the
+    // rest of this directory, anywhere, is unused" - the real FAT
+    // convention that byte is supposed to enforce directory-wide, not
+    // per-sector - so anything placed past an abandoned gap became
+    // permanently invisible to every subsequent listing or lookup,
+    // exactly what Fase 170 confirmed was already happening to this
+    // disk's own root directory via a temporary raw sector dump. Fixed
+    // by accumulating one continuous free run across a directory's
+    // entire scan instead of resetting per sector, so a run starting
+    // near a sector's end now correctly continues into the next
+    // sector's leading slots (or, if the existing chain is exhausted, a
+    // freshly grown cluster's leading slots) rather than orphaning them.
+    // `write_name_entries` needed no change: it already read and
+    // rewrote each slot's own sector independently, anticipating
+    // exactly this.
+    //
+    // This test engineers the exact boundary directly rather than
+    // relying on root's own incidental fullness: a fresh subdirectory's
+    // first sector starts with "." and ".." (2 slots); 13 more
+    // single-slot filler files bring it to 15 of 16 slots used, leaving
+    // exactly ONE free slot at its very tail - one short of the 2 slots
+    // (1 VFAT long entry + 1 short entry) a non-8.3-fitting name needs.
+    // Under the pre-Fase-171 bug, creating such a name at this point
+    // would still return Ok (the entry really is written, just in the
+    // wrong place to ever be found again), so `boundary_created` alone
+    // proves nothing; `boundary_visible` and `count_ok` are the real
+    // assertions, since both depend on `list_directory` actually
+    // reaching past the old sector boundary. Cleans up afterward (unlike
+    // Fase 170's own COLLTEST) so this test doesn't itself add to
+    // root's growing footprint every future boot.
+    kprintln!("[KERNEL INIT] Testing FAT12 free-entry-run search across a sector boundary...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                let dir_created = fs.create_directory("RUNSPAN").is_ok();
+                let dir_cluster = fs
+                    .list_root_directory()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|e| e.name.eq_ignore_ascii_case("RUNSPAN"))
+                    .map(|e| e.start_cluster);
+
+                let (fillers_ok, boundary_created, boundary_visible, count_ok, cleanup_ok) =
+                    if let Some(dir) = dir_cluster {
+                        let mut fillers_ok = true;
+                        for i in 0..13u32 {
+                            let name = alloc::format!("F{}.TXT", i);
+                            if fs.create_file_in(dir, &name, &[i as u8]).is_err() {
+                                fillers_ok = false;
+                            }
+                        }
+
+                        let boundary_created =
+                            fs.create_file_in(dir, "boundaryrun", b"boundary").is_ok();
+
+                        let entries = fs.list_directory(dir).unwrap_or_default();
+                        let boundary_visible = entries
+                            .iter()
+                            .any(|e| e.name.eq_ignore_ascii_case("boundaryrun"));
+                        // "." + ".." + 13 fillers + 1 boundary entry = 16
+                        // - proves nothing went missing, not just that
+                        // the boundary entry alone survived.
+                        let count_ok = entries.len() == 16;
+
+                        let mut cleanup_ok = fs.delete_file_in(dir, "boundaryrun").is_ok();
+                        for i in 0..13u32 {
+                            let name = alloc::format!("F{}.TXT", i);
+                            if fs.delete_file_in(dir, &name).is_err() {
+                                cleanup_ok = false;
+                            }
+                        }
+                        if fs.delete_directory("RUNSPAN").is_err() {
+                            cleanup_ok = false;
+                        }
+
+                        (
+                            fillers_ok,
+                            boundary_created,
+                            boundary_visible,
+                            count_ok,
+                            cleanup_ok,
+                        )
+                    } else {
+                        (false, false, false, false, false)
+                    };
+
+                kprintln!(
+                    "[FAT12] entry_run_spans_sector_test dir_created={} fillers_ok={} boundary_created={} boundary_visible={} count_ok={} cleanup_ok={}",
+                    dir_created, fillers_ok, boundary_created, boundary_visible, count_ok, cleanup_ok
+                );
+                serial_println!(
+                    "[FAT12] entry_run_spans_sector_test dir_created={} fillers_ok={} boundary_created={} boundary_visible={} count_ok={} cleanup_ok={}",
+                    dir_created, fillers_ok, boundary_created, boundary_visible, count_ok, cleanup_ok
+                );
+            }
+            Err(e) => {
+                kprintln!("[FAT12] entry_run_spans_sector_test: not FAT12 ({})", e);
+                serial_println!("[FAT12] entry_run_spans_sector_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!(
+                "[FAT12] entry_run_spans_sector_test: couldn't find FAT partition: {}",
+                e
+            );
+            serial_println!("[FAT12] entry_run_spans_sector_test -> no partition: {}", e);
+        }
+    }
+    shell::dispatch_command("ls");
+
     // 7f-1. Test fat_common::short_entry_if_matches directly (Fase 139) -
     // no disk I/O at all, unlike every FAT test above. This is the exact
     // shared helper `fat12.rs::find_entry_location_in` was just
