@@ -1917,17 +1917,30 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             syscall::dispatch_syscall(syscall::SYS_KV_FREE, 9999, 0, 0, false);
         let invalid_free_rejected = invalid_free_result == 0;
 
+        // Fase 163: closes the 14th Explore-agent survey's candidate #1 -
+        // 0 can never be a real block id either (they start at 1 -
+        // `allocate_kv_block`'s own `idx as u32 + 1`), and is a real,
+        // syscall-reachable edge `free_kv_block`'s own doc now explains
+        // (see `kv_allocator.rs`). Proves it's rejected the same clean
+        // way 9999 already is, not just that it doesn't crash - the
+        // `checked_sub` fix and this check are the two halves of the
+        // same proof.
+        let zero_free_result = syscall::dispatch_syscall(syscall::SYS_KV_FREE, 0, 0, 0, false);
+        let zero_free_rejected = zero_free_result == 0;
+
         kprintln!(
-            "[SYSCALL] kv_free_test: alloc_ok={} free_ok={} invalid_free_rejected={}",
+            "[SYSCALL] kv_free_test: alloc_ok={} free_ok={} invalid_free_rejected={} zero_free_rejected={}",
             alloc_ok,
             free_ok,
-            invalid_free_rejected
+            invalid_free_rejected,
+            zero_free_rejected
         );
         serial_println!(
-            "[SYSCALL] kv_free_test alloc_ok={} free_ok={} invalid_free_rejected={}",
+            "[SYSCALL] kv_free_test alloc_ok={} free_ok={} invalid_free_rejected={} zero_free_rejected={}",
             alloc_ok,
             free_ok,
-            invalid_free_rejected
+            invalid_free_rejected,
+            zero_free_rejected
         );
 
         // Fase 162: closes the 13th Explore-agent survey's candidate #1 -

@@ -76,8 +76,26 @@ impl KVCacheMemoryManager {
     /// can reconcile that process's own bookkeeping (see Fase 162's
     /// `SYS_KV_FREE` syscall arm) - `None` if `block_id` was never
     /// allocated or was already freed.
+    ///
+    /// Fase 163: closes the 14th Explore-agent survey's candidate #1 -
+    /// `block_id` is a raw, unvalidated syscall argument a ring-3 caller
+    /// controls directly, and real block ids start at 1, so `block_id ==
+    /// 0` is at least as plausible a caller mistake as the `9999` this
+    /// function's own existing self-test already covers. `checked_sub`
+    /// rejects it the same clean way an out-of-range id already was,
+    /// instead of relying on the plain `block_id - 1` this used to be:
+    /// harmless today only because this project's release builds run
+    /// with `overflow-checks` off (so it silently wrapped to `u32::MAX`,
+    /// which then correctly failed the bounds check below anyway) - but
+    /// an explicit debug build, or `overflow-checks = true` in
+    /// `[profile.release]`, would have turned the exact same call into a
+    /// genuine panic, and this kernel's own panic handler is an
+    /// unconditional `loop { hlt() }` - the same "clean rejection
+    /// expected, permanent hang possible instead" class Fase 132/159
+    /// already closed elsewhere, just via raw arithmetic on an id here
+    /// instead of a buffer length.
     pub fn free_kv_block(&mut self, block_id: u32) -> Option<u32> {
-        let idx = (block_id - 1) as usize;
+        let idx = block_id.checked_sub(1)? as usize;
         if idx < self.blocks.len() {
             if let Some(block) = self.blocks[idx].take() {
                 self.allocated_count -= 1;

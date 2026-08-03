@@ -948,6 +948,23 @@ jobs:
           # would have shifted every PID the task-alpha/preempt-task
           # assertions further below depend on.
           grep -q "SYSCALL\] kv_free_clears_block_id_test kv_block_id_set=true kv_block_id_cleared=true" boot.log
+          # Fase 163: closes the 14th Explore-agent survey's candidate #1 -
+          # `free_kv_block` computed its blocks-array index as `block_id -
+          # 1` on a raw `u32` syscall argument a ring-3 caller controls
+          # directly - real block ids start at 1, so `block_id == 0` is at
+          # least as plausible a caller mistake as the out-of-range `9999`
+          # the test above already covers. This project's release profile
+          # runs with `overflow-checks` off, so `block_id - 1` used to
+          # silently wrap to `u32::MAX` on the `0` case and still get
+          # rejected by the existing bounds check - but a debug build, or
+          # `overflow-checks = true` in `[profile.release]`, would turn the
+          # identical call into a genuine arithmetic-overflow panic hitting
+          # this kernel's unconditional `loop { hlt() }` panic handler, the
+          # same clean-rejection-expected/permanent-hang-possible class
+          # Fase 132/159 already closed elsewhere. Fixed via
+          # `block_id.checked_sub(1)?`; this asserts the new boundary case
+          # is genuinely rejected, not just that valid ids still work.
+          grep -q "SYSCALL\] kv_free_test alloc_ok=true free_ok=true invalid_free_rejected=true zero_free_rejected=true" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -
           # it's genuinely real time, different on every run by design -
