@@ -3844,6 +3844,40 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("rmdir DOTTEST");
     shell::dispatch_command("ls");
 
+    // Fase 166: closes the 16th Explore-agent survey's candidate #1 -
+    // split_path only rejected an empty path segment (a leading/
+    // trailing/double '/'), never a literal "." or ".." as the FINAL
+    // component - unlike Fase 164's fix just above, which only guarded
+    // "."/".." appearing as an INTERMEDIATE parent-chain segment.
+    // Every directory's own real on-disk "." (points to itself) and
+    // ".." (points to its parent - cluster 0 for a root-parented
+    // directory, the same FAT convention Fase 164 already had to
+    // translate) match fat_common::format_short_name's own
+    // reconstruction, so `rmdir DIR/..` matched the real ".." entry,
+    // fed cluster 0 into fat12.rs's unchecked `cluster_to_lba`, and
+    // would have gone on to corrupt the live disk (writing through a
+    // wrapped, garbage-derived LBA) instead of cleanly failing;
+    // `rmdir DIR/.` matched the real "." entry and would have freed
+    // DIR's own cluster chain while leaving DIR's own entry in its
+    // parent still pointing at it - a dangling reference the FAT would
+    // later hand to some unrelated file. Fixed by rejecting "."/".."
+    // as the final path component at `split_path` itself - the single
+    // choke point every mutating command (touch/rm/mkdir/rmdir)
+    // already shares - matching how a real shell's own rm/mkdir/rmdir
+    // refuse the same targets outright. Confirms all three attempts
+    // (rmdir DOTREJ/.., rmdir DOTREJ/., touch DOTREJ/.. text) are
+    // cleanly rejected with the new error, and that root's own entry
+    // count is unaffected by any of them (still DOTREJ, nothing else)
+    // before the real, legitimate cleanup.
+    kprintln!("[KERNEL INIT] Testing rejection of '.'/'..' as a path's final component...");
+    shell::dispatch_command("mkdir DOTREJ");
+    shell::dispatch_command("rmdir DOTREJ/..");
+    shell::dispatch_command("rmdir DOTREJ/.");
+    shell::dispatch_command("touch DOTREJ/.. text");
+    shell::dispatch_command("ls");
+    shell::dispatch_command("rmdir DOTREJ");
+    shell::dispatch_command("ls");
+
     // 7e-3. Test Multi-Chunk VFAT Long File Names (>13 characters, needing
     // several chained long-name entries instead of the one Fase 38 could
     // build). "a very long descriptive name.txt" is 32 characters - past

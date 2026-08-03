@@ -1764,6 +1764,21 @@ jobs:
           # contents, not a wrapped/garbage cluster silently returning
           # some other number.
           grep -q "SHELL\] ls DOTTEST/\.\. -> 6 entries" boot.log
+          # Fase 166: closes the 16th Explore-agent survey's candidate #1
+          # - split_path let '.' or '..' through as an ORDINARY name
+          # whenever it was the path's own FINAL component (Fase 164 only
+          # fixed '..' as an INTERMEDIATE segment, i.e. mid-path). Two
+          # distinct, zero-setup-reachable corruption paths this closes:
+          # `rmdir DIR/..` re-derives the same cluster-2 underflow Fase
+          # 164 fixed for `ls`, but here it reaches delete_directory_impl,
+          # so a garbage LBA gets a real disk WRITE, not just a bad read;
+          # `rmdir DIR/.` would delete the directory's own dangling self-
+          # reference instead of the directory itself. `touch DIR/..`
+          # would create a bogus VFAT entry literally named "..". All 5
+          # commands that resolve a "DIR/NAME" path - cat/touch/rm/mkdir/
+          # rmdir - share this one split_path helper, so the fix and this
+          # single assertion cover all of them at once.
+          grep -q "SHELL\] rmdir DOTREJ/\.\. -> FAILED: invalid path - '\.' or '\.\.' can't be used as the target name" boot.log
           # Confirms MULTI-CHUNK VFAT LONG FILE NAMES (Fase 40) - a name
           # past Fase 38's original 13-character single-entry cap now
           # chains multiple long-name entries instead of being rejected.

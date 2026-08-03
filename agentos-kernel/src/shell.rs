@@ -682,6 +682,23 @@ fn split_path(path: &str) -> Result<(alloc::vec::Vec<&str>, &str), &'static str>
     let name = segments
         .pop()
         .expect("split('/') always yields at least one segment");
+    // "." and ".." are real, ordinary directory entries on disk (every
+    // directory's own self/parent-pointer entries - fat12.rs's own
+    // format_short_name faithfully reconstructs them), so without this
+    // guard a caller could target one directly: `rmdir DIR/..` matches
+    // DIR's own real ".." entry (cluster 0 = "parent is root" - the
+    // same FAT convention Fase 164 already had to translate back to
+    // this shell's own root sentinel for the *read-only* `ls`/parent-
+    // chain path) and corrupts the live disk instead of cleanly
+    // failing; `rmdir DIR/.` deletes DIR's own cluster chain out from
+    // under DIR's still-listed parent entry, leaving a dangling
+    // reference the FAT will then hand to some unrelated future file.
+    // A real shell's own `rm`/`mkdir`/`rmdir` refuse `.`/`..` as the
+    // target outright for the same reason - do the same here, at the
+    // single choke point every mutating command already shares.
+    if name == "." || name == ".." {
+        return Err("invalid path - '.' or '..' can't be used as the target name");
+    }
     Ok((segments, name))
 }
 
