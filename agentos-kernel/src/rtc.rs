@@ -49,6 +49,25 @@ fn bcd_to_binary(value: u8) -> u8 {
     (value & 0x0F) + ((value >> 4) * 10)
 }
 
+/// Converts an already-decoded 1-12 hour value (BCD/binary resolved, PM
+/// bit masked off) into 24-hour form, using the PM flag read from the
+/// *original* raw hours byte. Split out from `read_time` as its own
+/// function so the AM/PM boundary cases - real hardware only ever
+/// presents them at midnight/noon, impossible to force via QEMU's own
+/// wall-clock in CI - can be exercised directly with synthetic inputs.
+pub fn normalize_hours_12h(hours_raw: u8, hours_12: u8) -> u8 {
+    if hours_raw & HOURS_PM_FLAG != 0 {
+        // PM: 12 PM -> 12, 1-11 PM -> 13-23.
+        (hours_12 % 12) + 12
+    } else if hours_12 == 12 {
+        // 12 AM (midnight) -> 0. Every other AM hour (1-11) is already
+        // correct as-is in 24-hour form.
+        0
+    } else {
+        hours_12
+    }
+}
+
 /// Reads the current wall-clock time from the CMOS RTC.
 ///
 /// Waits out any in-progress hardware update first (Status Register A's
@@ -97,11 +116,8 @@ pub fn read_time() -> RtcTime {
         )
     };
 
-    if !is_24h && hours_raw & HOURS_PM_FLAG != 0 {
-        // 12-hour mode, PM flag set - checked on the *raw* hours byte,
-        // since the branch above already masked that bit off before any
-        // BCD/binary conversion.
-        hours = (hours % 12) + 12;
+    if !is_24h {
+        hours = normalize_hours_12h(hours_raw, hours);
     }
 
     RtcTime {

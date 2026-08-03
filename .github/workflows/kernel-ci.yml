@@ -889,6 +889,15 @@ jobs:
             echo "RTC REGRESSION: year $rtc_year isn't plausible - BCD/binary conversion likely broken."
             exit 1
           fi
+          # Fase 144: rtc.rs's own 12-hour-to-24-hour conversion had a real
+          # bug, found by inspection - it only adjusted the hour when the
+          # PM flag was SET, so 12 AM (midnight, PM flag clear) was left as
+          # hour 12 instead of the correct 0. The `date` assertion above can
+          # only check plausibility (real wall-clock time can't be forced
+          # to hit midnight/noon on demand), so this calls the now-fixed,
+          # extracted `rtc::normalize_hours_12h` directly with synthetic
+          # inputs covering every AM/PM boundary case.
+          grep -q "RTC\] rtc_12h_conversion_test midnight_ok=true noon_ok=true one_am_ok=true one_pm_ok=true eleven_am_ok=true eleven_pm_ok=true" boot.log
           # Confirms cursor movement really works, not just that it
           # compiles: typing "hep", pressing Left once, then typing "l"
           # should insert at the cursor (between 'e' and 'p') and dispatch

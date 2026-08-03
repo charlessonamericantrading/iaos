@@ -1783,6 +1783,39 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::dispatch_command("date");
     shell::dispatch_command("lspci");
 
+    // 7b-1. Test rtc::normalize_hours_12h directly (Fase 144) - the `date`
+    // command just above exercises the REAL CMOS hardware clock, but
+    // whatever wall-clock time QEMU happens to boot with is whatever it
+    // is: it can never deterministically reach the AM/PM boundary cases
+    // (midnight, noon) on demand. Fixes a real bug found by inspection:
+    // in 12-hour RTC mode, the old conversion only adjusted the hour
+    // when the PM flag was SET, so 12 AM (midnight, PM flag clear) was
+    // left as hour 12 instead of the correct 0 - silently wrong for both
+    // the `date` command and every FAT12/VFAT file timestamp written at
+    // midnight (fat12.rs's own `to_fat_datetime` calls `rtc::read_time`
+    // too). `0x80` below is the CMOS hours register's PM flag bit,
+    // hand-supplied here the same way Fase 139's VFAT test hand-built
+    // raw on-disk bytes, rather than exporting the module's own private
+    // `HOURS_PM_FLAG` constant just for this.
+    kprintln!("[KERNEL INIT] Testing rtc::normalize_hours_12h (12-hour AM/PM boundary cases)...");
+    {
+        let midnight_ok = rtc::normalize_hours_12h(0x00, 12) == 0;
+        let noon_ok = rtc::normalize_hours_12h(0x80, 12) == 12;
+        let one_am_ok = rtc::normalize_hours_12h(0x00, 1) == 1;
+        let one_pm_ok = rtc::normalize_hours_12h(0x80, 1) == 13;
+        let eleven_am_ok = rtc::normalize_hours_12h(0x00, 11) == 11;
+        let eleven_pm_ok = rtc::normalize_hours_12h(0x80, 11) == 23;
+
+        kprintln!(
+            "[RTC] rtc_12h_conversion_test: midnight_ok={} noon_ok={} one_am_ok={} one_pm_ok={} eleven_am_ok={} eleven_pm_ok={}",
+            midnight_ok, noon_ok, one_am_ok, one_pm_ok, eleven_am_ok, eleven_pm_ok
+        );
+        serial_println!(
+            "[RTC] rtc_12h_conversion_test midnight_ok={} noon_ok={} one_am_ok={} one_pm_ok={} eleven_am_ok={} eleven_pm_ok={}",
+            midnight_ok, noon_ok, one_am_ok, one_pm_ok, eleven_am_ok, eleven_pm_ok
+        );
+    }
+
     // 7b-2. First real step toward a real e1000 NIC driver: find the real
     // device lspci above just confirmed is present, reach its
     // memory-mapped registers (reusing the same PHYS_MEM_OFFSET mechanism
