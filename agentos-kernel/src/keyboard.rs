@@ -68,10 +68,14 @@ impl KeyboardDriver {
     /// `rm` - a real, previously invisible-to-CI gap, since every existing
     /// self-test using a `.`/`/`-containing name dispatches it directly
     /// via `shell::dispatch_command`, bypassing this driver entirely).
-    /// Deliberately NOT covering shifted digit-row symbols (`!@#$` etc.)
-    /// or other punctuation - nothing on this disk or in any shell
-    /// command needs them yet, and this is a shell keyboard driver, not a
-    /// general-purpose one.
+    /// Fase 155 adds `,` (0x33 sits right between `m` (0x32) and `.`
+    /// (0x34) in the standard PS/2 Set 1 layout, but had no arm at all -
+    /// `touch`'s own free-form file content is the concrete, always-
+    /// reachable case: any comma a real person typed there vanished
+    /// silently, with no error). Deliberately NOT covering shifted
+    /// digit-row symbols (`!@#$` etc.) or other punctuation - nothing on
+    /// this disk or in any shell command needs them yet, and this is a
+    /// shell keyboard driver, not a general-purpose one.
     pub fn scancode_to_char(&self, scancode: u8) -> Option<char> {
         let shift = self.shift_held;
         match scancode {
@@ -113,6 +117,7 @@ impl KeyboardDriver {
             0x30 => Some(if shift { 'B' } else { 'b' }),
             0x31 => Some(if shift { 'N' } else { 'n' }),
             0x32 => Some(if shift { 'M' } else { 'm' }),
+            0x33 => Some(if shift { '<' } else { ',' }),
             0x34 => Some(if shift { '>' } else { '.' }),
             0x35 => Some(if shift { '?' } else { '/' }),
             0x39 => Some(' '),

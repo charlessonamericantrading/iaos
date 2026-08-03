@@ -4066,6 +4066,70 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         keyboard::handle_scancode(code);
     }
 
+    // 7c-6. Test `,` key support (Fase 155) - closes another real,
+    // previously invisible-to-CI gap in the same driver Fase 141 already
+    // patched once: `keyboard.rs::scancode_to_char` had no arm at all for
+    // 0x33, even though it sits right between `m` (0x32) and `.` (0x34)
+    // in the standard PS/2 Set 1 layout - a real key every physical
+    // keyboard has. `touch`'s own free-form file content is the
+    // concretely reachable case: any comma a real person typed there
+    // vanished silently, with no error at all. Types a full,
+    // self-contained round trip through the real keyboard path -
+    // `touch cm.txt a,bc`, `cat cm.txt`, `rm cm.txt` - and cleans up
+    // after itself. Success shows up as the shell's own real print lines
+    // (`Created 'cm.txt' (4 bytes).`, and critically `cat`'s own hex
+    // dump line `first4=612c6263` - byte-precise proof the comma (0x2c)
+    // landed correctly in the file content, not just "no error
+    // occurred"), not "Unknown command" or a FAT error.
+    kprintln!("[KERNEL INIT] Testing ',' key (touch/cat/rm via keyboard)...");
+    const COMMA_TEST_SEQUENCE: &[u8] = &[
+        // "touch cm.txt a,bc" + Enter
+        0x14, 0x94, // t
+        0x18, 0x98, // o
+        0x16, 0x96, // u
+        0x2E, 0xAE, // c
+        0x23, 0xA3, // h
+        0x39, 0xB9, // space
+        0x2E, 0xAE, // c
+        0x32, 0xB2, // m
+        0x34, 0xB4, // .
+        0x14, 0x94, // t
+        0x2D, 0xAD, // x
+        0x14, 0x94, // t
+        0x39, 0xB9, // space
+        0x1E, 0x9E, // a
+        0x33, 0xB3, // , (Fase 155 - the new key under test)
+        0x30, 0xB0, // b
+        0x2E, 0xAE, // c
+        0x1C, 0x9C, // enter
+        // "cat cm.txt" + Enter
+        0x2E, 0xAE, // c
+        0x1E, 0x9E, // a
+        0x14, 0x94, // t
+        0x39, 0xB9, // space
+        0x2E, 0xAE, // c
+        0x32, 0xB2, // m
+        0x34, 0xB4, // .
+        0x14, 0x94, // t
+        0x2D, 0xAD, // x
+        0x14, 0x94, // t
+        0x1C, 0x9C, // enter
+        // "rm cm.txt" + Enter
+        0x13, 0x93, // r
+        0x32, 0xB2, // m
+        0x39, 0xB9, // space
+        0x2E, 0xAE, // c
+        0x32, 0xB2, // m
+        0x34, 0xB4, // .
+        0x14, 0x94, // t
+        0x2D, 0xAD, // x
+        0x14, 0x94, // t
+        0x1C, 0x9C, // enter
+    ];
+    for &code in COMMA_TEST_SEQUENCE {
+        keyboard::handle_scancode(code);
+    }
+
     // 7d. Test a Real Cooperative Context Switch (stack + register swap)
     // Cooperative only - the worker yields back voluntarily. Not wired to
     // the timer interrupt yet (that's real preemption, separate work).

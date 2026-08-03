@@ -985,6 +985,20 @@ jobs:
           grep -q "SHELL\] cat d/a.b -> 2 bytes" boot.log
           grep -q "SHELL\] rm d/a.b -> deleted" boot.log
           grep -q "SHELL\] rmdir d -> deleted" boot.log
+          # Fase 155: confirms keyboard.rs::scancode_to_char's new `,`
+          # mapping really works - a full touch/cat/rm round trip typed
+          # via a real scancode sequence (not dispatched directly),
+          # putting the comma inside touch's own free-form file content.
+          # first4=612c6263 is byte-precise proof the comma (0x2c) landed
+          # correctly between `a` (0x61) and `b` (0x62) - not just that
+          # the command ran without error. Before this Fase, scancode
+          # 0x33 (which sits right between `m` (0x32) and `.` (0x34) in
+          # the standard PS/2 Set 1 layout) had no arm at all, so any
+          # comma a real person typed vanished silently.
+          grep -q "SHELL\] touch cm.txt -> created 4 bytes" boot.log
+          grep -q "SHELL\] cat cm.txt -> 4 bytes" boot.log
+          grep -q "first4=612c6263" boot.log
+          grep -q "SHELL\] rm cm.txt -> deleted" boot.log
           grep -q "\[CTXSWITCH\] worker -> main: demo OK" boot.log
           grep -q "\[COOP\] all tasks finished" boot.log
           # Confirms the ps-visible PCB table is really unified with the
