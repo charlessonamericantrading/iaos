@@ -14,9 +14,15 @@
 //! few back - proof this kernel can genuinely talk to a second,
 //! structurally different real NIC. Second stage (Fase 63):
 //! `init_tx_queue` completes the real device-initialization handshake
-//! and sets up ONE real virtqueue (TX) - still no actual frame sent or
-//! received yet, that's real, substantial follow-on work, the same
-//! multi-Fase progression `net::e1000` needed (Fase 19 -> 22 -> 44/45).
+//! and sets up ONE real virtqueue (TX). Third stage (Fase 64):
+//! `send_test_frame` proves a real frame genuinely reaches the device -
+//! the used ring's own `idx` advances. Fourth stage (Fase 65/66):
+//! `init_rx_queue` arms a real RX virtqueue and `receive_test_frame`
+//! proves a real frame comes back (a genuine ARP reply); Fase 82
+//! resolved the last open RX-timing mystery (a `used_idx` sampling-
+//! order bug in this kernel's own test, not a QEMU/hardware issue).
+//! Both directions are real now, completing the same multi-Fase
+//! progression `net::e1000` needed (Fase 19 -> 22 -> 44/45).
 //!
 //! **Genuinely different from e1000 in the one way that matters most
 //! just to reach its registers at all**: e1000's BAR0 is memory-mapped
