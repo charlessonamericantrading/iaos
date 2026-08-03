@@ -66,34 +66,10 @@ pub fn read_sector(lba: u32, buf: &mut [u8; 512]) -> Result<(), &'static str> {
 
 fn read_sector_inner(lba: u32, buf: &mut [u8; 512]) -> Result<(), &'static str> {
     unsafe {
-        let mut drive_head: Port<u8> = Port::new(DRIVE_HEAD);
-        let mut warmup: Port<u8> = Port::new(ERROR_FEATURES);
-        let mut sector_count: Port<u8> = Port::new(SECTOR_COUNT);
-        let mut lba_low: Port<u8> = Port::new(LBA_LOW);
-        let mut lba_mid: Port<u8> = Port::new(LBA_MID);
-        let mut lba_high: Port<u8> = Port::new(LBA_HIGH);
         let mut command_status: Port<u8> = Port::new(COMMAND_STATUS);
         let mut data: Port<u16> = Port::new(DATA);
 
-        // 0xE0: LBA mode (bit 6) + master drive (bit 4 clear) + the two
-        // reserved-as-1 bits (5, 7); low nibble is LBA bits 24-27.
-        drive_head.write(0xE0 | ((lba >> 24) & 0x0F) as u8);
-
-        // The drive needs ~400ns after a drive-select write before its
-        // status register is meaningful - reading the (otherwise unused
-        // here) error/features port a few times is the standard cheap way
-        // to burn that time without a real timer.
-        for _ in 0..4 {
-            let _ = warmup.read();
-        }
-
-        sector_count.write(1);
-        lba_low.write((lba & 0xFF) as u8);
-        lba_mid.write(((lba >> 8) & 0xFF) as u8);
-        lba_high.write(((lba >> 16) & 0xFF) as u8);
-        command_status.write(CMD_READ_SECTORS);
-
-        let mut status = poll_until(&mut command_status, "read", |s| s & STATUS_BSY == 0)?;
+        let mut status = select_drive_and_issue_command(lba, "read", CMD_READ_SECTORS)?;
         if status & STATUS_ERR != 0 {
             return Err("ATA read: drive reported an error (ERR bit set)");
         }
@@ -132,28 +108,10 @@ pub fn write_sector(lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
 
 fn write_sector_inner(lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
     unsafe {
-        let mut drive_head: Port<u8> = Port::new(DRIVE_HEAD);
-        let mut warmup: Port<u8> = Port::new(ERROR_FEATURES);
-        let mut sector_count: Port<u8> = Port::new(SECTOR_COUNT);
-        let mut lba_low: Port<u8> = Port::new(LBA_LOW);
-        let mut lba_mid: Port<u8> = Port::new(LBA_MID);
-        let mut lba_high: Port<u8> = Port::new(LBA_HIGH);
         let mut command_status: Port<u8> = Port::new(COMMAND_STATUS);
         let mut data: Port<u16> = Port::new(DATA);
 
-        drive_head.write(0xE0 | ((lba >> 24) & 0x0F) as u8);
-
-        for _ in 0..4 {
-            let _ = warmup.read();
-        }
-
-        sector_count.write(1);
-        lba_low.write((lba & 0xFF) as u8);
-        lba_mid.write(((lba >> 8) & 0xFF) as u8);
-        lba_high.write(((lba >> 16) & 0xFF) as u8);
-        command_status.write(CMD_WRITE_SECTORS);
-
-        let mut status = poll_until(&mut command_status, "write", |s| s & STATUS_BSY == 0)?;
+        let mut status = select_drive_and_issue_command(lba, "write", CMD_WRITE_SECTORS)?;
         if status & STATUS_ERR != 0 {
             return Err("ATA write: drive reported an error (ERR bit set)");
         }
@@ -179,6 +137,51 @@ fn write_sector_inner(lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
         poll_until(&mut command_status, "write", |s| s & STATUS_BSY == 0)?;
     }
     Ok(())
+}
+
+/// Selects the master drive in LBA mode for `lba`, waits the standard
+/// ~400ns drive-select settling time, writes the sector-count/LBA
+/// registers, issues `command`, and waits for `BSY` to clear - the exact
+/// setup `read_sector_inner`/`write_sector_inner` previously each hand-
+/// duplicated verbatim (byte-for-byte identical except this final
+/// `command` byte, the same "duplicate logic, unify it" class Fase 97/
+/// 111/118/119/122/125/131/139 already found and fixed elsewhere in this
+/// project). Returns the post-`BSY` status rather than checking `ERR`
+/// itself, since both callers immediately did that same wait next anyway
+/// but word their own `ERR` error message slightly differently
+/// ("ATA read: ..." vs "ATA write: ...").
+unsafe fn select_drive_and_issue_command(
+    lba: u32,
+    op: &'static str,
+    command: u8,
+) -> Result<u8, &'static str> {
+    let mut drive_head: Port<u8> = Port::new(DRIVE_HEAD);
+    let mut warmup: Port<u8> = Port::new(ERROR_FEATURES);
+    let mut sector_count: Port<u8> = Port::new(SECTOR_COUNT);
+    let mut lba_low: Port<u8> = Port::new(LBA_LOW);
+    let mut lba_mid: Port<u8> = Port::new(LBA_MID);
+    let mut lba_high: Port<u8> = Port::new(LBA_HIGH);
+    let mut command_status: Port<u8> = Port::new(COMMAND_STATUS);
+
+    // 0xE0: LBA mode (bit 6) + master drive (bit 4 clear) + the two
+    // reserved-as-1 bits (5, 7); low nibble is LBA bits 24-27.
+    drive_head.write(0xE0 | ((lba >> 24) & 0x0F) as u8);
+
+    // The drive needs ~400ns after a drive-select write before its status
+    // register is meaningful - reading the (otherwise unused here)
+    // error/features port a few times is the standard cheap way to burn
+    // that time without a real timer.
+    for _ in 0..4 {
+        let _ = warmup.read();
+    }
+
+    sector_count.write(1);
+    lba_low.write((lba & 0xFF) as u8);
+    lba_mid.write(((lba >> 8) & 0xFF) as u8);
+    lba_high.write(((lba >> 16) & 0xFF) as u8);
+    command_status.write(command);
+
+    poll_until(&mut command_status, op, |s| s & STATUS_BSY == 0)
 }
 
 /// Polls `port` until `done(status)` is true, returning the status that
