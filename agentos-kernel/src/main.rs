@@ -4720,6 +4720,81 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         keyboard::handle_scancode(code);
     }
 
+    // 7c-7. Test Shift-release no longer clobbering another held key's
+    // repeat-suppression tracking (Fase 173) - closes a real, ordinary-
+    // typing-reachable bug the 23rd Explore-agent survey found:
+    // `keyboard.rs`'s Shift make/break arms used to write their own
+    // scancode into the shared `last_scancode` field (meant to suppress a
+    // held key's own PS/2 hardware auto-repeat), even though Shift already
+    // tracks its own state via `shift_held` and never needed to. Releasing
+    // Shift while a DIFFERENT key was still held made that key's very next
+    // hardware-repeat tick look like a brand-new press (it no longer
+    // matched the clobbered `last_scancode`), silently inserting a
+    // spurious duplicate, unshifted character. Probes the exact sequence:
+    // hold Shift, press 'a' (emits 'A'), let 'a' auto-repeat once (must be
+    // suppressed), release Shift, let 'a' auto-repeat again (must STILL be
+    // suppressed - this is what the bug broke), then release 'a'. Under
+    // the bug this produced "Aabcd" (5 bytes, `first4=41616263`); fixed,
+    // it produces "Abcd" (4 bytes, `first4=41626364`) - byte-precise proof
+    // of the exact mechanism, not just "no crash occurred".
+    kprintln!("[KERNEL INIT] Testing Shift-release/last_scancode repeat-suppression (Fase 173)...");
+    const SHIFT_REPEAT_TEST_SEQUENCE: &[u8] = &[
+        // "touch ab.txt " (trailing space - content starts next)
+        0x14, 0x94, // t
+        0x18, 0x98, // o
+        0x16, 0x96, // u
+        0x2E, 0xAE, // c
+        0x23, 0xA3, // h
+        0x39, 0xB9, // space
+        0x1E, 0x9E, // a
+        0x30, 0xB0, // b
+        0x34, 0xB4, // .
+        0x14, 0x94, // t
+        0x2D, 0xAD, // x
+        0x14, 0x94, // t
+        0x39, 0xB9, // space
+        // Probe: hold Shift, press+repeat 'a', release Shift, repeat 'a'
+        // again, then release 'a' - no intervening break codes for 'a'
+        // itself, simulating the key being held throughout.
+        0x2A, // Left-Shift make (held)
+        0x1E, // 'a' make - new press, emits 'A'
+        0x1E, // 'a' make again - hardware auto-repeat, must be suppressed
+        0xAA, // Left-Shift break (released)
+        0x1E, // 'a' make again - still held, must STILL be suppressed
+        0x9E, // 'a' break - finally released
+        // "bcd" + Enter
+        0x30, 0xB0, // b
+        0x2E, 0xAE, // c
+        0x20, 0xA0, // d
+        0x1C, 0x9C, // enter
+        // "cat ab.txt" + Enter
+        0x2E, 0xAE, // c
+        0x1E, 0x9E, // a
+        0x14, 0x94, // t
+        0x39, 0xB9, // space
+        0x1E, 0x9E, // a
+        0x30, 0xB0, // b
+        0x34, 0xB4, // .
+        0x14, 0x94, // t
+        0x2D, 0xAD, // x
+        0x14, 0x94, // t
+        0x1C, 0x9C, // enter
+        // "rm ab.txt" + Enter
+        0x13, 0x93, // r
+        0x32, 0xB2, // m
+        0x39, 0xB9, // space
+        0x1E, 0x9E, // a
+        0x30, 0xB0, // b
+        0x34, 0xB4, // .
+        0x14, 0x94, // t
+        0x2D, 0xAD, // x
+        0x14, 0x94, // t
+        0x1C, 0x9C, // enter
+    ];
+    for &code in SHIFT_REPEAT_TEST_SEQUENCE {
+        keyboard::handle_scancode(code);
+    }
+
     // 7g. Test a Real Cooperative Context Switch (stack + register swap)
     // Cooperative only - the worker yields back voluntarily. Not wired to
     // the timer interrupt yet (that's real preemption, separate work).

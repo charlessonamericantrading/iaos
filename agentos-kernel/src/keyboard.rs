@@ -247,15 +247,25 @@ pub fn handle_scancode(scancode: u8) {
     // otherwise just discard it (it only ever recognizes make codes as
     // meaningful, tracking break codes solely so the *next* press of the
     // same key isn't mistaken for a held-key repeat).
+    //
+    // Fase 173: deliberately does NOT touch `last_scancode` here (unlike
+    // the generic path below) - that field tracks whichever OTHER key is
+    // being held for repeat-suppression purposes, and Shift already has
+    // its own separate `shift_held` flag for its own state. Writing
+    // `scancode` here used to clobber that tracking: releasing Shift
+    // while a different key was still auto-repeating made the very next
+    // repeat tick of that OTHER key look like a brand-new press (it no
+    // longer matched `last_scancode`), silently inserting a spurious
+    // duplicate character - an ordinary sequence (hold Shift, hold
+    // another key, release Shift first) genuinely reachable in normal
+    // typing, not just in principle.
     match scancode {
         SCANCODE_LSHIFT | SCANCODE_RSHIFT => {
             kb.shift_held = true;
-            kb.last_scancode = scancode;
             return;
         }
         SCANCODE_LSHIFT_BREAK | SCANCODE_RSHIFT_BREAK => {
             kb.shift_held = false;
-            kb.last_scancode = scancode;
             return;
         }
         _ => {}

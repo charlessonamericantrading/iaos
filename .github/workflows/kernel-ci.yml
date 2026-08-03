@@ -1928,6 +1928,32 @@ jobs:
           # exercise delete_directory_impl's own copy of the fix
           # identically.
           grep -q "FAT12\] lfn_freed_on_delete_test dir_created=true file_slots_freed=true dir_slots_freed=true cleanup_ok=true" boot.log
+          # Fase 173 (23rd survey): fixes keyboard.rs's Shift make/break
+          # arms clobbering the shared last_scancode field (meant only to
+          # suppress a held OTHER key's own PS/2 hardware auto-repeat)
+          # with Shift's own scancode, even though Shift already tracks
+          # its state via shift_held and never needed to write there.
+          # Releasing Shift while a different key was still held made
+          # that key's very next repeat tick look like a brand-new press
+          # (it no longer matched the clobbered last_scancode), silently
+          # inserting a spurious duplicate, unshifted character - reachable
+          # via an entirely ordinary typing sequence (hold Shift, hold
+          # another key, release Shift first), not a contrived edge case.
+          # Self-test probes exactly this: hold Shift, press 'a' (emits
+          # 'A'), let 'a' auto-repeat once (must be suppressed), release
+          # Shift, let 'a' auto-repeat again (must STILL be suppressed -
+          # this is what the bug broke), release 'a', then finish typing
+          # "bcd" - all via the real keyboard::handle_scancode path, into
+          # a real touch/cat/rm round trip. Under the pre-fix bug this
+          # produced "Aabcd" (5 bytes, first4=41616263, an extra spurious
+          # lowercase 'a'); fixed, it produces "Abcd" (4 bytes) - the
+          # byte-precise first4 hex proves the exact mechanism, not just
+          # "no crash occurred". Neither hex value collided with any
+          # pre-existing assertion, confirmed by grep before adding this
+          # one. All checks passed identically across 5 repeated boots,
+          # with zero regression across every other keyboard/FAT12
+          # self-test suite in the same boot log.
+          grep -q "first4=41626364" boot.log
           # Fase 139: confirms fat_common::short_entry_if_matches - the
           # shared helper fat12.rs::find_entry_location_in was refactored
           # to call instead of its own inline duplicate, and that
