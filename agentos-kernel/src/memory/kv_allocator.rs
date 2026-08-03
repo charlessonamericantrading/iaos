@@ -70,7 +70,6 @@ impl KVCacheMemoryManager {
         Some(block_id)
     }
 
-    #[allow(dead_code)]
     pub fn free_kv_block(&mut self, block_id: u32) -> bool {
         let idx = (block_id - 1) as usize;
         if idx < self.blocks.len() && self.blocks[idx].is_some() {

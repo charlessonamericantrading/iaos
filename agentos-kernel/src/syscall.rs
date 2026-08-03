@@ -9,6 +9,7 @@ pub const SYS_SERIAL_PRINT: u64 = 1;
 pub const SYS_AGENT_SPAWN: u64 = 2;
 pub const SYS_KV_ALLOC: u64 = 3;
 pub const SYS_TENSOR_EVAL: u64 = 4;
+pub const SYS_KV_FREE: u64 = 5;
 
 /// Real arguments for `SYS_TENSOR_EVAL` - a forward-pass layer evaluation
 /// (`Y = ReLU(W*X + B)`), matching `TensorEngine::matmul_layer`'s own
@@ -122,6 +123,20 @@ pub fn dispatch_syscall(
                 }
                 None => 0,
             }
+        }
+        // Fase 138: KVCacheMemoryManager::free_kv_block existed since
+        // before this session's own start, fully implemented and correct
+        // (it really drops the block's own Box<[u8]>, genuinely freeing
+        // the heap memory), but had zero callers anywhere in the tree -
+        // the same "defined but never wired up" gap Fase 55/136 already
+        // found and closed for SYS_TENSOR_EVAL/get_active_count(). arg1
+        // is the block_id SYS_KV_ALLOC returned; returns 1 on a real
+        // free, 0 if that id was never allocated (or was already freed).
+        SYS_KV_FREE => {
+            let mut kv = KV_MANAGER.lock();
+            let freed = kv.free_kv_block(arg1 as u32);
+            kprintln!("[SYSCALL] Freed KV Cache Block #{}: {}", arg1 as u32, freed);
+            freed as u64
         }
         SYS_TENSOR_EVAL => {
             // Fase 74: this kernel's ring-3 arc is no longer hypothetical

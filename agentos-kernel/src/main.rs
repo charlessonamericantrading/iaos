@@ -1701,6 +1701,57 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 7a-5. Test SYS_KV_FREE (Fase 138) - KVCacheMemoryManager::free_kv_block
+    // existed since before this session's own start, fully implemented and
+    // correct (it really drops the block's own Box<[u8]>, genuinely freeing
+    // the heap memory), but had zero callers anywhere in the tree until now
+    // - the same "defined but never wired up" gap Fase 55/136 already found
+    // and closed for SYS_TENSOR_EVAL/get_active_count() (see syscall.rs's
+    // own SYS_KV_FREE arm for the full reasoning). Allocates a THIRD block
+    // (on top of the two already-CI-asserted ones: #1 pid=2/tokens=2048
+    // from this function's own KV Cache Memory Manager init above, #2
+    // pid=4/tokens=1024 from the SYS_KV_ALLOC test just above) via the
+    // syscall path, confirms the real allocated count went up by one - not
+    // just that the syscall returned a block id - frees it via SYS_KV_FREE,
+    // and confirms the count genuinely came back down. This third block is
+    // freed here, before `mem` runs for the first time just below, so
+    // `mem`'s own existing output (and the Fase 137 CI assertions tied to
+    // it) stays completely unaffected. Also confirms freeing a block id
+    // that was NEVER allocated is rejected cleanly (0), not silently
+    // treated as success.
+    kprintln!("[KERNEL SYSCALL] Testing SYS_KV_FREE (real heap deallocation via syscall)...");
+    {
+        let count_before = KV_MANAGER.lock().get_allocated_count();
+        let new_block_id = syscall::dispatch_syscall(syscall::SYS_KV_ALLOC, 99, 512, 0, false);
+        let count_after_alloc = KV_MANAGER.lock().get_allocated_count();
+        let alloc_ok = count_after_alloc == count_before + 1;
+
+        let free_result =
+            syscall::dispatch_syscall(syscall::SYS_KV_FREE, new_block_id, 0, 0, false);
+        let count_after_free = KV_MANAGER.lock().get_allocated_count();
+        let free_ok = free_result == 1 && count_after_free == count_before;
+
+        // 9999 can never be a real block id - KVCacheMemoryManager only
+        // ever holds 128 slots (kv_allocator.rs's own
+        // `blocks: [Option<KVCacheBlock>; 128]`).
+        let invalid_free_result =
+            syscall::dispatch_syscall(syscall::SYS_KV_FREE, 9999, 0, 0, false);
+        let invalid_free_rejected = invalid_free_result == 0;
+
+        kprintln!(
+            "[SYSCALL] kv_free_test: alloc_ok={} free_ok={} invalid_free_rejected={}",
+            alloc_ok,
+            free_ok,
+            invalid_free_rejected
+        );
+        serial_println!(
+            "[SYSCALL] kv_free_test alloc_ok={} free_ok={} invalid_free_rejected={}",
+            alloc_ok,
+            free_ok,
+            invalid_free_rejected
+        );
+    }
+
     // 7b. Test the Shell Command Dispatcher (same parser the IRQ1 keyboard
     // handler calls once a real key press ends a line - this exercises it
     // without needing one, so it's provable from a headless serial capture.

@@ -849,6 +849,20 @@ jobs:
           # arbitrary.
           grep -q "KV block #1 pid=2 tokens=2048 SystemRam" boot.log
           grep -q "KV block #2 pid=4 tokens=1024 SystemRam" boot.log
+          # Fase 138: KVCacheMemoryManager::free_kv_block existed since
+          # before this session's own start, fully implemented and correct,
+          # but had zero callers anywhere in the tree until now - the same
+          # "defined but never wired up" gap Fase 55/136 already found and
+          # closed. This test allocates a THIRD block via the new
+          # SYS_KV_FREE syscall's sibling SYS_KV_ALLOC, confirms the real
+          # allocated count went up by one (not just that the syscall
+          # returned a block id), frees it via SYS_KV_FREE, and confirms
+          # the count genuinely came back down - then confirms freeing a
+          # block id that was NEVER allocated is rejected cleanly (0), not
+          # silently treated as success. This third block is freed before
+          # `mem` runs, so the two assertions above (blocks #1/#2) are
+          # completely unaffected.
+          grep -q "SYSCALL\] kv_free_test alloc_ok=true free_ok=true invalid_free_rejected=true" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -
           # it's genuinely real time, different on every run by design -
