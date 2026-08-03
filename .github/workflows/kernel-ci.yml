@@ -496,6 +496,14 @@ jobs:
           # already found and closed elsewhere) - this is the first
           # assertion ever to cover this specific self-test's own output.
           grep -q "SYSCALL\] kv_block_id_test matches=true" boot.log
+          # Fase 150: confirms ProcessControlBlock::token_quota - recorded
+          # by NativeAgentScheduler::spawn since this project's very first
+          # commit - is genuinely readable back per-process via the
+          # already-pub for_each_process, not just stored and never
+          # surfaced (same "write-only" class as Fase 138/143/147/148's
+          # own fixes). pid1/2/3 must match the exact quotas spawn was
+          # called with in main.rs (50000/25000/25000).
+          grep -q "SCHEDULER\] token_quota_test pid1=Some(50000) pid2=Some(25000) pid3=Some(25000) ok=true" boot.log
           # Confirms SYS_TENSOR_EVAL (Fase 55) genuinely dispatches to the
           # real tensor engine now, not "Unknown System Call Number" (this
           # syscall number had been defined but never wired to any match

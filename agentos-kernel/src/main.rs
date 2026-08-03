@@ -492,6 +492,40 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         if let Some(next_pid) = sched.schedule_next() {
             kprintln!("[SCHEDULER] Switched context to active PID: {}", next_pid);
         }
+
+        // 3b. Test that ProcessControlBlock::token_quota - recorded by
+        // `spawn` above since this project's very first commit - is
+        // genuinely readable back per-process, not just stored and never
+        // surfaced (same "write-only" class as Fase 138/143/147/148's own
+        // fixes). Reads live SCHEDULER state via the already-`pub`
+        // `for_each_process` rather than assuming the constructor argument
+        // order held.
+        let mut token_quota_pid1 = None;
+        let mut token_quota_pid2 = None;
+        let mut token_quota_pid3 = None;
+        sched.for_each_process(|p| match p.pid {
+            1 => token_quota_pid1 = Some(p.token_quota),
+            2 => token_quota_pid2 = Some(p.token_quota),
+            3 => token_quota_pid3 = Some(p.token_quota),
+            _ => {}
+        });
+        let token_quota_ok = token_quota_pid1 == Some(50000)
+            && token_quota_pid2 == Some(25000)
+            && token_quota_pid3 == Some(25000);
+        kprintln!(
+            "[SCHEDULER] token_quota_test: pid1={:?} pid2={:?} pid3={:?} ok={}",
+            token_quota_pid1,
+            token_quota_pid2,
+            token_quota_pid3,
+            token_quota_ok
+        );
+        serial_println!(
+            "[SCHEDULER] token_quota_test pid1={:?} pid2={:?} pid3={:?} ok={}",
+            token_quota_pid1,
+            token_quota_pid2,
+            token_quota_pid3,
+            token_quota_ok
+        );
     }
 
     // 4. Test Native KV Cache Memory Allocation
