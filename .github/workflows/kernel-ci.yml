@@ -507,6 +507,14 @@ jobs:
           # already found and closed elsewhere) - this is the first
           # assertion ever to cover this specific self-test's own output.
           grep -q "SYSCALL\] kv_block_id_test matches=true" boot.log
+          # Fase 156: confirms NativeAgentScheduler::current_pid - set by
+          # schedule_next whenever a process is picked to run, since this
+          # project's very first commit, but with no getter anywhere in
+          # the tree until now (11th Explore-agent survey's candidate #3,
+          # same "write-only" class as Fase 138/143/147/148/150/153's own
+          # fixes) - is genuinely readable back, and matches the exact pid
+          # schedule_next itself just returned.
+          grep -q "SCHEDULER\] current_pid_test get_current_pid=1 scheduled_pid=1 ok=true" boot.log
           # Fase 150: confirms ProcessControlBlock::token_quota - recorded
           # by NativeAgentScheduler::spawn since this project's very first
           # commit - is genuinely readable back per-process via the

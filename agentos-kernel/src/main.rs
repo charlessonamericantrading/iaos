@@ -492,6 +492,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         if let Some(next_pid) = sched.schedule_next() {
             kprintln!("[SCHEDULER] Switched context to active PID: {}", next_pid);
+
+            // 3a-2. Test that NativeAgentScheduler::current_pid - set by
+            // schedule_next just above but never surfaced anywhere in the
+            // tree until now (11th Explore-agent survey's candidate #3,
+            // same "write-only" class as Fase 138/143/147/148/150/153's
+            // own fixes) - is genuinely readable back, and matches the
+            // exact pid schedule_next itself just returned (not just
+            // "some pid was stored").
+            let current_pid_ok = sched.get_current_pid() == next_pid;
+            kprintln!(
+                "[SCHEDULER] current_pid_test: get_current_pid={} scheduled_pid={} ok={}",
+                sched.get_current_pid(),
+                next_pid,
+                current_pid_ok
+            );
+            serial_println!(
+                "[SCHEDULER] current_pid_test get_current_pid={} scheduled_pid={} ok={}",
+                sched.get_current_pid(),
+                next_pid,
+                current_pid_ok
+            );
         }
 
         // 3b. Test that ProcessControlBlock::token_quota - recorded by

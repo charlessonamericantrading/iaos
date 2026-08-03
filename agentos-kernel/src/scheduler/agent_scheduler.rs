@@ -62,6 +62,14 @@ impl NativeAgentScheduler {
         self.processes.iter().filter(|p| p.is_some()).count()
     }
 
+    /// Fase 156: closes the 11th Explore-agent survey's candidate #3 -
+    /// `current_pid` (set by `schedule_next` above whenever a process is
+    /// picked to run) had no getter anywhere in the tree, the same
+    /// "write-only" class as Fase 138/143/147/148/150/153's own fixes.
+    pub fn get_current_pid(&self) -> u32 {
+        self.current_pid
+    }
+
     /// Read-only iteration over live processes, for the `ps` shell command -
     /// keeps the fixed-size `processes` array a private implementation
     /// detail instead of exposing it directly.
