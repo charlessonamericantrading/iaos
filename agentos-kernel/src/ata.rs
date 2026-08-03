@@ -134,7 +134,10 @@ fn write_sector_inner(lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
         }
 
         command_status.write(CMD_CACHE_FLUSH);
-        poll_until(&mut command_status, "write", |s| s & STATUS_BSY == 0)?;
+        status = poll_until(&mut command_status, "write", |s| s & STATUS_BSY == 0)?;
+        if status & STATUS_ERR != 0 {
+            return Err("ATA write: drive reported an error after cache flush (ERR bit set)");
+        }
     }
     Ok(())
 }
