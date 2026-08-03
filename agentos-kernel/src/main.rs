@@ -500,7 +500,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let mut kv = KV_MANAGER.lock();
         if let Some(block_id) = kv.allocate_kv_block(2, 2048) {
             kprintln!(
-                "[KV MEMORY] Allocated KV Cache Block #{} for PID 2 in VRAM",
+                "[KV MEMORY] Allocated KV Cache Block #{} for PID 2 in SystemRam",
                 block_id
             );
         }
