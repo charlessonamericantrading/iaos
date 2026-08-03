@@ -881,6 +881,37 @@ impl Fat12Info {
         Ok(entries)
     }
 
+    /// Counts raw, non-free directory-entry slots inside a subdirectory's
+    /// cluster chain - including VFAT long-name entries (attribute
+    /// `0x0F`), unlike `list_directory`, which folds each one into
+    /// whichever `DirEntry` it describes and never counts it separately.
+    /// Exists purely to make a leaked long-name entry provable directly
+    /// (Fase 172): an orphaned VFAT slot is neither `0x00` nor `0xE5`, so
+    /// it still counts as "used" here even though `list_directory` would
+    /// never surface a name for it - exactly the gap
+    /// `delete_file`/`delete_directory` used to leave behind.
+    pub fn count_used_slots_in(&self, dir_cluster: u32) -> Result<usize, &'static str> {
+        let mut count = 0usize;
+        let mut cluster = Some(dir_cluster);
+        let mut sector_buf = [0u8; 512];
+        'scan: while let Some(c) = cluster {
+            let cluster_lba = self.cluster_to_lba(c);
+            for s in 0..self.sectors_per_cluster as u32 {
+                ata::read_sector(cluster_lba + s, &mut sector_buf)?;
+                for raw in sector_buf.as_chunks::<32>().0.iter() {
+                    if raw[0] == 0x00 {
+                        break 'scan;
+                    }
+                    if raw[0] != 0xE5 {
+                        count += 1;
+                    }
+                }
+            }
+            cluster = self.next_cluster(c)?;
+        }
+        Ok(count)
+    }
+
     /// Finds `name`'s directory entry AND its exact on-disk location
     /// (sector LBA plus byte offset within that sector) - unlike
     /// `list_root_directory`, which only returns the parsed `DirEntry`
@@ -935,12 +966,78 @@ impl Fat12Info {
         Err(not_found)
     }
 
+    /// Finds any VFAT long-name entries (attribute `0x0F`) immediately
+    /// preceding the short entry at `(short_lba, short_offset)` - the
+    /// slots `delete_file_impl`/`delete_directory_impl` (Fase 172) also
+    /// need to mark deleted, not just the short entry itself. Re-scans
+    /// the directory from the start rather than threading extra state
+    /// through `find_entry_location_in` (whose other two callers,
+    /// `read_file_impl`/`write_file_impl`, have no use for a long name's
+    /// own slot locations) - a second pass over what's usually a handful
+    /// of sectors, not a meaningful cost next to the disk I/O already
+    /// happening around it.
+    ///
+    /// Doesn't verify the VFAT checksum the way `LfnState::take_verified`
+    /// does when reconstructing a *name* - it doesn't need to: a
+    /// contiguous run of `0x0F` entries immediately preceding a target
+    /// slot can only be one of two things, both safe to free. Either
+    /// it's that target's own long-name sequence (the common case - this
+    /// kernel's own `write_name_entries` always writes long entries
+    /// immediately followed by exactly one short entry, as one unit, at
+    /// creation time, so a *live* sequence can never end up sitting
+    /// before an unrelated short entry). Or it's an already-orphaned
+    /// sequence from a delete that predates this fix - left behind with
+    /// its own short entry already marked `0xE5` - that
+    /// `find_free_entry_run_in` later happened to reuse for this
+    /// unrelated target; freeing it here is a harmless bonus cleanup,
+    /// not a mistake, since a dead orphan was never reachable by name
+    /// either way. Any intervening entry that isn't part of a real
+    /// contiguous long-name run - a deleted (`0xE5`) slot, a volume
+    /// label, or another real short entry - resets the accumulator,
+    /// which is exactly what stops one entry's own preceding orphan from
+    /// ever being misattributed to a completely different, still-live
+    /// entry sitting further down the directory.
+    fn find_preceding_lfn_slots(
+        &self,
+        dir: DirLocation,
+        short_lba: u32,
+        short_offset: usize,
+    ) -> Result<Vec<(u32, usize)>, &'static str> {
+        let mut sector_buf = [0u8; 512];
+        let mut pending: Vec<(u32, usize)> = Vec::new();
+        for lba in self.directory_sectors(dir)? {
+            ata::read_sector(lba, &mut sector_buf)?;
+            for (i, raw) in sector_buf.as_chunks::<32>().0.iter().enumerate() {
+                let offset = i * 32;
+                if lba == short_lba && offset == short_offset {
+                    return Ok(pending);
+                }
+                if raw[0] == 0x00 {
+                    return Ok(Vec::new());
+                }
+                if raw[0] == 0xE5 {
+                    pending.clear();
+                    continue;
+                }
+                if raw[11] == 0x0F {
+                    pending.push((lba, offset));
+                    continue;
+                }
+                pending.clear(); // volume label or an unrelated short entry
+            }
+        }
+        Ok(Vec::new())
+    }
+
     /// Deletes `name`: frees every cluster in its chain (each FAT entry
     /// set back to `0x000`) and marks its directory entry deleted (first
-    /// byte `0xE5`, the standard FAT convention) - the rest of the
-    /// entry's bytes are left as-is, matching how real FAT filesystems
-    /// handle deletion; only that one byte actually needs to change for
-    /// the slot to be treated as free/reusable by `find_free_root_entry`
+    /// byte `0xE5`, the standard FAT convention) - along with any VFAT
+    /// long-name entries describing it (Fase 172; see
+    /// `find_preceding_lfn_slots`), previously left behind forever on
+    /// every delete of a long-named file. The rest of each entry's bytes
+    /// are left as-is, matching how real FAT filesystems handle
+    /// deletion; only that one byte per slot actually needs to change
+    /// for it to be treated as free/reusable by `find_free_entry_run_in`
     /// (or any other FAT-aware reader).
     pub fn delete_file(&mut self, name: &str) -> Result<(), &'static str> {
         self.delete_file_impl(DirLocation::Root, name)
@@ -957,6 +1054,7 @@ impl Fat12Info {
         if entry.is_dir {
             return Err("FAT12: delete_file does not support directories");
         }
+        let lfn_slots = self.find_preceding_lfn_slots(dir, entry_lba, entry_offset)?;
 
         // Fase 169: no `entry.size > 0` guard here - create_file_impl always
         // allocates at least one real cluster to anchor start_cluster, even
@@ -974,21 +1072,27 @@ impl Fat12Info {
             cluster = next;
         }
 
-        let mut sector_buf = [0u8; 512];
-        ata::read_sector(entry_lba, &mut sector_buf)?;
-        sector_buf[entry_offset] = 0xE5;
-        ata::write_sector(entry_lba, &sector_buf)?;
+        for (lba, offset) in lfn_slots
+            .into_iter()
+            .chain(core::iter::once((entry_lba, entry_offset)))
+        {
+            let mut sector_buf = [0u8; 512];
+            ata::read_sector(lba, &mut sector_buf)?;
+            sector_buf[offset] = 0xE5;
+            ata::write_sector(lba, &sector_buf)?;
+        }
 
         Ok(())
     }
 
     /// Deletes an EMPTY subdirectory: frees its cluster chain and marks
-    /// its root-directory entry deleted (`0xE5`) - same mechanics as
-    /// `delete_file`, since freeing a chain and marking an entry deleted
-    /// doesn't care whether the chain held file bytes or directory
-    /// entries. Refuses to delete a non-empty directory (anything beyond
-    /// the `.`/`..` entries every directory `create_directory` writes) -
-    /// the standard, safe `rmdir` semantic.
+    /// its own entry (plus any VFAT long-name entries describing it,
+    /// Fase 172 - see `delete_file`'s identical note) deleted (`0xE5`) -
+    /// same mechanics as `delete_file`, since freeing a chain and marking
+    /// entries deleted doesn't care whether the chain held file bytes or
+    /// directory entries. Refuses to delete a non-empty directory
+    /// (anything beyond the `.`/`..` entries every directory
+    /// `create_directory` writes) - the standard, safe `rmdir` semantic.
     pub fn delete_directory(&mut self, name: &str) -> Result<(), &'static str> {
         self.delete_directory_impl(DirLocation::Root, name)
     }
@@ -1018,6 +1122,7 @@ impl Fat12Info {
         if entries.len() > 2 {
             return Err("FAT12: directory is not empty");
         }
+        let lfn_slots = self.find_preceding_lfn_slots(parent, entry_lba, entry_offset)?;
 
         let mut cluster = Some(entry.start_cluster);
         while let Some(c) = cluster {
@@ -1026,10 +1131,15 @@ impl Fat12Info {
             cluster = next;
         }
 
-        let mut sector_buf = [0u8; 512];
-        ata::read_sector(entry_lba, &mut sector_buf)?;
-        sector_buf[entry_offset] = 0xE5;
-        ata::write_sector(entry_lba, &sector_buf)?;
+        for (lba, offset) in lfn_slots
+            .into_iter()
+            .chain(core::iter::once((entry_lba, entry_offset)))
+        {
+            let mut sector_buf = [0u8; 512];
+            ata::read_sector(lba, &mut sector_buf)?;
+            sector_buf[offset] = 0xE5;
+            ata::write_sector(lba, &sector_buf)?;
+        }
 
         Ok(())
     }

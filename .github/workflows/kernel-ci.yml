@@ -1888,6 +1888,46 @@ jobs:
           # fix, since both require list_directory to read past the old
           # sector boundary.
           grep -q "FAT12\] entry_run_spans_sector_test dir_created=true fillers_ok=true boundary_created=true boundary_visible=true count_ok=true cleanup_ok=true" boot.log
+          # Fase 172: closes the standing "VFAT long-name entries never
+          # freed on delete" watch-only item (re-confirmed by the
+          # 19th/20th/21st surveys, each assuming the fix would need
+          # find_entry_location_in's own signature changed to return a
+          # full slot range - the 22nd survey found a simpler, purely
+          # additive shape instead). delete_file_impl/delete_directory_impl
+          # each only ever marked their own short entry's byte deleted
+          # (0xE5), leaving any VFAT long-name entries describing it
+          # untouched forever - a real, silent, permanent directory-slot
+          # leak on every single delete of a long-named file/directory,
+          # reachable via the most ordinary touch+rm or mkdir+rmdir
+          # sequence imaginable, and the exact root cause Fase 170
+          # diagnosed for its own root-directory-full incident. Fixed via
+          # a new find_preceding_lfn_slots helper that re-scans a
+          # directory to find any run of long-name (0x0F) entries
+          # immediately preceding a known short-entry location, called
+          # from both delete paths before they free clusters -
+          # find_entry_location_in itself, and its other two callers
+          # (read_file_impl/write_file_impl), are completely untouched.
+          # Deliberately skips the checksum verification
+          # LfnState::take_verified does when reconstructing a name: a
+          # contiguous 0x0F run immediately preceding a target slot can
+          # only be that target's own real sequence (write_name_entries
+          # always writes long entries immediately followed by exactly
+          # one short entry, as one unit, at creation time - a live
+          # sequence can never end up sitting before an unrelated short
+          # entry) or an already-orphaned sequence from a pre-fix delete
+          # that a later create happened to land next to - freeing that
+          # too is a harmless bonus cleanup, not a mistake. Self-test
+          # proves the leak is closed for BOTH delete paths via a new
+          # count_used_slots_in helper (unlike list_directory, it counts
+          # raw slots including long-name entries, so a leaked one still
+          # shows up as "used"): a fresh LFNLEAK subdirectory starts at
+          # count=2 ("." ".."); creating a 13-character long-named file
+          # brings it to 4, and deleting it returns to exactly 2 - under
+          # the pre-fix bug it would have stayed at 3. Repeats the same
+          # round trip for a same-length long-named SUBdirectory to
+          # exercise delete_directory_impl's own copy of the fix
+          # identically.
+          grep -q "FAT12\] lfn_freed_on_delete_test dir_created=true file_slots_freed=true dir_slots_freed=true cleanup_ok=true" boot.log
           # Fase 139: confirms fat_common::short_entry_if_matches - the
           # shared helper fat12.rs::find_entry_location_in was refactored
           # to call instead of its own inline duplicate, and that

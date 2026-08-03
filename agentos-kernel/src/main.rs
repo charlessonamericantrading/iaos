@@ -4231,6 +4231,120 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
+    // 7e-5. Fase 172: closes the 22nd Explore-agent survey's candidate #1
+    // - the standing "VFAT long-name entries never freed on delete"
+    // watch-only item (re-confirmed by the 19th/20th/21st surveys, each
+    // time assuming the correct fix would need find_entry_location_in's
+    // own signature changed to return a full slot range, more invasive
+    // than a single-function fix). This survey found a genuinely
+    // simpler, purely additive shape instead: delete_file_impl and
+    // delete_directory_impl each only ever marked their own short
+    // entry's byte deleted (`0xE5`), leaving any VFAT long-name entries
+    // describing it untouched forever - a real, silent, permanent
+    // directory-slot leak on every single delete of a long-named
+    // file/directory, reachable via the most ordinary `touch`+`rm` or
+    // `mkdir`+`rmdir` sequence imaginable, and the exact root cause Fase
+    // 170 diagnosed for its own root-directory-full incident ("every
+    // slot holds either a live entry or an orphaned VFAT long-name
+    // remnant").
+    //
+    // Fixed via a new `find_preceding_lfn_slots` helper that re-scans a
+    // directory to find any run of long-name (`0x0F`) entries
+    // immediately preceding a known short-entry location, called from
+    // both delete paths before they free clusters - `find_entry_location_in`
+    // itself, and its other two callers (`read_file_impl`/`write_file_impl`,
+    // neither of which need a long name's own slot locations), are
+    // completely untouched. Deliberately skips the checksum verification
+    // `LfnState::take_verified` does when reconstructing a *name*: a
+    // contiguous `0x0F` run immediately before a target slot can only be
+    // that target's own real sequence (this kernel's own
+    // `write_name_entries` always writes long entries immediately
+    // followed by exactly one short entry, as one unit, at creation time
+    // - a live sequence can never end up sitting before an unrelated
+    // short entry) or an already-orphaned sequence from a pre-fix delete
+    // that a later create happened to land next to - freeing that too is
+    // a harmless bonus cleanup, not a mistake, since a dead orphan was
+    // never reachable by name either way.
+    //
+    // Self-test proves the leak is closed for BOTH delete paths (they
+    // shared the identical bug, so both get an identical test rather
+    // than assuming a fix mirrored by hand across two functions behaves
+    // identically) via a new `count_used_slots_in` helper - unlike
+    // `list_directory`, it counts raw slots including long-name entries,
+    // so a leaked one still shows up as "used" even though it holds no
+    // reachable name of its own. A fresh `LFNLEAK` subdirectory starts at
+    // count=2 (".", ".."); creating "long name.txt" (13 characters,
+    // needs exactly one VFAT long entry) brings it to 4, and deleting it
+    // should bring it back to exactly 2 - under the pre-fix bug it would
+    // have stayed at 3, the orphaned long entry never reclaimed. Repeats
+    // the same create-count-delete-count round trip for a same-length
+    // long-named SUBdirectory ("long dir name") to exercise
+    // `delete_directory_impl`'s own copy of the fix identically.
+    kprintln!("[KERNEL INIT] Testing FAT12 VFAT long-name entries are freed on delete...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                let dir_created = fs.create_directory("LFNLEAK").is_ok();
+                let dir_cluster = fs
+                    .list_root_directory()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|e| e.name.eq_ignore_ascii_case("LFNLEAK"))
+                    .map(|e| e.start_cluster);
+
+                let (file_slots_freed, dir_slots_freed, cleanup_ok) = if let Some(dir) = dir_cluster
+                {
+                    let base_count = fs.count_used_slots_in(dir).unwrap_or(usize::MAX);
+
+                    let file_created = fs.create_file_in(dir, "long name.txt", b"hi").is_ok();
+                    let count_after_file_create = fs.count_used_slots_in(dir).unwrap_or(usize::MAX);
+                    let file_deleted = fs.delete_file_in(dir, "long name.txt").is_ok();
+                    let count_after_file_delete = fs.count_used_slots_in(dir).unwrap_or(usize::MAX);
+                    let file_slots_freed = file_created
+                        && file_deleted
+                        && count_after_file_create == base_count + 2
+                        && count_after_file_delete == base_count;
+
+                    let subdir_created = fs.create_directory_in(dir, "long dir name").is_ok();
+                    let count_after_dir_create = fs.count_used_slots_in(dir).unwrap_or(usize::MAX);
+                    let subdir_deleted = fs.delete_directory_in(dir, "long dir name").is_ok();
+                    let count_after_dir_delete = fs.count_used_slots_in(dir).unwrap_or(usize::MAX);
+                    let dir_slots_freed = subdir_created
+                        && subdir_deleted
+                        && count_after_dir_create == base_count + 2
+                        && count_after_dir_delete == base_count;
+
+                    let cleanup_ok = fs.delete_directory("LFNLEAK").is_ok();
+
+                    (file_slots_freed, dir_slots_freed, cleanup_ok)
+                } else {
+                    (false, false, false)
+                };
+
+                kprintln!(
+                    "[FAT12] lfn_freed_on_delete_test dir_created={} file_slots_freed={} dir_slots_freed={} cleanup_ok={}",
+                    dir_created, file_slots_freed, dir_slots_freed, cleanup_ok
+                );
+                serial_println!(
+                    "[FAT12] lfn_freed_on_delete_test dir_created={} file_slots_freed={} dir_slots_freed={} cleanup_ok={}",
+                    dir_created, file_slots_freed, dir_slots_freed, cleanup_ok
+                );
+            }
+            Err(e) => {
+                kprintln!("[FAT12] lfn_freed_on_delete_test: not FAT12 ({})", e);
+                serial_println!("[FAT12] lfn_freed_on_delete_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!(
+                "[FAT12] lfn_freed_on_delete_test: couldn't find FAT partition: {}",
+                e
+            );
+            serial_println!("[FAT12] lfn_freed_on_delete_test -> no partition: {}", e);
+        }
+    }
+    shell::dispatch_command("ls");
+
     // 7f-1. Test fat_common::short_entry_if_matches directly (Fase 139) -
     // no disk I/O at all, unlike every FAT test above. This is the exact
     // shared helper `fat12.rs::find_entry_location_in` was just
