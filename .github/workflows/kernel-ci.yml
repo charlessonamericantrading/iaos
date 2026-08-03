@@ -475,6 +475,18 @@ jobs:
           # cleanup_ok confirms this is fully self-cleaning, same
           # discipline as every other dedicated-file FAT12 test.
           grep -q "GGUF\] multi_tensor_disk_test write_ok=true round_trip_ok=true header_ok=true parse_many_disk_ok=true tensor1_disk_decode_ok=true tensor2_disk_decode_ok=true cleanup_ok=true" boot.log
+          # Fase 147: VirtIONetDriver::tx_packets_count existed since this
+          # project's very first commit but was write-only (incremented,
+          # never printed or asserted anywhere) - the last remaining
+          # candidate from the 8th Explore-agent survey, ranked lowest
+          # priority since this whole driver is an intentionally-simulated
+          # placeholder (see virtio_net.rs's own module doc). Now printed
+          # in the existing "Simulated TX" line; main.rs calls
+          # send_ipv4_packet twice so this specifically confirms the count
+          # printed for the SECOND call reads 2, not just that a lone call
+          # prints some number - real proof it accumulates rather than
+          # being a stray one-off increment.
+          grep -q "VIRTIO-NET\] Simulated TX 56 bytes tx_count=2" boot.log
           # Fase 143: confirms SYS_KV_ALLOC's own new PCB-recording call
           # genuinely reached real, live SCHEDULER state - not just that
           # the syscall itself returned a plausible-looking block id.

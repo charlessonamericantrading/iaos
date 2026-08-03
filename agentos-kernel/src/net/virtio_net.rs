@@ -56,10 +56,15 @@ impl VirtIONetDriver {
         }
         self.tx_packets_count += 1;
         kprintln!(
-            "[VIRTIO-NET] Simulated transmit of {} byte packet (no real virtqueue).",
-            packet.len()
+            "[VIRTIO-NET] Simulated transmit of {} byte packet (no real virtqueue). tx_count={}",
+            packet.len(),
+            self.tx_packets_count
         );
-        serial_println!("[VIRTIO-NET] Simulated TX {} bytes", packet.len());
+        serial_println!(
+            "[VIRTIO-NET] Simulated TX {} bytes tx_count={}",
+            packet.len(),
+            self.tx_packets_count
+        );
         true
     }
 }

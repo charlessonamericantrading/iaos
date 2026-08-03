@@ -1506,6 +1506,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // drivers this kernel actually talks to hardware through).
     kprintln!("[NET INIT] Initializing simulated VirtIO-Net stack & TCP/IP demo...");
     NativeNetworkStack::send_ipv4_packet([192, 168, 1, 1], b"AgentOS Kernel Online");
+    // Fase 147: a second call - VirtIONetDriver::tx_packets_count existed
+    // since this project's very first commit but was write-only (never
+    // printed or asserted anywhere); a single transmit can't prove it's a
+    // real counter rather than a stray increment, so this repeats the send
+    // to confirm the count printed in the (serial-visible) "Simulated TX"
+    // line genuinely accumulates across calls.
+    NativeNetworkStack::send_ipv4_packet([192, 168, 1, 2], b"Fase 147 second packet");
 
     // 7. Invoke System Calls (Syscalls)
     kprintln!("[KERNEL SYSCALL] Testing Native Agent Syscall Dispatcher...");
