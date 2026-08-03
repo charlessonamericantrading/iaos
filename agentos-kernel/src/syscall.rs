@@ -114,11 +114,24 @@ pub fn dispatch_syscall(
             }
         }
         SYS_KV_ALLOC => {
-            let mut kv = KV_MANAGER.lock();
-            let block_id = kv.allocate_kv_block(arg1 as u32, arg2 as usize);
+            let block_id = KV_MANAGER
+                .lock()
+                .allocate_kv_block(arg1 as u32, arg2 as usize);
             match block_id {
                 Some(b) => {
                     kprintln!("[SYSCALL] Allocated KV Cache Block #{}", b);
+                    // Fase 143: `ProcessControlBlock::kv_block_id` existed
+                    // since before this session's own start, but nothing
+                    // ever wrote to it - the same "defined but never
+                    // wired up" gap Fase 55/136/138 already found and
+                    // closed elsewhere. Records which real block `arg1`'s
+                    // own process now owns, mirroring `update_process`'s
+                    // own established shape for keeping `ps`-visible PCB
+                    // fields honest after construction. `KV_MANAGER`'s
+                    // own lock is already released by this point (taken
+                    // only for the single `allocate_kv_block` call above),
+                    // so this never holds both locks at once.
+                    SCHEDULER.lock().set_kv_block_id(arg1 as u32, b);
                     b as u64
                 }
                 None => 0,

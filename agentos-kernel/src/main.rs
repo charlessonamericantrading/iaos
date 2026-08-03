@@ -1511,7 +1511,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!("[KERNEL SYSCALL] Testing Native Agent Syscall Dispatcher...");
     syscall::dispatch_syscall(syscall::SYS_SERIAL_PRINT, 0, 0, 0, false);
     let spawned_pid = syscall::dispatch_syscall(syscall::SYS_AGENT_SPAWN, 10000, 0, 0, false);
-    syscall::dispatch_syscall(syscall::SYS_KV_ALLOC, spawned_pid, 1024, 0, false);
+    let kv_block_id = syscall::dispatch_syscall(syscall::SYS_KV_ALLOC, spawned_pid, 1024, 0, false);
+
+    // 7a-1b. Test that SYS_KV_ALLOC's new PCB-recording call (Fase 143)
+    // genuinely reached the real, live scheduler state - not just that
+    // the syscall itself returned a plausible-looking block id.
+    // `ProcessControlBlock::kv_block_id` existed since before this
+    // session's own start but had no setter anywhere in the tree; this
+    // confirms `spawned_pid`'s own real PCB entry (found by scanning
+    // live `SCHEDULER` state via `for_each_process`, not assumed) now
+    // carries the exact same block id `SYS_KV_ALLOC` just returned.
+    let mut kv_block_id_matches = false;
+    SCHEDULER.lock().for_each_process(|p| {
+        if p.pid == spawned_pid as u32 {
+            kv_block_id_matches = p.kv_block_id == Some(kv_block_id as u32);
+        }
+    });
+    kprintln!(
+        "[KERNEL SYSCALL] kv_block_id_test: matches={}",
+        kv_block_id_matches
+    );
+    serial_println!("[SYSCALL] kv_block_id_test matches={}", kv_block_id_matches);
 
     // 7a-2. Test SYS_TENSOR_EVAL (Fase 55) - this syscall number has been
     // defined since before this session's own start, but dispatch_syscall

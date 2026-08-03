@@ -85,6 +85,23 @@ impl NativeAgentScheduler {
             }
         }
     }
+
+    /// Records which real KV-cache block `pid`'s own process now owns -
+    /// the same narrowly-scoped, find-by-pid shape `update_process`
+    /// already established, kept separate rather than folding into that
+    /// function since most `update_process` callers have no block id to
+    /// report at all. Fase 143: `kv_block_id` existed on
+    /// `ProcessControlBlock` since before this session's own start, but
+    /// nothing ever called a setter for it - the same "defined but never
+    /// wired up" gap Fase 55/136/138 already found and closed elsewhere.
+    pub fn set_kv_block_id(&mut self, pid: u32, block_id: u32) {
+        for slot in self.processes.iter_mut().flatten() {
+            if slot.pid == pid {
+                slot.kv_block_id = Some(block_id);
+                return;
+            }
+        }
+    }
 }
 
 lazy_static! {

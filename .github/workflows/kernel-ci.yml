@@ -475,6 +475,15 @@ jobs:
           # cleanup_ok confirms this is fully self-cleaning, same
           # discipline as every other dedicated-file FAT12 test.
           grep -q "GGUF\] multi_tensor_disk_test write_ok=true round_trip_ok=true header_ok=true parse_many_disk_ok=true tensor1_disk_decode_ok=true tensor2_disk_decode_ok=true cleanup_ok=true" boot.log
+          # Fase 143: confirms SYS_KV_ALLOC's own new PCB-recording call
+          # genuinely reached real, live SCHEDULER state - not just that
+          # the syscall itself returned a plausible-looking block id.
+          # ProcessControlBlock::kv_block_id existed since before this
+          # session's own start but had no setter anywhere in the tree
+          # (the same "defined but never wired up" gap Fase 55/136/138
+          # already found and closed elsewhere) - this is the first
+          # assertion ever to cover this specific self-test's own output.
+          grep -q "SYSCALL\] kv_block_id_test matches=true" boot.log
           # Confirms SYS_TENSOR_EVAL (Fase 55) genuinely dispatches to the
           # real tensor engine now, not "Unknown System Call Number" (this
           # syscall number had been defined but never wired to any match
