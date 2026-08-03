@@ -4165,13 +4165,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         keyboard::handle_scancode(code);
     }
 
-    // 7d. Test a Real Cooperative Context Switch (stack + register swap)
+    // 7g. Test a Real Cooperative Context Switch (stack + register swap)
     // Cooperative only - the worker yields back voluntarily. Not wired to
     // the timer interrupt yet (that's real preemption, separate work).
+    // Fase 158: renumbered from the original "7d" (11th Explore-agent
+    // survey's candidate #4) - this label collided with the unrelated
+    // FAT12/VFAT step group above (7d-1 through 7d-13), which already
+    // owns "7d" for its own, much larger family of sub-steps. Comment-
+    // only rename to "7g"/"7h"/"7i" (continuing straight on from FAT12's
+    // own "7f-1"/"7f-2"), matching this file's own established
+    // lettered-step convention rather than reusing an already-taken
+    // letter - zero behavior change.
     scheduler::context_switch::run_demo();
 
-    // 7e. Test a Real N-Way Priority Cooperative Scheduler
-    // Generalizes 7d from one hardcoded worker to multiple tasks picked by
+    // 7h. Test a Real N-Way Priority Cooperative Scheduler
+    // Generalizes 7g from one hardcoded worker to multiple tasks picked by
     // priority - still cooperative, not timer-driven. Also proves the
     // ps-visible PCB table is now really unified with this scheduler: the
     // demo itself calls `ps` from inside the "alpha" task to show live
@@ -4182,8 +4190,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     scheduler::context_switch::run_cooperative_demo();
     shell::dispatch_command("ps");
 
-    // 7f. Test Real Timer-Driven Preemption
-    // Unlike 7d/7e, these two tasks never call yield_now at all - the only
+    // 7i. Test Real Timer-Driven Preemption
+    // Unlike 7g/7h, these two tasks never call yield_now at all - the only
     // reason either one ever stops running is the timer IRQ forcing it.
     // Also proves ps-visible PCB unification reaches the preemptive
     // scheduler too now (via try_lock from tick(), see preemptive.rs's
