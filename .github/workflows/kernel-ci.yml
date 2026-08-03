@@ -515,6 +515,18 @@ jobs:
           # own fixes). pid1/2/3 must match the exact quotas spawn was
           # called with in main.rs (50000/25000/25000).
           grep -q "SCHEDULER\] token_quota_test pid1=Some(50000) pid2=Some(25000) pid3=Some(25000) ok=true" boot.log
+          # Fase 153: confirms ProcessControlBlock::tokens_used - sitting
+          # right next to token_quota above, but with no setter anywhere
+          # in the tree - is genuinely wired through the new
+          # add_tokens_used helper (10th Explore-agent survey's candidate
+          # #2, same "write-only" class as Fase 138/143/147/148/150/152).
+          # PID 1 got 2 separate calls (100 then 250, expecting 350 -
+          # real proof of accumulation, not last-write-wins); PID 2 got a
+          # single call (500); PID 3 was left untouched (expecting 0,
+          # confirming add_tokens_used only ever touches the pid it's
+          # given, and an untouched process's own zero-init still reads
+          # back as 0).
+          grep -q "SCHEDULER\] tokens_used_test pid1=Some(350) pid2=Some(500) pid3=Some(0) ok=true" boot.log
           # Confirms SYS_TENSOR_EVAL (Fase 55) genuinely dispatches to the
           # real tensor engine now, not "Unknown System Call Number" (this
           # syscall number had been defined but never wired to any match

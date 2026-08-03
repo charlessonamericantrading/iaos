@@ -102,6 +102,25 @@ impl NativeAgentScheduler {
             }
         }
     }
+
+    /// Same narrowly-scoped, find-by-pid shape as `set_kv_block_id` above.
+    /// Fase 152's 10th Explore-agent survey found `tokens_used` sitting
+    /// right next to `token_quota` (surfaced Fase 150) with no setter
+    /// anywhere in the tree - the same "defined but never wired up" gap.
+    /// Deliberately just this bookkeeping call, not real per-syscall token
+    /// accounting: `dispatch_syscall` has no calling-pid concept today
+    /// (only `caller_is_ring3`), and this kernel runs several separate,
+    /// unreconciled scheduling mechanisms with no single "current process"
+    /// notion - wiring real consumption tracking through that is its own,
+    /// larger design decision, not this Fase's.
+    pub fn add_tokens_used(&mut self, pid: u32, amount: usize) {
+        for slot in self.processes.iter_mut().flatten() {
+            if slot.pid == pid {
+                slot.tokens_used = slot.tokens_used.saturating_add(amount);
+                return;
+            }
+        }
+    }
 }
 
 lazy_static! {

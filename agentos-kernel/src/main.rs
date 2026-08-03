@@ -527,6 +527,46 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             token_quota_pid3,
             token_quota_ok
         );
+
+        // 3c. Test that ProcessControlBlock::tokens_used - sitting right
+        // next to token_quota above, but with no setter anywhere in the
+        // tree - is genuinely wired through the new add_tokens_used
+        // helper (10th Explore-agent survey's candidate #2, same
+        // "write-only" class as Fase 138/143/147/148/150's own fixes).
+        // PID 1 gets 2 separate calls (100 then 250) to prove real
+        // accumulation, not last-write-wins; PID 2 gets a single call;
+        // PID 3 is left untouched entirely, confirming both that
+        // add_tokens_used only ever touches the pid it's given and that
+        // an untouched process's own zero-init still reads back as 0.
+        sched.add_tokens_used(1, 100);
+        sched.add_tokens_used(1, 250);
+        sched.add_tokens_used(2, 500);
+        let mut tokens_used_pid1 = None;
+        let mut tokens_used_pid2 = None;
+        let mut tokens_used_pid3 = None;
+        sched.for_each_process(|p| match p.pid {
+            1 => tokens_used_pid1 = Some(p.tokens_used),
+            2 => tokens_used_pid2 = Some(p.tokens_used),
+            3 => tokens_used_pid3 = Some(p.tokens_used),
+            _ => {}
+        });
+        let tokens_used_ok = tokens_used_pid1 == Some(350)
+            && tokens_used_pid2 == Some(500)
+            && tokens_used_pid3 == Some(0);
+        kprintln!(
+            "[SCHEDULER] tokens_used_test: pid1={:?} pid2={:?} pid3={:?} ok={}",
+            tokens_used_pid1,
+            tokens_used_pid2,
+            tokens_used_pid3,
+            tokens_used_ok
+        );
+        serial_println!(
+            "[SCHEDULER] tokens_used_test pid1={:?} pid2={:?} pid3={:?} ok={}",
+            tokens_used_pid1,
+            tokens_used_pid2,
+            tokens_used_pid3,
+            tokens_used_ok
+        );
     }
 
     // 4. Test Native KV Cache Memory Allocation
