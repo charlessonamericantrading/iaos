@@ -67,6 +67,32 @@ impl VirtIONetDriver {
         );
         true
     }
+
+    /// Mirrors `transmit_packet` for the inbound direction - `rx_packets_count`
+    /// existed since this project's very first commit but had no incrementer
+    /// or reader anywhere in the tree (the same "write-only" class Fase
+    /// 136/138/143/147/148/150 already found and closed elsewhere), because
+    /// unlike `transmit_packet` this driver never had a receive path at all,
+    /// simulated or otherwise. `len` is caller-supplied (there's no real
+    /// virtqueue here to actually receive bytes from) purely to log a
+    /// plausible packet size, matching `transmit_packet`'s own signature.
+    pub fn receive_packet(&mut self, len: usize) -> bool {
+        if !self.is_initialized {
+            return false;
+        }
+        self.rx_packets_count += 1;
+        kprintln!(
+            "[VIRTIO-NET] Simulated receive of {} byte packet (no real virtqueue). rx_count={}",
+            len,
+            self.rx_packets_count
+        );
+        serial_println!(
+            "[VIRTIO-NET] Simulated RX {} bytes rx_count={}",
+            len,
+            self.rx_packets_count
+        );
+        true
+    }
 }
 
 lazy_static! {

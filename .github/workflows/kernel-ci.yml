@@ -487,6 +487,17 @@ jobs:
           # prints some number - real proof it accumulates rather than
           # being a stray one-off increment.
           grep -q "VIRTIO-NET\] Simulated TX 56 bytes tx_count=2" boot.log
+          # Fase 152: VirtIONetDriver::rx_packets_count existed since this
+          # project's very first commit but had no incrementer at all -
+          # unlike tx_packets_count (Fase 147), this driver never had a
+          # receive path, simulated or otherwise (10th Explore-agent
+          # survey's #1 candidate). receive_packet() mirrors
+          # transmit_packet's own shape; called twice with lengths
+          # distinct from the TX self-test's own byte counts, so this
+          # specifically confirms the SECOND call's count reads 2 (real
+          # proof it accumulates, not a stray one-off increment) and that
+          # the two counters can't be confused for each other.
+          grep -q "VIRTIO-NET\] Simulated RX 64 bytes rx_count=2" boot.log
           # Fase 143: confirms SYS_KV_ALLOC's own new PCB-recording call
           # genuinely reached real, live SCHEDULER state - not just that
           # the syscall itself returned a plausible-looking block id.

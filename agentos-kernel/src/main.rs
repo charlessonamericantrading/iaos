@@ -33,6 +33,7 @@ use alloc::vec::Vec;
 use gguf_loader::{GgufGtype, GgufModelLoader, GgufTensorInfo};
 use memory::kv_allocator::KV_MANAGER;
 use net::tcpip::NativeNetworkStack;
+use net::virtio_net::VIRTIO_NET;
 use scheduler::agent_scheduler::SCHEDULER;
 use scheduler::process::Priority;
 
@@ -1547,6 +1548,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // to confirm the count printed in the (serial-visible) "Simulated TX"
     // line genuinely accumulates across calls.
     NativeNetworkStack::send_ipv4_packet([192, 168, 1, 2], b"Fase 147 second packet");
+    // Fase 152: VirtIONetDriver::rx_packets_count existed since this
+    // project's very first commit but had no incrementer at all - unlike
+    // tx_packets_count (Fase 147), this driver never had a receive path,
+    // simulated or otherwise. receive_packet() mirrors transmit_packet's
+    // own shape exactly; called twice (same "prove it's a real counter,
+    // not a stray increment" reasoning Fase 147 used for tx_packets_count)
+    // with lengths deliberately distinct from the TX self-test's own byte
+    // counts, so the two counters can't be confused for each other in the
+    // boot log.
+    VIRTIO_NET.lock().receive_packet(60);
+    VIRTIO_NET.lock().receive_packet(64);
 
     // 7. Invoke System Calls (Syscalls)
     kprintln!("[KERNEL SYSCALL] Testing Native Agent Syscall Dispatcher...");
