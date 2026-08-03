@@ -74,16 +74,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     gdt::init();
 
     // 2a-2. Test the ring-3 GDT/TSS foundation (Fase 68) - the first
-    // step of a real usermode transition arc, deliberately scoped to
-    // just the infrastructure: real ring-3 code/data segments exist in
-    // the GDT now, and the TSS has a real kernel stack (RSP0) ready for
-    // when a ring-3->ring-0 control transfer needs one. Does NOT yet
-    // attempt an actual transition (no IDT gate has DPL=3, no page is
-    // marked user-accessible, nothing executes iretq/sysret to ring 3
-    // yet) - that's real, substantial follow-on work, matching this
-    // project's own established multi-Fase pattern for large features
-    // (e.g. net::e1000/net::virtio's own probe -> setup -> send -> ...
-    // progressions).
+    // step of a real usermode transition arc, deliberately scoped at
+    // the time to just the infrastructure: real ring-3 code/data
+    // segments in the GDT, and a TSS with a real kernel stack (RSP0)
+    // ready for when a ring-3->ring-0 control transfer needs one.
+    // Fase 69 then added the first real DPL=3 IDT gate, Fase 70 the
+    // first real USER-accessible page, and Fase 71 the actual
+    // privilege-lowering control transfer (`ring3.rs`'s own
+    // `iretq`-to-ring-3) - all three real, substantial pieces of
+    // follow-on work this comment once described as not yet started,
+    // shipped and exercised by dozens of self-tests since (7 DPL=3
+    // gates, 4 USER-accessible pages, and thousands of lines of
+    // `ring3.rs` as of this writing).
     //
     // user_code_rpl/user_data_rpl=3 is genuine proof these selectors'
     // Requested Privilege Level bits are really Ring 3, not just "some
