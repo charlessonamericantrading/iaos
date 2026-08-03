@@ -928,6 +928,20 @@ impl GgufModelLoader {
     }
 
     /// Perform forward inference using loaded GGUF tensor weights
+    ///
+    /// # Errors
+    /// Returns `Err` if `in_dim`/`out_dim` are inconsistent with
+    /// `weights`/`outputs`' own actual lengths - `matmul_layer` indexes
+    /// both with `weights[row_start..row_start + in_dim]` for `row` in
+    /// `0..out_dim`, and `outputs[row]`, and a mismatch there panics
+    /// rather than returning cleanly. Mirrors the exact check the Fase
+    /// 132 `SYS_TENSOR_EVAL` syscall handler already applies before
+    /// reaching this same `matmul_layer` primitive - this method is a
+    /// separate, non-syscall call path into it that never got the same
+    /// protection. `inputs` deliberately isn't checked here either, for
+    /// the same reason `SYS_TENSOR_EVAL` skips it: `dot_product`'s own
+    /// `w.len().min(x.len())` guard already makes any `inputs` length
+    /// safe regardless of `in_dim`.
     pub fn execute_gguf_layer_pass(
         &self,
         weights: &[f32],
@@ -935,12 +949,17 @@ impl GgufModelLoader {
         outputs: &mut [f32],
         in_dim: usize,
         out_dim: usize,
-    ) {
+    ) -> Result<(), &'static str> {
+        let weights_needed = out_dim.saturating_mul(in_dim);
+        if weights_needed > weights.len() || out_dim > outputs.len() {
+            return Err("GGUF layer pass: in_dim/out_dim inconsistent with weights/outputs length");
+        }
         let dummy_bias = [0.0f32; 16];
         kprintln!(
             "[GGUF ENGINE] Executing native layer pass for arch '{}'...",
             self.architecture
         );
         TensorEngine::matmul_layer(weights, inputs, &dummy_bias, outputs, in_dim, out_dim);
+        Ok(())
     }
 }

@@ -337,7 +337,7 @@ jobs:
           # Fase 138/143/147/148/150/153/156 already found and closed
           # elsewhere, just closer to tightening an already-passing
           # test's own assertions than a live bug).
-          grep -q "GGUF\] disk_load_test write_ok=true round_trip_ok=true header_fields_ok=true tensor_info_ok=true weights_decoded_ok=true tensor_output_ok=true cleanup_ok=true" boot.log
+          grep -q "GGUF\] disk_load_test write_ok=true round_trip_ok=true header_fields_ok=true tensor_info_ok=true weights_decoded_ok=true tensor_output_ok=true layer_pass_ok=true bad_dims_rejected=true cleanup_ok=true" boot.log
           # Confirms real GGUF Q8_0 quantized tensor decoding (Fase 50) -
           # pure byte-transformation logic, deliberately disk-independent.
           # f16_vectors_ok is hand-computed (bit patterns 0x3C00/0xC000/

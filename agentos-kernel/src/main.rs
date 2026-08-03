@@ -665,6 +665,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let mut tensor_info_ok = false;
                 let mut weights_decoded_ok = false;
                 let mut tensor_output_ok = false;
+                let mut layer_pass_ok = false;
+                let mut bad_dims_rejected = false;
                 if let Ok(full_bytes) = &read_back {
                     if let Ok(loader) = GgufModelLoader::parse_header(&full_bytes[0..24]) {
                         // Fase 157: closes the 11th Explore-agent survey's
@@ -700,7 +702,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
                             let inputs: [f32; 4] = [1.0, 2.0, 0.5, 3.0];
                             let mut outputs: [f32; 4] = [0.0; 4];
-                            loader.execute_gguf_layer_pass(&weights, &inputs, &mut outputs, 4, 4);
+                            layer_pass_ok = loader
+                                .execute_gguf_layer_pass(&weights, &inputs, &mut outputs, 4, 4)
+                                .is_ok();
 
                             kprintln!(
                                 "[GGUF RESULT] Y = ReLU(W * X + B) -> [{:.2}, {:.2}, {:.2}, {:.2}]",
@@ -710,21 +714,48 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                                 outputs[3]
                             );
                             const EXPECTED_OUTPUTS: [f32; 4] = [0.8, 3.7, 1.65, 2.1];
-                            tensor_output_ok = outputs
-                                .iter()
-                                .zip(EXPECTED_OUTPUTS.iter())
-                                .all(|(a, b)| (a - b).abs() < 0.001);
+                            tensor_output_ok = layer_pass_ok
+                                && outputs
+                                    .iter()
+                                    .zip(EXPECTED_OUTPUTS.iter())
+                                    .all(|(a, b)| (a - b).abs() < 0.001);
+
+                            // Fase 160: closes the 12th Explore-agent survey's
+                            // candidate #2 - execute_gguf_layer_pass's
+                            // in_dim/out_dim were never cross-checked against
+                            // weights/outputs' own actual lengths before
+                            // indexing into them inside matmul_layer, the
+                            // exact panic-prone gap Fase 132 already closed at
+                            // the SYS_TENSOR_EVAL syscall boundary but never
+                            // closed for this separate, non-syscall call path.
+                            // out_dim=8 is deliberately inconsistent with both
+                            // the 16-length `weights` buffer (needs
+                            // out_dim*in_dim <= 16, i.e. out_dim <= 4 here)
+                            // and a 4-length scratch outputs buffer (needs
+                            // out_dim <= 4) - proves the new rejection path
+                            // actually fires, not just that valid dimensions
+                            // keep working.
+                            let mut scratch_outputs: [f32; 4] = [0.0; 4];
+                            bad_dims_rejected = loader
+                                .execute_gguf_layer_pass(
+                                    &weights,
+                                    &inputs,
+                                    &mut scratch_outputs,
+                                    4,
+                                    8,
+                                )
+                                .is_err();
                         }
                     }
                 }
 
                 kprintln!(
-                    "[GGUF LOADER] disk round-trip: write_ok={} round_trip_ok={} header_fields_ok={} tensor_info_ok={} weights_decoded_ok={} tensor_output_ok={} cleanup_ok={}",
-                    write_ok, round_trip_ok, header_fields_ok, tensor_info_ok, weights_decoded_ok, tensor_output_ok, cleanup_ok
+                    "[GGUF LOADER] disk round-trip: write_ok={} round_trip_ok={} header_fields_ok={} tensor_info_ok={} weights_decoded_ok={} tensor_output_ok={} layer_pass_ok={} bad_dims_rejected={} cleanup_ok={}",
+                    write_ok, round_trip_ok, header_fields_ok, tensor_info_ok, weights_decoded_ok, tensor_output_ok, layer_pass_ok, bad_dims_rejected, cleanup_ok
                 );
                 serial_println!(
-                    "[GGUF] disk_load_test write_ok={} round_trip_ok={} header_fields_ok={} tensor_info_ok={} weights_decoded_ok={} tensor_output_ok={} cleanup_ok={}",
-                    write_ok, round_trip_ok, header_fields_ok, tensor_info_ok, weights_decoded_ok, tensor_output_ok, cleanup_ok
+                    "[GGUF] disk_load_test write_ok={} round_trip_ok={} header_fields_ok={} tensor_info_ok={} weights_decoded_ok={} tensor_output_ok={} layer_pass_ok={} bad_dims_rejected={} cleanup_ok={}",
+                    write_ok, round_trip_ok, header_fields_ok, tensor_info_ok, weights_decoded_ok, tensor_output_ok, layer_pass_ok, bad_dims_rejected, cleanup_ok
                 );
             }
             Err(e) => {
