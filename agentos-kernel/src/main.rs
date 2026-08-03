@@ -30,7 +30,7 @@ mod vga_buffer;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use gguf_loader::{GgufGtype, GgufModelLoader, GgufTensorInfo};
+use gguf_loader::{GgufGtype, GgufModelLoader, GgufTensorInfo, GGUF_MAGIC};
 use memory::kv_allocator::KV_MANAGER;
 use net::tcpip::NativeNetworkStack;
 use net::virtio_net::VIRTIO_NET;
@@ -661,11 +661,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let round_trip_ok = read_back.as_deref() == Ok(model_file_bytes.as_slice());
                 let cleanup_ok = fs.delete_file("MODEL.BIN").is_ok();
 
+                let mut header_fields_ok = false;
                 let mut tensor_info_ok = false;
                 let mut weights_decoded_ok = false;
                 let mut tensor_output_ok = false;
                 if let Ok(full_bytes) = &read_back {
                     if let Ok(loader) = GgufModelLoader::parse_header(&full_bytes[0..24]) {
+                        // Fase 157: closes the 11th Explore-agent survey's
+                        // candidate #1 - magic/version/context_length/
+                        // embedding_length were all set by parse_header
+                        // (magic/version from the real header bytes above,
+                        // context_length/embedding_length as fixed defaults
+                        // since this loader doesn't parse GGUF KV-metadata
+                        // yet) but no self-test ever read any of them back -
+                        // only execute_gguf_layer_pass's own architecture
+                        // field got touched (in a kprintln, never asserted).
+                        header_fields_ok = loader.magic == GGUF_MAGIC
+                            && loader.version == 3
+                            && loader.context_length == 4096
+                            && loader.embedding_length == 2048;
                         if let Ok((info, _consumed)) = GgufTensorInfo::parse(&full_bytes[24..]) {
                             tensor_info_ok = info.name == TENSOR_NAME
                                 && info.dimensions == [4, 4]
@@ -705,12 +719,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 }
 
                 kprintln!(
-                    "[GGUF LOADER] disk round-trip: write_ok={} round_trip_ok={} tensor_info_ok={} weights_decoded_ok={} tensor_output_ok={} cleanup_ok={}",
-                    write_ok, round_trip_ok, tensor_info_ok, weights_decoded_ok, tensor_output_ok, cleanup_ok
+                    "[GGUF LOADER] disk round-trip: write_ok={} round_trip_ok={} header_fields_ok={} tensor_info_ok={} weights_decoded_ok={} tensor_output_ok={} cleanup_ok={}",
+                    write_ok, round_trip_ok, header_fields_ok, tensor_info_ok, weights_decoded_ok, tensor_output_ok, cleanup_ok
                 );
                 serial_println!(
-                    "[GGUF] disk_load_test write_ok={} round_trip_ok={} tensor_info_ok={} weights_decoded_ok={} tensor_output_ok={} cleanup_ok={}",
-                    write_ok, round_trip_ok, tensor_info_ok, weights_decoded_ok, tensor_output_ok, cleanup_ok
+                    "[GGUF] disk_load_test write_ok={} round_trip_ok={} header_fields_ok={} tensor_info_ok={} weights_decoded_ok={} tensor_output_ok={} cleanup_ok={}",
+                    write_ok, round_trip_ok, header_fields_ok, tensor_info_ok, weights_decoded_ok, tensor_output_ok, cleanup_ok
                 );
             }
             Err(e) => {

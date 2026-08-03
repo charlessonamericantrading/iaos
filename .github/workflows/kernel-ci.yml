@@ -327,8 +327,17 @@ jobs:
           # indirection works, not just parses. tensor_output_ok=true means
           # running the matmul on those offset-located, disk-decoded
           # weights produces the same known-correct result the original
-          # hardcoded array always did.
-          grep -q "GGUF\] disk_load_test write_ok=true round_trip_ok=true tensor_info_ok=true weights_decoded_ok=true tensor_output_ok=true cleanup_ok=true" boot.log
+          # hardcoded array always did. header_fields_ok=true (Fase 157)
+          # means magic/version/context_length/embedding_length - set by
+          # parse_header (magic/version from the real header bytes,
+          # context_length/embedding_length as fixed defaults since this
+          # loader doesn't parse GGUF KV-metadata yet) - were genuinely
+          # read back and matched, not just set and ignored (the 11th
+          # Explore-agent survey's candidate #1, same "write-only" gap
+          # Fase 138/143/147/148/150/153/156 already found and closed
+          # elsewhere, just closer to tightening an already-passing
+          # test's own assertions than a live bug).
+          grep -q "GGUF\] disk_load_test write_ok=true round_trip_ok=true header_fields_ok=true tensor_info_ok=true weights_decoded_ok=true tensor_output_ok=true cleanup_ok=true" boot.log
           # Confirms real GGUF Q8_0 quantized tensor decoding (Fase 50) -
           # pure byte-transformation logic, deliberately disk-independent.
           # f16_vectors_ok is hand-computed (bit patterns 0x3C00/0xC000/
