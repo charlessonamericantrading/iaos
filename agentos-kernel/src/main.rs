@@ -3358,9 +3358,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // entry must point to the PARENT's real cluster, not always 0 (0 is
     // specifically the "parent is root" convention) - this test's real
     // correctness check is confirming that value, not just that
-    // creation "succeeded". Not yet wired to shell path syntax (that
-    // needs multi-segment path parsing, a separate concern) - proven at
-    // the Fat12Info API level first, same order as Fase 34.
+    // creation "succeeded". This test itself operates at the Fat12Info
+    // API level only, not through shell command parsing - same order as
+    // Fase 34 (API proven first, wired to the shell separately).
+    // Multi-segment shell path syntax (mkdir/touch/cat/rm/rmdir
+    // A/B/FILE) was genuinely added 3 Fases later, at Fase 39 - see the
+    // "7e-2" self-test below (MULTIOUT/MULTIIN/DEEP.TXT) - this comment
+    // used to claim that wiring still didn't exist at all, which
+    // stopped being true then.
     kprintln!("[KERNEL INIT] Testing nested FAT12 subdirectories...");
     match shell::find_fat_partition() {
         Ok(partition) => match fat12::read_bpb(&partition) {
