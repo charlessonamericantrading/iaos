@@ -4010,6 +4010,107 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     shell::dispatch_command("ls");
 
+    // 7e-3b. Fase 170: closes the 20th Explore-agent survey's candidate #1
+    // - create_file_impl's own name-collision check only ever caught a
+    // file/file collision, since it worked by calling read_file_impl,
+    // which by design treats a name matching an existing DIRECTORY as
+    // "not found" (see its own doc comment). For a name short enough to
+    // fit plain 8.3, this gap happened to be masked by a second,
+    // independent check inside build_name_entries' short-alias
+    // generation (existing_short_names_in lists every entry regardless
+    // of type). But a name needing a VFAT long entry has no such second
+    // check: `mkdir "dircollision test"` followed by `touch "dircollision
+    // test"` used to silently create a SECOND, distinct entry sharing the
+    // identical reconstructed long name - permanently shadowed behind
+    // the directory (find_entry_location_in always resolves to the
+    // earlier slot first), unreachable and undeletable by name ever
+    // again. Fixed by checking every entry regardless of type, mirroring
+    // create_directory_impl's own already-correct check (which this test
+    // deliberately reuses the exact same "dir already exists" collision
+    // shape from, just triggered from the opposite direction - a file
+    // create colliding with an existing directory, not a directory
+    // create colliding with anything). still_one_entry directly proves no
+    // shadow entry was created, not just that create_file returned Err.
+    // Run inside a dedicated fresh subdirectory rather than the root:
+    // investigating this test's own first failed attempt (both right
+    // after vfat_test, 7e-1, AND right after multi_chunk_vfat_test)
+    // uncovered a real, separate, deeper bug - this project's root
+    // directory is a fixed-size run of sectors, and after ~170 Fases of
+    // create/delete self-tests its first sector is now completely full
+    // (every one of its 16 slots holds either a live entry or an
+    // orphaned VFAT long-name remnant the 19th survey's watch-only item
+    // already knew about). `find_free_entry_run_in` still finds a slot
+    // for a new multi-entry name by continuing into the NEXT sector when
+    // the current one lacks room - but `parse_dir_sector`/
+    // `find_entry_location_in` (like any FAT-convention-respecting
+    // reader) stop at the very first `0x00` byte they see, ANYWHERE,
+    // treating it as "nothing more exists in this directory at all". If
+    // an earlier sector's own free run is too small and a later sector
+    // is used instead, everything written there becomes permanently
+    // invisible to every reader in this codebase, including this same
+    // self-test's own verification calls moments later - confirmed
+    // directly via a raw sector dump (removed after use) showing the
+    // new entries physically present exactly where expected, while
+    // `list_root_directory` still reported the old, pre-creation count.
+    // This is a materially bigger bug than what candidate #1 originally
+    // described and needs its own dedicated fix in a future Fase (a
+    // fresh survey should re-rank it) - not appropriate to bundle into
+    // this one. A fresh subdirectory's own single, newly-allocated
+    // cluster has no such history, so it's the safe, minimal place to
+    // actually exercise the create_file_impl fix this Fase is about.
+    kprintln!("[KERNEL INIT] Testing FAT12 file/directory long-name collision rejection...");
+    match shell::find_fat_partition() {
+        Ok(partition) => match fat12::read_bpb(&partition) {
+            Ok(mut fs) => {
+                let outer_created = fs.create_directory("COLLTEST").is_ok();
+                let outer_cluster = fs
+                    .list_root_directory()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|e| e.name.eq_ignore_ascii_case("COLLTEST"))
+                    .map(|e| e.start_cluster);
+                let (dir_created, file_collision_rejected, still_one_entry) =
+                    if let Some(outer_cluster) = outer_cluster {
+                        let dir_created = fs
+                            .create_directory_in(outer_cluster, "dircollision test")
+                            .is_ok();
+                        let file_collision_rejected = fs
+                            .create_file_in(outer_cluster, "dircollision test", b"shadow")
+                            .is_err();
+                        let entries = fs.list_directory(outer_cluster).unwrap_or_default();
+                        let still_one_entry = entries
+                            .iter()
+                            .filter(|e| e.name == "dircollision test")
+                            .count()
+                            == 1;
+                        (dir_created, file_collision_rejected, still_one_entry)
+                    } else {
+                        (false, false, false)
+                    };
+                kprintln!(
+                    "[FAT12] dir_name_collision_test outer_created={} dir_created={} file_collision_rejected={} still_one_entry={}",
+                    outer_created, dir_created, file_collision_rejected, still_one_entry
+                );
+                serial_println!(
+                    "[FAT12] dir_name_collision_test outer_created={} dir_created={} file_collision_rejected={} still_one_entry={}",
+                    outer_created, dir_created, file_collision_rejected, still_one_entry
+                );
+            }
+            Err(e) => {
+                kprintln!("[FAT12] dir_name_collision_test: not FAT12 ({})", e);
+                serial_println!("[FAT12] dir_name_collision_test -> not fat12: {}", e);
+            }
+        },
+        Err(e) => {
+            kprintln!(
+                "[FAT12] dir_name_collision_test: couldn't find FAT partition: {}",
+                e
+            );
+            serial_println!("[FAT12] dir_name_collision_test -> no partition: {}", e);
+        }
+    }
+    shell::dispatch_command("ls");
+
     // 7f-1. Test fat_common::short_entry_if_matches directly (Fase 139) -
     // no disk I/O at all, unlike every FAT test above. This is the exact
     // shared helper `fat12.rs::find_entry_location_in` was just

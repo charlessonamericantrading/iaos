@@ -614,8 +614,25 @@ impl Fat12Info {
         name: &str,
         data: &[u8],
     ) -> Result<(), &'static str> {
-        if self.read_file_impl(dir, name).is_ok() {
-            return Err("FAT12: a file with that name already exists");
+        // Fase 170: the 20th Explore-agent survey found `read_file_impl`
+        // treats a name matching an existing DIRECTORY as "not found"
+        // (by design - see its own comment), so that check alone never
+        // caught a file/directory name collision - only ever a file/file
+        // one. For a name that fits plain 8.3, build_name_entries's own
+        // short-alias generation happened to still reject the collision
+        // via existing_short_names_in (which lists every entry regardless
+        // of type). But a name needing a VFAT long entry has no such
+        // second check: `mkdir verylongname` then `touch verylongname`
+        // silently created a second, distinct entry sharing the identical
+        // reconstructed long name - permanently shadowed behind the
+        // directory (find_entry_location_in always finds the earlier
+        // slot first), unreachable and undeletable by name forever. Now
+        // checks against every entry regardless of type, exactly
+        // mirroring create_directory_impl's own already-correct check
+        // below.
+        let entries = self.list_entries_in(dir)?;
+        if entries.iter().any(|e| e.name.eq_ignore_ascii_case(name)) {
+            return Err("FAT12: a file or directory with that name already exists");
         }
 
         let (short_name, long_entries) = self.build_name_entries(dir, name)?;

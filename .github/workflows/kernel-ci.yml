@@ -1827,6 +1827,41 @@ jobs:
           # a fresh CI image always takes this same fully-self-cleaning
           # path.
           grep -q "FAT12\] multi_chunk_vfat_test created=true shown=true long_read_ok=true alias_read_ok=true delete_ok=true gone_ok=true" boot.log
+          # Fase 170: closes the 20th Explore-agent survey's candidate #1 -
+          # create_file_impl's own name-collision check only ever caught a
+          # file/file collision (it worked by calling read_file_impl, which
+          # by design treats a name matching an existing DIRECTORY as "not
+          # found"). For a name fitting plain 8.3 this gap was masked by a
+          # second, independent check inside build_name_entries's own
+          # short-alias generation - but a name needing a VFAT long entry
+          # had no such second check: `mkdir "dircollision test"` followed
+          # by `touch "dircollision test"` used to silently create a
+          # SECOND, distinct entry sharing the identical reconstructed long
+          # name, permanently shadowed behind the directory and unreachable/
+          # undeletable by name ever again. Fixed by checking every entry
+          # regardless of type, mirroring create_directory_impl's own
+          # already-correct check. still_one_entry directly proves no
+          # shadow entry was created, not just that create_file returned
+          # Err. Runs inside a dedicated fresh subdirectory (COLLTEST)
+          # rather than the root: this project's root directory is a
+          # fixed-size run of sectors, and after ~170 Fases of create/
+          # delete self-tests its first sector is now completely full
+          # (every slot holds either a live entry or an orphaned VFAT
+          # long-name remnant - the 19th survey's own watch-only item).
+          # find_free_entry_run_in still finds room for a new multi-entry
+          # name by continuing into the next sector, but parse_dir_sector/
+          # find_entry_location_in stop at the very first 0x00 byte they
+          # see anywhere, so anything written past an earlier sector's own
+          # boundary becomes permanently invisible to every reader in this
+          # codebase - confirmed directly with a temporary raw sector dump
+          # while diagnosing this test's own first (root-based) attempt
+          # failing to find its own freshly-created entry. That's a real,
+          # separate, and materially bigger bug than this Fase's own fix,
+          # left open for a future Fase's dedicated fix rather than bundled
+          # in here. A fresh subdirectory's own newly-allocated cluster has
+          # no such history, making it the safe, minimal place to actually
+          # exercise the collision-check fix this Fase is about.
+          grep -q "FAT12\] dir_name_collision_test outer_created=true dir_created=true file_collision_rejected=true still_one_entry=true" boot.log
           # Fase 139: confirms fat_common::short_entry_if_matches - the
           # shared helper fat12.rs::find_entry_location_in was refactored
           # to call instead of its own inline duplicate, and that
