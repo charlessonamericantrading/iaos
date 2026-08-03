@@ -935,6 +935,19 @@ jobs:
           # `mem` runs, so the two assertions above (blocks #1/#2) are
           # completely unaffected.
           grep -q "SYSCALL\] kv_free_test alloc_ok=true free_ok=true invalid_free_rejected=true" boot.log
+          # Fase 162: closes the 13th Explore-agent survey's candidate #1
+          # - SYS_KV_FREE cleared the freed block's own slot in
+          # KVCacheMemoryManager but never reset the freeing process's own
+          # kv_block_id PCB field back to None, so an ordinary alloc ->
+          # free -> realloc sequence (the freed id is immediately
+          # reusable) left a stale, wrong kv_block_id behind. Reuses PID 3
+          # (kv-cache-pager, already spawned at kernel init) for an
+          # isolated alloc+free round trip rather than spawning a new
+          # process, deliberately avoiding the "shifting hardcoded PIDs"
+          # regression class Fase 80 already hit once - a fresh spawn here
+          # would have shifted every PID the task-alpha/preempt-task
+          # assertions further below depend on.
+          grep -q "SYSCALL\] kv_free_clears_block_id_test kv_block_id_set=true kv_block_id_cleared=true" boot.log
           # Confirms the `date` command reads a real, plausible wall-clock
           # value from the CMOS RTC. Can't assert an exact date/time here -
           # it's genuinely real time, different on every run by design -

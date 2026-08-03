@@ -146,10 +146,27 @@ pub fn dispatch_syscall(
         // is the block_id SYS_KV_ALLOC returned; returns 1 on a real
         // free, 0 if that id was never allocated (or was already freed).
         SYS_KV_FREE => {
-            let mut kv = KV_MANAGER.lock();
-            let freed = kv.free_kv_block(arg1 as u32);
-            kprintln!("[SYSCALL] Freed KV Cache Block #{}: {}", arg1 as u32, freed);
-            freed as u64
+            let freed_pid = {
+                let mut kv = KV_MANAGER.lock();
+                kv.free_kv_block(arg1 as u32)
+            }; // KV_MANAGER's lock released before SCHEDULER's is taken
+               // below - never holds both at once, same discipline
+               // SYS_KV_ALLOC's own arm already follows.
+               // Fase 162: closes the 13th Explore-agent survey's candidate
+               // #1 - freeing a block used to leave the owning process's own
+               // `kv_block_id` stale (see `clear_kv_block_id_if_matches`'s
+               // own doc for the full reasoning).
+            if let Some(pid) = freed_pid {
+                SCHEDULER
+                    .lock()
+                    .clear_kv_block_id_if_matches(pid, arg1 as u32);
+            }
+            kprintln!(
+                "[SYSCALL] Freed KV Cache Block #{}: {}",
+                arg1 as u32,
+                freed_pid.is_some()
+            );
+            freed_pid.is_some() as u64
         }
         SYS_TENSOR_EVAL => {
             // Fase 74: this kernel's ring-3 arc is no longer hypothetical

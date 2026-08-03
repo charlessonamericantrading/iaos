@@ -111,6 +111,27 @@ impl NativeAgentScheduler {
         }
     }
 
+    /// Counterpart to `set_kv_block_id` above - Fase 162's 13th
+    /// Explore-agent survey found `SYS_KV_FREE` cleared the block's own
+    /// slot in `KVCacheMemoryManager` but never reset the freeing
+    /// process's own `kv_block_id` back to `None`, so an ordinary
+    /// alloc -> free -> realloc sequence (the freed id is immediately
+    /// reusable, `allocate_kv_block` always picks the first free slot)
+    /// left BOTH processes' PCBs claiming the same `kv_block_id` - the
+    /// original owner's copy silently stale. Only clears the field if it
+    /// still equals `block_id`, not unconditionally: `pid` could have
+    /// since been given a newer block via `set_kv_block_id`, and this
+    /// must not stomp that newer value just because an older, already-
+    /// superseded block id is what's being freed now.
+    pub fn clear_kv_block_id_if_matches(&mut self, pid: u32, block_id: u32) {
+        for slot in self.processes.iter_mut().flatten() {
+            if slot.pid == pid && slot.kv_block_id == Some(block_id) {
+                slot.kv_block_id = None;
+                return;
+            }
+        }
+    }
+
     /// Same narrowly-scoped, find-by-pid shape as `set_kv_block_id` above.
     /// Fase 152's 10th Explore-agent survey found `tokens_used` sitting
     /// right next to `token_quota` (surfaced Fase 150) with no setter

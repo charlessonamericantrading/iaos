@@ -1929,6 +1929,54 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             free_ok,
             invalid_free_rejected
         );
+
+        // Fase 162: closes the 13th Explore-agent survey's candidate #1 -
+        // proves SYS_KV_FREE's new clear_kv_block_id_if_matches call
+        // genuinely reaches live SCHEDULER state, not just that
+        // KVCacheMemoryManager's own count came back down (already proven
+        // by free_ok above). Deliberately reuses PID 3 (kv-cache-pager,
+        // already spawned at kernel init) rather than spawning a fresh
+        // process: an extra SYS_AGENT_SPAWN here would shift every PID
+        // this boot sequence hands out afterward, breaking the several
+        // CI assertions further down that hardcode exact PIDs for
+        // task-alpha/task-bravo/task-charlie/preempt-task-0/1 - caught by
+        // directly diffing a boot log against one from before this Fase,
+        // the same "shifting hardcoded PIDs" regression class Fase 80
+        // already hit once. PID 3 never has `kv_block_id` set by anything
+        // else in this whole boot sequence (blocks #1/#2 belong to PID
+        // 2/4 respectively - see the KV_MANAGER init above and
+        // `kv_block_id_test` above), so this is a clean, isolated
+        // before/after check with no interference from pre-existing
+        // state, and (like pid=99's own block above) allocates then
+        // immediately frees a throwaway block before `mem` ever runs, so
+        // the Fase 137 `mem`-output CI assertions for blocks #1/#2 stay
+        // completely unaffected.
+        const KV_FREE_TEST_PID: u64 = 3;
+        let kv_free_block_id =
+            syscall::dispatch_syscall(syscall::SYS_KV_ALLOC, KV_FREE_TEST_PID, 128, 0, false);
+        let mut kv_block_id_set = false;
+        SCHEDULER.lock().for_each_process(|p| {
+            if p.pid == KV_FREE_TEST_PID as u32 {
+                kv_block_id_set = p.kv_block_id == Some(kv_free_block_id as u32);
+            }
+        });
+        syscall::dispatch_syscall(syscall::SYS_KV_FREE, kv_free_block_id, 0, 0, false);
+        let mut kv_block_id_cleared = false;
+        SCHEDULER.lock().for_each_process(|p| {
+            if p.pid == KV_FREE_TEST_PID as u32 {
+                kv_block_id_cleared = p.kv_block_id.is_none();
+            }
+        });
+        kprintln!(
+            "[KERNEL SYSCALL] kv_free_clears_block_id_test: kv_block_id_set={} kv_block_id_cleared={}",
+            kv_block_id_set,
+            kv_block_id_cleared
+        );
+        serial_println!(
+            "[SYSCALL] kv_free_clears_block_id_test kv_block_id_set={} kv_block_id_cleared={}",
+            kv_block_id_set,
+            kv_block_id_cleared
+        );
     }
 
     // 7b. Test the Shell Command Dispatcher (same parser the IRQ1 keyboard

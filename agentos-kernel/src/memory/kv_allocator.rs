@@ -72,15 +72,19 @@ impl KVCacheMemoryManager {
         Some(block_id)
     }
 
-    pub fn free_kv_block(&mut self, block_id: u32) -> bool {
+    /// Returns the freed block's own owning `pid` on success, so a caller
+    /// can reconcile that process's own bookkeeping (see Fase 162's
+    /// `SYS_KV_FREE` syscall arm) - `None` if `block_id` was never
+    /// allocated or was already freed.
+    pub fn free_kv_block(&mut self, block_id: u32) -> Option<u32> {
         let idx = (block_id - 1) as usize;
-        if idx < self.blocks.len() && self.blocks[idx].is_some() {
-            self.blocks[idx] = None; // drops the Box<[u8]> - really frees the heap memory
-            self.allocated_count -= 1;
-            true
-        } else {
-            false
+        if idx < self.blocks.len() {
+            if let Some(block) = self.blocks[idx].take() {
+                self.allocated_count -= 1;
+                return Some(block.pid); // drops block, incl. its Box<[u8]> - really frees the heap memory
+            }
         }
+        None
     }
 
     pub fn get_allocated_count(&self) -> usize {
