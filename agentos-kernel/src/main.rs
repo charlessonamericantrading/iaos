@@ -3779,6 +3779,84 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         keyboard::handle_scancode(code);
     }
 
+    // 7c-5. Test `.`/`/` key support (Fase 141) - a real, previously
+    // invisible-to-CI gap: `keyboard.rs::scancode_to_char` had no arms
+    // for either key, even though `cat`/`touch` require `.` in every
+    // FILENAME.EXT argument and `split_path` requires `/` for every
+    // multi-segment path - every prior self-test using such a name
+    // (e.g. "PATHTEST/INSIDE.TXT" above) dispatches it directly via
+    // `shell::dispatch_command`, bypassing this driver entirely, so a
+    // real person at the keyboard could never have typed one themselves.
+    // Types a full, self-contained round trip through the real keyboard
+    // path - `mkdir d`, `touch d/a.b hi`, `cat d/a.b`, `rm d/a.b`,
+    // `rmdir d` - using both new keys together (`/` for the directory
+    // separator, `.` inside the 8.3 filename itself) and cleans up after
+    // itself, matching the shape of the existing (direct-dispatch)
+    // multi-segment-path test above. Success shows up as the shell's own
+    // real print lines for each command (`created`/`2 bytes`/`deleted`),
+    // not "Unknown command" or a FAT error.
+    kprintln!("[KERNEL INIT] Testing '.'/'/' keys (mkdir/touch/cat/rm/rmdir via keyboard)...");
+    const DOT_SLASH_TEST_SEQUENCE: &[u8] = &[
+        // "mkdir d" + Enter
+        0x32, 0xB2, // m
+        0x25, 0xA5, // k
+        0x20, 0xA0, // d
+        0x17, 0x97, // i
+        0x13, 0x93, // r
+        0x39, 0xB9, // space
+        0x20, 0xA0, // d
+        0x1C, 0x9C, // enter
+        // "touch d/a.b hi" + Enter
+        0x14, 0x94, // t
+        0x18, 0x98, // o
+        0x16, 0x96, // u
+        0x2E, 0xAE, // c
+        0x23, 0xA3, // h
+        0x39, 0xB9, // space
+        0x20, 0xA0, // d
+        0x35, 0xB5, // /
+        0x1E, 0x9E, // a
+        0x34, 0xB4, // .
+        0x30, 0xB0, // b
+        0x39, 0xB9, // space
+        0x23, 0xA3, // h
+        0x17, 0x97, // i
+        0x1C, 0x9C, // enter
+        // "cat d/a.b" + Enter
+        0x2E, 0xAE, // c
+        0x1E, 0x9E, // a
+        0x14, 0x94, // t
+        0x39, 0xB9, // space
+        0x20, 0xA0, // d
+        0x35, 0xB5, // /
+        0x1E, 0x9E, // a
+        0x34, 0xB4, // .
+        0x30, 0xB0, // b
+        0x1C, 0x9C, // enter
+        // "rm d/a.b" + Enter
+        0x13, 0x93, // r
+        0x32, 0xB2, // m
+        0x39, 0xB9, // space
+        0x20, 0xA0, // d
+        0x35, 0xB5, // /
+        0x1E, 0x9E, // a
+        0x34, 0xB4, // .
+        0x30, 0xB0, // b
+        0x1C, 0x9C, // enter
+        // "rmdir d" + Enter
+        0x13, 0x93, // r
+        0x32, 0xB2, // m
+        0x20, 0xA0, // d
+        0x17, 0x97, // i
+        0x13, 0x93, // r
+        0x39, 0xB9, // space
+        0x20, 0xA0, // d
+        0x1C, 0x9C, // enter
+    ];
+    for &code in DOT_SLASH_TEST_SEQUENCE {
+        keyboard::handle_scancode(code);
+    }
+
     // 7d. Test a Real Cooperative Context Switch (stack + register swap)
     // Cooperative only - the worker yields back voluntarily. Not wired to
     // the timer interrupt yet (that's real preemption, separate work).

@@ -912,6 +912,18 @@ jobs:
             echo "SHIFT KEY REGRESSION: the two 'cat KERNEL~1' dispatches read different byte counts - the Shift-driven filename was likely typed wrong."
             exit 1
           fi
+          # Fase 141: confirms keyboard.rs::scancode_to_char's new `.`/`/`
+          # mappings really work - a full mkdir/touch/cat/rm/rmdir round
+          # trip typed via a real scancode sequence (not dispatched
+          # directly), using both new keys together (`/` as the directory
+          # separator, `.` inside the "a.b" 8.3 filename itself). Before
+          # this Fase, this whole sequence was unreachable from a real
+          # keyboard - `scancode_to_char` had no arms for either key.
+          grep -q "SHELL\] mkdir d -> created" boot.log
+          grep -q "SHELL\] touch d/a.b -> created 2 bytes" boot.log
+          grep -q "SHELL\] cat d/a.b -> 2 bytes" boot.log
+          grep -q "SHELL\] rm d/a.b -> deleted" boot.log
+          grep -q "SHELL\] rmdir d -> deleted" boot.log
           grep -q "\[CTXSWITCH\] worker -> main: demo OK" boot.log
           grep -q "\[COOP\] all tasks finished" boot.log
           # Confirms the ps-visible PCB table is really unified with the

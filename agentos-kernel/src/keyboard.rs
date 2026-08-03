@@ -59,12 +59,19 @@ impl KeyboardDriver {
     }
 
     /// Convert PS/2 set 1 scancode to ASCII char, honoring the current
-    /// Shift state for letters and the two punctuation keys real
-    /// filenames on this disk actually need (`~`/`-`, for "KERNEL~1"-
-    /// style names). Deliberately NOT covering shifted digit-row symbols
-    /// (`!@#$` etc.) or other punctuation - nothing on this disk or in
-    /// any shell command needs them yet, and this is a shell keyboard
-    /// driver, not a general-purpose one.
+    /// Shift state for letters and the punctuation keys real shell usage
+    /// actually needs: `~`/`-` (for "KERNEL~1"-style filenames), and -
+    /// Fase 141 - `.`/`/` (`cat`/`touch` require `.` in every FILENAME.EXT
+    /// argument, `parse_ipv4` requires `.` in every dotted IPv4 argument
+    /// to `ping`/`dns`/`tcpecho`, and `split_path` requires `/` for every
+    /// multi-segment path argument to `ls`/`mkdir`/`rmdir`/`touch`/`cat`/
+    /// `rm` - a real, previously invisible-to-CI gap, since every existing
+    /// self-test using a `.`/`/`-containing name dispatches it directly
+    /// via `shell::dispatch_command`, bypassing this driver entirely).
+    /// Deliberately NOT covering shifted digit-row symbols (`!@#$` etc.)
+    /// or other punctuation - nothing on this disk or in any shell
+    /// command needs them yet, and this is a shell keyboard driver, not a
+    /// general-purpose one.
     pub fn scancode_to_char(&self, scancode: u8) -> Option<char> {
         let shift = self.shift_held;
         match scancode {
@@ -106,6 +113,8 @@ impl KeyboardDriver {
             0x30 => Some(if shift { 'B' } else { 'b' }),
             0x31 => Some(if shift { 'N' } else { 'n' }),
             0x32 => Some(if shift { 'M' } else { 'm' }),
+            0x34 => Some(if shift { '>' } else { '.' }),
+            0x35 => Some(if shift { '?' } else { '/' }),
             0x39 => Some(' '),
             0x1C => Some('\n'),
             _ => None,
